@@ -1069,7 +1069,11 @@ ikigai-repo = "0.2.0" # 0.2.0 = naming only: names its `space()` `urn:iki:space:
 # Repository browsing (urn:repo:{root}:tree/file/state/hash/explain +
 # urn:iki:annotation:*) over configured roots — opt-in via `browse.root` config lines
 # (embedded host).
-ikigai-browse = "0.18.4" # 0.18.4 is a PERFORMANCE floor (ledger #1131, #1198): every annotation and
+ikigai-browse = "0.18.5" # 0.18.5 is a CORRECTNESS floor (ledger #1207, #1253): every archive record
+# (an explanation, an annotation, a finding, a decision) commits as ONE transaction on ikigai-store's
+# SharedWriter (store 0.2.15, which it pulls in), so a rewrite is atomic and a crash cannot leave a
+# record half-written. A patch: no Rust API, resource name or capability this host uses moved.
+# Beneath it, still true: 0.18.4 is a PERFORMANCE floor (ledger #1131, #1198): every annotation and
 # finding write commits on the archive's one long-lived writer thread. RocksDB seeds a memtable
 # skiplist from the thread id and this host's socket door spawns a thread per connection, so writes
 # from fresh threads left later reads 6x to 68x slower until the memtable flushed (the store's

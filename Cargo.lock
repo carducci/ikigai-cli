@@ -2973,13 +2973,14 @@ dependencies = [
 
 [[package]]
 name = "ikigai-browse"
-version = "0.18.4"
+version = "0.18.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a937f7bbb2c1272e35d44130bac6aa12b4c1032fc6e52935540d2fabc9321555"
+checksum = "d96980f63d3f17d1c984aa95a361cdd0a0e29ce120538353103e100a5e971b9c"
 dependencies = [
  "async-trait",
  "ikigai-a11y",
  "ikigai-core",
+ "ikigai-store",
  "notify",
  "oxigraph",
  "serde_json",
@@ -3588,9 +3589,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-store"
-version = "0.2.14"
+version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a131082d0fa1b4caf6ac488c66bb2ba0fd3ced7e109350d3f79a609b5ec4b7e"
+checksum = "60bf6fb1216322c91ea12afba747552a3d6888ae23cce5dd11afa066301668f4"
 dependencies = [
  "async-trait",
  "ikigai-core",
