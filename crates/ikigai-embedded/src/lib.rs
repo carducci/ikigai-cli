@@ -446,11 +446,21 @@ fn toggle_description(
         )
 }
 
-/// `$HOME/.ikigai`, created — the ikigai-owned config/state directory. ([`file_root`]
-/// nests `workspace/` beneath it; command history persists here too.)
+/// `$HOME/.ikigai` — the ikigai-owned config/state directory. ([`file_root`] nests
+/// `workspace/` beneath it; command history persists here too.)
+///
+/// ⚠ NOT created here. A READ (is the history marker there? what history is saved?) must
+/// not write the home: `history_flag()` is seeded through this, so every caller of the flag,
+/// a test included, created `~/.ikigai` as a side effect and failed `just hermetic` (ledger
+/// #1264). The two writers create it: [`ikigai_home_for_writing`].
 fn ikigai_home() -> PathBuf {
     let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    let dir = home.join(".ikigai");
+    home.join(".ikigai")
+}
+
+/// [`ikigai_home`], created, for the paths that are about to write into it.
+fn ikigai_home_for_writing() -> PathBuf {
+    let dir = ikigai_home();
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
@@ -514,7 +524,7 @@ pub fn append_history(line: &str) {
     if !history_flag().load(Ordering::Relaxed) {
         return;
     }
-    write_history(&ikigai_home(), line);
+    write_history(&ikigai_home_for_writing(), line);
 }
 
 /// Turn history persistence on or off, updating both the live flag and the on-disk
@@ -524,6 +534,7 @@ pub fn set_history(on: bool) {
     history_flag().store(on, Ordering::SeqCst);
     let marker = history_marker();
     if on {
+        ikigai_home_for_writing();
         let _ = std::fs::File::create(&marker); // presence is the signal; empty is fine
     } else {
         let _ = std::fs::remove_file(&marker);

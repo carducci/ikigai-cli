@@ -98,16 +98,13 @@ fn fingerprint(cert: &Path) -> String {
     ikigai_quic::fingerprint_of_pem(&pem).expect("a certificate")
 }
 
-/// A UDP port nothing holds: bound, read back, released.
-fn free_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .and_then(|s| s.local_addr())
-        .expect("a free UDP port")
-        .port()
-}
-
-/// Start `serve quic://127.0.0.1:<port>` with `extra` flags; returns the door, its address
-/// and its stderr up to the banner.
+/// Start `serve quic://127.0.0.1:0` with `extra` flags; returns the door, the address its
+/// banner names (the BOUND port) and its stderr up to the banner.
+///
+/// ★ Port 0, read back from the banner (ledger #1265). Picking a port by binding one and
+/// releasing it races a child another test thread spawns, which can inherit the socket on
+/// macOS and hold the port (field guide 9h, ledger #1223); the door binds before its banner
+/// since 0.1.51, so the banner's address is the one it holds.
 fn serve(home: &Path, certs: &Path, extra: &[&str]) -> (Door, String, String) {
     serve_with(home, certs, extra, true)
 }
@@ -116,10 +113,9 @@ fn serve(home: &Path, certs: &Path, extra: &[&str]) -> (Door, String, String) {
 /// (`drain`) or CLOSES the pipe there — what a supervisor or harness that stops reading
 /// does to a door (ledger #1208).
 fn serve_with(home: &Path, certs: &Path, extra: &[&str], drain: bool) -> (Door, String, String) {
-    let target = format!("quic://127.0.0.1:{}", free_port());
     let mut args = vec![
         "serve",
-        target.as_str(),
+        "quic://127.0.0.1:0",
         "--cert-dir",
         certs.to_str().unwrap(),
     ];
@@ -155,11 +151,22 @@ fn serve_with(home: &Path, certs: &Path, extra: &[&str], drain: bool) -> (Door, 
     let seen = rx
         .recv_timeout(PATIENCE)
         .unwrap_or_else(|e| panic!("`{args:?}` never printed its banner: {e}"));
+    let target = seen
+        .lines()
+        .find_map(|line| line.split("serving on ").nth(1))
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_else(|| panic!("no address in the banner:\n{seen}"))
+        .to_string();
+    assert!(
+        !target.ends_with(":0"),
+        "the banner names the BOUND port, not the one asked for: {target}"
+    );
     (door, target, seen)
 }
 
 /// Ask the door `command` as the client whose certificate is `cert` (the base client when
-/// `None`). The banner prints before the socket binds, so a refused first dial is retried.
+/// `None`). A refused first dial is retried, boundedly: the door binds before its banner
+/// since 0.1.51, so this is a guard against a slow accept loop rather than a race.
 fn ask_as(home: &Path, certs: &Path, cert: Option<&str>, target: &str, command: &str) -> Output {
     let dir = certs.to_str().unwrap().to_string();
     let mut args = vec!["--cert-dir".to_string(), dir.clone()];
@@ -335,10 +342,14 @@ fn an_unusable_connection_age_stops_the_door() {
         "quic.max_connection_age = \"0\"\n",
     )
     .unwrap();
-    let target = format!("quic://127.0.0.1:{}", free_port());
     let out = run(
         &home,
-        &["serve", &target, "--cert-dir", certs.to_str().unwrap()],
+        &[
+            "serve",
+            "quic://127.0.0.1:0",
+            "--cert-dir",
+            certs.to_str().unwrap(),
+        ],
     );
     assert!(!out.status.success(), "the door must not start");
     let stderr = String::from_utf8_lossy(&out.stderr);

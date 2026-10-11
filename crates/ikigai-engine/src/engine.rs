@@ -1561,8 +1561,7 @@ impl Engine {
     ) -> Option<Vec<u8>> {
         let description = description?;
         let name = route_value_name(iri, Some(description), named).ok()?;
-        if !description
-            .inputs
+        if !source_inputs(description)
             .iter()
             .any(|input| input.name == name && input.required)
         {
@@ -2131,7 +2130,7 @@ pub(crate) fn route_value_name(
         .collect();
     match remaining.as_slice() {
         [name] => Ok((*name).to_string()),
-        [] if description.inputs.is_empty() => Ok("in".to_string()),
+        [] if source_inputs(description).is_empty() => Ok("in".to_string()),
         [] if declared.is_empty() => Err(format!(
             "`{}` takes no by-value argument — its parameter is captured from the \
              identifier, so put the value in the IRI",
@@ -2147,12 +2146,12 @@ pub(crate) fn route_value_name(
             // exactly one *required* input is unnamed, the piped/positional value fills it
             // (e.g. `… | urn:jsonld:flatten` → `content`, leaving optional `base` unset).
             // Only genuinely ambiguous when 2+ required inputs are still unnamed.
+            let inputs = source_inputs(description);
             let required: Vec<&str> = many
                 .iter()
                 .copied()
                 .filter(|name| {
-                    description
-                        .inputs
+                    inputs
                         .iter()
                         .any(|input| input.name == *name && input.required)
                 })
@@ -2167,6 +2166,25 @@ pub(crate) fn route_value_name(
             }
         }
     }
+}
+
+/// The inputs a target's SOURCE reads, which is what every by-value routing decision is
+/// about: a pipe, a positional value and a batch's stdin all land on a `source` stage.
+///
+/// ⚠ Not `description.inputs`. That is the FLAT authoring form only; an endpoint that
+/// declares per-verb [`ActionSpec`](ikigai_core::ActionSpec)s puts its inputs on the action
+/// and may leave the flat list empty, so "is `content` required?" read `false` for every
+/// such endpoint (ledger #1272: `urn:nl:sparql:check`, whose one required `content` then
+/// never took a batch's stdin). `action_specs()` normalizes both forms, an explicit action
+/// winning for its verb, so this is the Source action's inputs either way. A description
+/// that declares no Source verb at all keeps the flat list, as before.
+fn source_inputs(description: &Description) -> Vec<ikigai_core::ArgSpec> {
+    description
+        .action_specs()
+        .into_iter()
+        .find(|action| action.verb == Verb::Source)
+        .map(|action| action.inputs)
+        .unwrap_or_else(|| description.inputs.clone())
 }
 
 /// The names of a target's declared by-value arguments, in declaration order.
@@ -3676,6 +3694,88 @@ mod tests {
             "GRAPH=G QUERY=SELECT 1"
         );
         assert!(!read.get(), "no stage needed stdin, so nothing read it");
+    }
+
+    /// ledger #1272: `printf q | ikigai --mount "urn:gk:=…" -c 'source urn:gk:nl:sparql:check
+    /// focus=ledger'` refused "missing required argument content". The contract DID cross the
+    /// mount; what the routing rule missed is that `nl:sparql:check` declares its inputs on a
+    /// per-verb `ActionSpec`, the multi-verb authoring form, and "is it required?" read only
+    /// the FLAT `inputs`. So `content` looked optional, stdin was never taken, and a
+    /// positional value was called ambiguous. Local and mounted, the same contract.
+    #[test]
+    fn a_per_verb_contracts_required_argument_takes_the_batch_stdin() {
+        let run = |e: &Engine, cmd: &str| match e.eval(cmd) {
+            Action::Output(entry) => entry.result,
+            _ => panic!("expected Action::Output"),
+        };
+        fn check_kernel() -> Kernel {
+            let check = FnEndpoint::new("check", |inv: &Invocation<'_>| {
+                let content = inv.inline_str("content").unwrap_or("-");
+                let focus = inv.inline_str("focus").unwrap_or("-");
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    format!("content={content} focus={focus}").into_bytes(),
+                ))
+            })
+            .with_description(
+                Description::new("check").action(
+                    ikigai_core::ActionSpec::new(Verb::Source)
+                        .input(ArgSpec::new("content").summary("the query"))
+                        .input(ArgSpec::new("focus").summary("a focus").optional())
+                        .input(ArgSpec::new("preview").summary("rows").optional())
+                        .output("text/plain"),
+                ),
+            );
+            Kernel::with_meta_renderer(
+                Arc::new(EndpointSpace::new().bind(Exact::new("urn:nl:check"), check)),
+                Arc::new(JsonRenderer),
+            )
+        }
+        /// The peer on another thread, as a wire presents it (see the #1166 test).
+        struct Peer(Arc<Kernel>);
+        impl Resolver for Peer {
+            fn issue(
+                &self,
+                request: Request,
+            ) -> Result<(Representation, ikigai_resolve::CacheStatus), ikigai_core::Error>
+            {
+                let kernel = Arc::clone(&self.0);
+                std::thread::spawn(move || kernel.issue(request))
+                    .join()
+                    .expect("the peer thread")
+            }
+            fn is_cached(&self, _: &Request, _: &Capability) -> bool {
+                false
+            }
+            fn entries(&self) -> Option<Vec<ikigai_core::SpaceEntry>> {
+                let kernel = Arc::clone(&self.0);
+                std::thread::spawn(move || Resolver::entries(&*kernel))
+                    .join()
+                    .expect("the peer thread")
+            }
+        }
+        let local = Engine::new(check_kernel());
+        let mounted = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(ikigai_resolve::MountedRemote::new(
+                Arc::new(Peer(Arc::new(check_kernel()))),
+                "urn:gk:",
+                "test://peer",
+            )),
+            Arc::new(JsonRenderer),
+        ));
+        for (engine, target) in [(&local, "urn:nl:check"), (&mounted, "urn:gk:nl:check")] {
+            engine.set_piped_input(b"SELECT ?s".to_vec());
+            assert_eq!(
+                run(engine, &format!("source {target} focus=ledger")).unwrap(),
+                "content=SELECT ?s focus=ledger",
+                "{target}: the piped query fills the one REQUIRED argument"
+            );
+            assert_eq!(
+                run(engine, &format!("source {target} focus=ledger SELECT 1")).unwrap(),
+                "content=SELECT 1 focus=ledger",
+                "{target}: and so does a positional value"
+            );
+        }
     }
 
     /// An echo sink that reports whether `content` arrived at all, and what it was.
