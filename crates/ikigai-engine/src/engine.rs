@@ -1280,9 +1280,14 @@ impl Engine {
     async fn run_sink(&self, rest: &str) -> Result<String, String> {
         // `urn:host:login` / `urn:host:logout` are session operations, not kernel
         // resources — the engine owns the session capability, so it handles them here
-        // (like `urn:kernel:*` is handled by the kernel before its space). This makes
-        // login/logout addressable as resources: `sink urn:host:login <scope…>` over
-        // any transport whose session layer intercepts them.
+        // (like `urn:kernel:*` is handled by the kernel before its space). That makes
+        // login/logout addressable as resources IN THE ENGINE'S GRAMMAR: `sink
+        // urn:host:login <scope…>` works whatever this engine drives (an embedded kernel,
+        // an IPC or QUIC mount) because it never reaches the resolver at all. It is NOT a
+        // wire operation (ledger #1154): no transport in this workspace has a session layer
+        // that intercepts it, so a Sink of `urn:host:login` sent over a socket by anything
+        // but an engine reaches the server's kernel, which binds no such name, and is
+        // refused as unresolved. The authority a remote session gets is its door's clamp.
         let (target, content) = split_first_word(rest);
         match target {
             "urn:host:login" => return self.run_login(content),
@@ -1465,8 +1470,11 @@ impl Engine {
         let iri = parse_target(target)?;
 
         // The contract is only needed to recognise named arguments and route the
-        // value; a bare `source <iri>` (no args, no pipe) skips the lookup.
-        let description = if !args.is_empty() || incoming.is_some() {
+        // value; a bare `source <iri>` (no args, no pipe) skips the lookup — unless a
+        // batch's piped stdin is waiting, which may be this stage's value (see
+        // `stdin_for_the_required_argument`).
+        let stdin_waiting = incoming.is_none() && self.piped_input.borrow().is_some();
+        let description = if !args.is_empty() || incoming.is_some() || stdin_waiting {
             self.describe_struct(&iri).await
         } else {
             None
@@ -1492,6 +1500,15 @@ impl Engine {
         }
         let positional = positional.join(" ");
 
+        // A batch's piped stdin, when this stage has no other value and a required
+        // argument is left for it (ledger #1166).
+        let stdin = if incoming.is_none() && positional.is_empty() && stdin_waiting {
+            let names: Vec<&str> = named.iter().map(|(name, _)| *name).collect();
+            self.stdin_for_the_required_argument(&iri, description.as_ref(), &names)
+        } else {
+            None
+        };
+
         // The value to route comes from the pipe xor the positional text — never
         // both (a piped stage's input is the pipe, so a literal has nowhere else
         // to go).
@@ -1504,7 +1521,7 @@ impl Engine {
             }
             (Some(value), true) => Some(value),
             (None, false) => Some(positional.as_bytes()),
-            (None, true) => None,
+            (None, true) => stdin.as_deref(),
         };
 
         let mut request = Request::new(Verb::Source, iri.clone());
@@ -1518,6 +1535,46 @@ impl Engine {
             request = request.with_arg(name, ArgRef::Inline(value.to_vec()));
         }
         Ok(request)
+    }
+
+    /// The batch's one-shot piped stdin, taken for a `source` stage that would otherwise
+    /// FAIL for want of it: no pipe and no positional value reached the stage, and the
+    /// routing rule ([`route_value_name`]) names exactly one unfilled argument that is
+    /// REQUIRED.
+    ///
+    /// Ledger #1166: `cat q.rq | ikigai -c 'source urn:…:graph-select graph=G'` failed with
+    /// "missing required argument `query`", because stdin reached only a content-less
+    /// `sink`. The routing rule itself was right (a positional query filled `query`, mount
+    /// included); the value simply never arrived.
+    ///
+    /// ★ Why so narrow. Reading stdin is the hazard ledger #1088 fixed for sinks — an
+    /// inherited pipe nobody writes, and a `-c` inside a `while read` loop that must not
+    /// swallow the loop's input. So stdin is touched only where the request could not
+    /// succeed without a value: a stage whose leftover argument is OPTIONAL, or that has
+    /// none, never reads it, and nor does any stage after the first. An idle stdin answers
+    /// `None` after the grace, and the stage fails exactly as it did before.
+    fn stdin_for_the_required_argument(
+        &self,
+        iri: &Iri,
+        description: Option<&Description>,
+        named: &[&str],
+    ) -> Option<Vec<u8>> {
+        let description = description?;
+        let name = route_value_name(iri, Some(description), named).ok()?;
+        if !description
+            .inputs
+            .iter()
+            .any(|input| input.name == name && input.required)
+        {
+            return None;
+        }
+        // Take FIRST, then read: a deferred reader may block, and holding the RefCell
+        // borrow across that is a deadlock waiting to happen (as in `write_request`).
+        let piped = self.piped_input.borrow_mut().take();
+        match piped? {
+            PipedInput::Ready(bytes) => Some(bytes),
+            PipedInput::Deferred(read) => read(),
+        }
     }
 
     /// Build the `Sink` [`Request`] for a `sink <iri> [key=value …]` pipeline
@@ -2293,10 +2350,20 @@ pub(crate) fn parse_spec(spec: &str) -> Result<Pipeline, String> {
         pos: 0,
     };
     let pipeline = parser.parse_pipeline()?;
+    // The engine quotes with `"…"` only. A `'…'` span is ordinary text, so an operator
+    // inside it still splits — `query='SELECT …; …'` met the `;` (ledger #1166). Making
+    // `'` a quote would break every positional value with an apostrophe in it, so the
+    // grammar stays and the refusal says which quote it does honor.
+    let hint = if spec.contains('\'') {
+        " (the engine quotes with `\"…\"`, not `'…'`: write `key=\"a ; b\"` to keep an \
+         operator literal)"
+    } else {
+        ""
+    };
     match parser.peek() {
         None => Ok(pipeline),
-        Some(Token::Close) => Err("unmatched `)`".to_string()),
-        Some(Token::Semi) => Err("`;` outside a `( … )` fork".to_string()),
+        Some(Token::Close) => Err(format!("unmatched `)`{hint}")),
+        Some(Token::Semi) => Err(format!("`;` outside a `( … )` fork{hint}")),
         Some(_) => Err("trailing input after the pipeline".to_string()),
     }
 }
@@ -2502,12 +2569,20 @@ fn render_trace_event(
     // Authority: a hop that *changed* it (an attenuation, or a mount clamp against a
     // remote principal) names the new scopes; a uniform node under a scoped session
     // is simply marked authorized; a root session stays uncluttered.
-    let cap_note = match parent_cap {
-        Some(parent) if parent != &event.capability => {
-            format!(" · cap ↓ {}", render_cap(&event.capability))
-        }
-        _ if scoped => " · cap ✓".to_string(),
-        _ => String::new(),
+    // ★ A node the floor DENIED is marked `✗`, never `✓` (ledger #1157): `✓` meant
+    // "capability unchanged from the parent", but beside a denial it read as
+    // "authorized" — the one thing that node was not. An attenuated hop that was then
+    // denied keeps its scopes, because which authority was refused is the diagnosis.
+    let attenuated = match parent_cap {
+        Some(parent) if parent != &event.capability => Some(render_cap(&event.capability)),
+        _ => None,
+    };
+    let cap_note = match (attenuated, cache == "denied") {
+        (Some(scopes), true) => format!(" · cap ↓ {scopes} ✗"),
+        (None, true) => " · cap ✗".to_string(),
+        (Some(scopes), false) => format!(" · cap ↓ {scopes}"),
+        (None, false) if scoped => " · cap ✓".to_string(),
+        (None, false) => String::new(),
     };
     // Facts the endpoint attached to its own span (`Invocation::trace_note`) —
     // e.g. the LLM facade's resolved model, or the HTTP client's redirect hops.
@@ -3446,6 +3521,163 @@ mod tests {
         assert_eq!(run(&engine, "sink urn:echo"), "stored:piped");
     }
 
+    /// A `graph-select`-shaped read: `graph` and `query` REQUIRED, `bindings` optional —
+    /// the contract of `urn:iki:store:graph-select` that ledger #1166 was filed against.
+    fn select_kernel() -> Kernel {
+        let select = FnEndpoint::new("select", |inv: &Invocation<'_>| {
+            let graph = inv.inline_str("graph").unwrap_or("-");
+            let query = inv.inline_str("query").unwrap_or("-");
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("graph={graph} query={query}").into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("select")
+                .verb(Verb::Source)
+                .input(ArgSpec::new("graph").summary("the graphs"))
+                .input(ArgSpec::new("query").summary("a SELECT"))
+                .input(ArgSpec::new("bindings").summary("values").optional())
+                .output("text/plain"),
+        );
+        let lenient = FnEndpoint::new("lenient", |inv: &Invocation<'_>| {
+            let note = inv.inline_str("note").unwrap_or("none");
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("note={note}").into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("lenient")
+                .verb(Verb::Source)
+                .input(ArgSpec::new("note").summary("optional").optional())
+                .output("text/plain"),
+        );
+        Kernel::with_meta_renderer(
+            Arc::new(
+                EndpointSpace::new()
+                    .bind(Exact::new("urn:test:select"), select)
+                    .bind(Exact::new("urn:test:lenient"), lenient)
+                    .bind(Exact::new("urn:test:upper"), builtins::to_upper()),
+            ),
+            Arc::new(JsonRenderer),
+        )
+    }
+
+    /// ledger #1166, reproduced: `cat q.rq | ikigai -c 'source …:graph-select graph=G'`
+    /// failed with "missing required argument `query`". The routing rule was right — a
+    /// positional value filled `query` — but a batch's stdin reached only a `sink`. Now it
+    /// fills a `source` stage's one REQUIRED argument left unnamed, on a local kernel with
+    /// a JSON Meta renderer and through a MOUNT (the contract must cross it to route).
+    #[test]
+    fn a_batch_stdin_fills_the_one_required_argument_of_a_source() {
+        let run = |e: &Engine, cmd: &str| match e.eval(cmd) {
+            Action::Output(entry) => entry.result,
+            _ => panic!("expected Action::Output"),
+        };
+        /// The peer as a wire would present it: its kernel answers on ANOTHER thread, so
+        /// its `block_on` never nests inside the engine's (a socket peer is another process).
+        struct Peer(Arc<Kernel>);
+        impl Resolver for Peer {
+            fn issue(
+                &self,
+                request: Request,
+            ) -> Result<(Representation, ikigai_resolve::CacheStatus), ikigai_core::Error>
+            {
+                let kernel = Arc::clone(&self.0);
+                std::thread::spawn(move || kernel.issue(request))
+                    .join()
+                    .expect("the peer thread")
+            }
+            fn is_cached(&self, _: &Request, _: &Capability) -> bool {
+                false
+            }
+            fn entries(&self) -> Option<Vec<ikigai_core::SpaceEntry>> {
+                let kernel = Arc::clone(&self.0);
+                std::thread::spawn(move || Resolver::entries(&*kernel))
+                    .join()
+                    .expect("the peer thread")
+            }
+        }
+        let local = Engine::new(select_kernel());
+        let mounted = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(ikigai_resolve::MountedRemote::new(
+                Arc::new(Peer(Arc::new(select_kernel()))),
+                "urn:gk:",
+                "test://peer",
+            )),
+            Arc::new(JsonRenderer),
+        ));
+        for (engine, target) in [
+            (&local, "urn:test:select"),
+            (&mounted, "urn:gk:test:select"),
+        ] {
+            // The positional form worked before, and is the control.
+            assert_eq!(
+                run(engine, &format!("source {target} graph=g SELECT 1")).unwrap(),
+                "graph=g query=SELECT 1"
+            );
+            engine.set_piped_input(b"SELECT ?s".to_vec());
+            assert_eq!(
+                run(engine, &format!("source {target} graph=g")).unwrap(),
+                "graph=g query=SELECT ?s",
+                "{target}: the piped query fills `query`"
+            );
+            // One-shot: consumed, so the next batch line goes without `query` as it always
+            // did (this test endpoint reports the absence; the real store refuses it).
+            assert_eq!(
+                run(engine, &format!("source {target} graph=g")).unwrap(),
+                "graph=g query=-",
+                "{target}: stdin is one-shot"
+            );
+            // An idle stdin is no value at all: the stage goes without `query`, as before.
+            engine.set_piped_input_polled(|| None);
+            assert_eq!(
+                run(engine, &format!("source {target} graph=g")).unwrap(),
+                "graph=g query=-",
+                "{target}: an idle stdin fills nothing"
+            );
+        }
+        // A bare `source` whose one argument is required takes stdin too (the contract is
+        // fetched because stdin is waiting), and the value flows on through a pipe.
+        local.set_piped_input(b"hi".to_vec());
+        assert_eq!(
+            run(&local, "source urn:test:upper | urn:test:upper").unwrap(),
+            "HI"
+        );
+    }
+
+    /// The other half of ledger #1166: stdin is the hazard ledger #1088 fixed, so it is read
+    /// ONLY where the stage could not succeed without it. A leftover OPTIONAL argument, a
+    /// positional value, and a stage after the first never touch it.
+    #[test]
+    fn a_batch_stdin_is_not_read_by_a_source_that_does_not_need_it() {
+        let run = |e: &Engine, cmd: &str| match e.eval(cmd) {
+            Action::Output(entry) => entry.result.unwrap(),
+            _ => panic!("expected Action::Output"),
+        };
+        let engine = Engine::new(select_kernel());
+        let read = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = std::rc::Rc::clone(&read);
+        engine.set_piped_input_with(move || {
+            flag.set(true);
+            b"stdin".to_vec()
+        });
+        assert_eq!(run(&engine, "source urn:test:lenient"), "note=none");
+        assert_eq!(
+            run(&engine, "source urn:test:select graph=g SELECT 1"),
+            "graph=g query=SELECT 1"
+        );
+        assert_eq!(
+            run(
+                &engine,
+                "source urn:test:select graph=g SELECT 1 | urn:test:upper"
+            ),
+            "GRAPH=G QUERY=SELECT 1"
+        );
+        assert!(!read.get(), "no stage needed stdin, so nothing read it");
+    }
+
     /// An echo sink that reports whether `content` arrived at all, and what it was.
     fn content_probe_engine() -> Engine {
         let echo = FnEndpoint::new("echo", |inv: &Invocation<'_>| {
@@ -3987,6 +4219,56 @@ mod tests {
         );
     }
 
+    /// ledger #1157: a node the capability floor DENIED rendered `cap ✓` under a scoped
+    /// session — the mark meant "unchanged from the parent" and read as "authorized".
+    /// Pinned on the rendered line itself: the denial shows in the cap column, both for
+    /// a uniform node and for an attenuated hop, and an allowed sibling keeps its `✓`.
+    #[test]
+    fn a_denied_node_never_renders_as_authorized() {
+        use ikigai_core::Time;
+        let ev =
+            |target: &str, span: u64, parent: Option<u64>, cap: &[&str], denied: bool| TraceEvent {
+                target: target.to_string(),
+                thread: "w".to_string(),
+                started: Some(Time::from_millis(0)),
+                ended: Some(Time::from_millis(0)),
+                cache_hit: false,
+                span,
+                parent,
+                capability: Some(cap.iter().map(|s| s.to_string()).collect()),
+                notes: if denied {
+                    vec![(ikigai_core::DENIED_NOTE.to_string(), "fs".to_string())]
+                } else {
+                    Vec::new()
+                },
+            };
+        let session = ["urn:cap:fs:read:/a", "urn:cap:fs:read:/b"];
+        let events = vec![
+            ev("urn:test:compose", 0, None, &session, false),
+            ev("urn:test:allowed", 1, Some(0), &session, false),
+            ev("urn:test:refused", 2, Some(0), &session, true),
+            ev(
+                "urn:test:narrowed",
+                3,
+                Some(0),
+                &["urn:cap:fs:read:/a"],
+                true,
+            ),
+        ];
+        let mut out = Vec::new();
+        render_trace_tree(&events, &[], true, None, &mut out);
+
+        assert!(out[1].contains("· cap ✓"), "allowed keeps ✓: {out:#?}");
+        assert!(
+            out[2].contains("denied") && out[2].contains("· cap ✗") && !out[2].contains("✓"),
+            "a denied node is not marked authorized: {out:#?}"
+        );
+        assert!(
+            out[3].contains("· cap ↓ urn:cap:fs:read:/a ✗"),
+            "a denied attenuated hop names the refused scopes: {out:#?}"
+        );
+    }
+
     #[test]
     fn trace_tree_reconstructs_the_real_execution_from_span_links() {
         use ikigai_core::Time;
@@ -4231,6 +4513,65 @@ mod tests {
         let engine = Engine::with_identity(Kernel::new(Arc::new(EndpointSpace::new())), bob);
         engine.login(alice);
         assert_eq!(engine.capability().principal(), Some("urn:example:bob"));
+    }
+
+    /// ledger #1154: the same guarantee through the TYPED forms a person (or a script, or
+    /// whoever holds a handed-off session) can actually spell — `login <scopes…>` and
+    /// `sink urn:host:login <scopes…>` — not just the `Engine::login` API. A principal scope
+    /// typed at login is a CLAIM, and a floor that cannot act as that principal never
+    /// names it: under an anonymous scoped floor and after `cap seal`, the session stays
+    /// anonymous (`principal()` None, `acts_as` false). Under a ROOT floor the name passes,
+    /// and that is no escalation: root already acts as everyone, and the named session is
+    /// strictly narrower than the root it came from.
+    #[test]
+    fn a_typed_principal_at_login_is_never_named_by_a_floor_that_cannot_act_as_it() {
+        const ALICE: &str = "urn:example:alice";
+        let claim = format!("urn:cap:principal:{ALICE} urn:cap:x");
+        let forms = [
+            format!("login {claim}"),
+            format!("sink urn:host:login {claim}"),
+        ];
+        let anonymous = |engine: &Engine, how: &str| {
+            let cap = engine.capability();
+            assert_eq!(cap.principal(), None, "{how}: no principal named");
+            assert!(!cap.acts_as(ALICE), "{how}: does not act as alice");
+            assert!(
+                cap.allows("urn:cap:x"),
+                "{how}: the floor's grant still holds"
+            );
+        };
+        for form in &forms {
+            // An anonymous scoped floor (an engine opened with a scoped identity).
+            let engine = Engine::with_identity(
+                Kernel::new(Arc::new(EndpointSpace::new())),
+                Capability::scoped(["urn:cap:x".to_string()]),
+            );
+            output(engine.eval(form)).unwrap();
+            anonymous(&engine, &format!("scoped floor, `{form}`"));
+
+            // A root session narrowed, then SEALED — the hand-off — then typed at.
+            let engine = builtin_engine();
+            output(engine.eval("cap urn:cap:x")).unwrap();
+            output(engine.eval("cap seal")).unwrap();
+            assert!(engine.is_sealed());
+            output(engine.eval(form)).unwrap();
+            anonymous(&engine, &format!("sealed, `{form}`"));
+            // …and neither `cap reset` nor `logout` recovers a name or root.
+            output(engine.eval("cap reset")).unwrap();
+            anonymous(&engine, &format!("sealed then reset, `{form}`"));
+            output(engine.eval("logout")).unwrap();
+            anonymous(&engine, &format!("sealed then logout, `{form}`"));
+
+            // A root floor: the name passes, and the session is NARROWER than root —
+            // it acts as alice and no one else, and holds only what was typed.
+            let engine = builtin_engine();
+            output(engine.eval(form)).unwrap();
+            let cap = engine.capability();
+            assert_eq!(cap.principal(), Some(ALICE), "root floor, `{form}`");
+            assert!(cap.acts_as(ALICE) && !cap.acts_as("urn:example:bob"));
+            assert!(cap.scopes().is_some(), "no longer root");
+            assert!(!cap.allows("urn:cap:y"), "nothing beyond what was typed");
+        }
     }
 
     #[test]
@@ -5029,6 +5370,32 @@ mod tests {
         assert!(parse_spec("a ; b").unwrap_err().contains("outside"));
         assert!(parse_spec("( )").unwrap_err().contains("empty"));
         assert!(parse_spec("( a ; )").unwrap_err().contains("stray `;`"));
+    }
+
+    /// ledger #1166: single quotes are not engine quotes, so an operator inside `'…'`
+    /// still splits. The grammar is unchanged (an apostrophe is ordinary text); the
+    /// refusal names the quote the engine DOES honor, and only when a `'` is present.
+    #[test]
+    fn a_single_quoted_operator_is_refused_with_the_quote_that_works() {
+        let err = parse_spec("urn:q query='SELECT ?s ; x'").unwrap_err();
+        assert!(err.contains("outside") && err.contains("`\"…\"`"), "{err}");
+        let err = parse_spec("urn:q query='a) b'").unwrap_err();
+        assert!(
+            err.contains("unmatched") && err.contains("not `'…'`"),
+            "{err}"
+        );
+        assert!(!parse_spec("a ; b").unwrap_err().contains("quotes with"));
+        // …and the double-quoted form it points at parses, operator intact.
+        let pipeline = parse_spec(r#"urn:q query="SELECT ?s ; x""#).expect("quoted");
+        assert_eq!(
+            pipeline.first,
+            Node::Source(vec!["urn:q".into(), "query=SELECT ?s ; x".into()])
+        );
+        // An apostrophe in a positional value is still ordinary text.
+        assert_eq!(
+            parse_spec("urn:fn:echo don't").expect("plain").first,
+            Node::Source(vec!["urn:fn:echo".into(), "don't".into()])
+        );
     }
 
     /// An engine over the list-y builtins: `reverseList` (newline list in/out)
