@@ -90,3 +90,7 @@ futures = { workspace = true }
 # table, a `[dependencies.x]` table or a target-gated one, and a hand-rolled scan that
 # silently skips a form it does not recognize is a guard that passes by not looking.
 toml = "0.8"
+# `tests/layers_serve.rs` enrolls its participants with the layer host's OWN generator
+# (`ikigai_layers::grants`, the library behind `ikigai-layers grants <config dir>`), so the test
+# proves the door serves the pair of files that generator writes, not a hand-copied imitation.
+ikigai-layers = { workspace = true }

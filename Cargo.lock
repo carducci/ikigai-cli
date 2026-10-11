@@ -3001,6 +3001,7 @@ dependencies = [
  "ikigai-embedded",
  "ikigai-engine",
  "ikigai-ipc",
+ "ikigai-layers",
  "ikigai-mcp",
  "ikigai-quic",
  "ikigai-resolve",
@@ -3050,9 +3051,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-core"
-version = "0.1.95"
+version = "0.1.96"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6bf23e6c4982bf55606ee50ba9ea84cfe92b97fb490ca56ee6e84f7b9cebab3b"
+checksum = "ef0513a0992558a05050d3c06961eac40079284bb492ba266b99db8bdf41e328"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3117,6 +3118,7 @@ dependencies = [
  "ikigai-intake",
  "ikigai-intray",
  "ikigai-jsonld",
+ "ikigai-layers",
  "ikigai-ledger",
  "ikigai-lisp",
  "ikigai-llm",
@@ -3268,6 +3270,25 @@ dependencies = [
  "futures",
  "ikigai-core",
  "json-ld",
+]
+
+[[package]]
+name = "ikigai-layers"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b9f5f328f221a17f8726f5b70710d4dc22939b666d31de3fb10881fcb718ab8"
+dependencies = [
+ "async-trait",
+ "futures",
+ "futures-timer",
+ "ikigai-core",
+ "ikigai-intray",
+ "oxrdf",
+ "oxrdfio",
+ "oxttl",
+ "serde",
+ "serde_json",
+ "toml 0.8.23",
 ]
 
 [[package]]
@@ -3636,9 +3657,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-vocab"
-version = "0.1.95"
+version = "0.1.96"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0286693b5828dff9f6121036be75e992b3167eee22123cd6572d6570c154ce6b"
+checksum = "1893c2eaf81382c07b24d24249ab9cafe85a7f8c4772c8377c1b9b3fb7614ad6"
 dependencies = [
  "ikigai-core",
  "serde_json",

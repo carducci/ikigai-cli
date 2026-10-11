@@ -48,6 +48,14 @@ usage:
                                next call reconnects under the enrolment as it is then.
   ikigai serve <q> --announce  also advertise this kernel on the local network (mDNS), so clients
                                can mount it by name; `source urn:peer:list` shows who is out there
+  ikigai serve <q>             hosts LAYERS (ikigai-layers: urn:layer:*, urn:layers:*, urn:collab:*)
+                               when the config home has a layers/ directory, beside urn:shacl:validate
+                               (admission; the door refuses to start if it cannot validate) on a
+                               kernel with a clock. Participants are clients.json/grants.json as
+                               `ikigai-layers grants <config home>` writes them. State lives in
+                               --layers-state <dir>, else `layers.state` (instance-scoped as
+                               <name>.layers.state; relative to the config home) in config.toml,
+                               else ~/.ikigai/layers/<name>. No environment variable names it
   ikigai serve <s> --prefer …  a served host may take --mount/--override/--prefer too, so IT owns
                                the topology: a local client reaches a peer through this socket
                                without holding its certs or finding it itself
@@ -212,6 +220,10 @@ enum Mode {
         /// then reaches a peer through this socket without knowing where it is, holding its
         /// certificates, or needing the platform permission discovery requires.
         mounts: Mounts,
+        /// `--layers-state <dir>` (absolute): where a QUIC door hosting layers keeps their
+        /// entries, tuples, receipts and feeds (ledger #1188). Layers are hosted when the
+        /// config home has a `layers/` directory; see `ikigai_embedded::layers`.
+        layers_state: Option<std::path::PathBuf>,
     },
     /// Serve the capability-scoped manifold as an MCP (Model Context Protocol)
     /// server over stdio. `grants`/`scopes` union into the session capability —
@@ -740,7 +752,29 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
         let mut mounts = Mounts::default();
         let mut passkey_rp_id: Option<String> = None;
         let mut passkey_origin: Option<String> = None;
+        let mut layers_state: Option<std::path::PathBuf> = None;
         while let Some(arg) = argv.next() {
+            if arg == "--layers-state" {
+                let dir = argv
+                    .next()
+                    .ok_or_else(|| "--layers-state needs a directory".to_string())?;
+                if layers_state.is_some() {
+                    return Err(
+                        "--layers-state given twice; a door has one state directory".to_string()
+                    );
+                }
+                // Absolute now, against the directory it was typed in: a state directory that
+                // moved with the working directory would be a second host's.
+                let dir = std::path::PathBuf::from(dir);
+                layers_state = Some(if dir.is_absolute() {
+                    dir
+                } else {
+                    std::env::current_dir()
+                        .map_err(|e| format!("--layers-state: no working directory ({e})"))?
+                        .join(dir)
+                });
+                continue;
+            }
             if cert_flag(&arg, &mut argv, &mut certs)? {
                 // A cert flag FOLLOWING a mount belongs to that mount (the REPL's rule),
                 // so two peers with different identities never share a set. Flags before
@@ -939,6 +973,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
             push,
             announce,
             mounts,
+            layers_state,
         }));
     }
 
@@ -1226,7 +1261,19 @@ fn main() {
             routes_only,
             max_body,
             push,
+            layers_state,
         } => match (http, target.as_deref()) {
+            // Layers are hosted by the QUIC door only: it is the door that names each
+            // participant from its certificate, and a layer refuses a write that names nobody.
+            // A state directory for a door that hosts nothing is a flag that does nothing.
+            (http, target)
+                if layers_state.is_some() && (http.is_some() || !target.is_some_and(is_quic)) =>
+            {
+                eprintln!(
+                    "ikigai: --layers-state applies to `serve quic://…`, the door that hosts layers"
+                );
+                std::process::exit(2);
+            }
             // The inbound HTTP face takes precedence over IPC/QUIC when `--http` is given.
             (Some(bind), _) => {
                 refuse_arrangement_flag("the HTTP door (`serve --http`), a served posture,");
@@ -1244,7 +1291,7 @@ fn main() {
             }
             (None, Some(t)) if is_quic(t) => {
                 refuse_arrangement_flag("a QUIC door (`serve quic://…`), a served posture,");
-                serve_quic(t, &certs, &caps, announce, mounts)
+                serve_quic(t, &certs, &caps, announce, mounts, layers_state)
             }
             (None, _) if !caps.is_empty() => {
                 eprintln!("ikigai: --cap sets a per-connection ceiling and needs a quic:// target");
@@ -2578,13 +2625,26 @@ fn trusted_identities(
 }
 
 #[cfg(all(feature = "embedded", feature = "quic"))]
-fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, mounts: Mounts) -> ! {
+fn serve_quic(
+    target: &str,
+    certs: &Certs,
+    caps: &[String],
+    announce: bool,
+    mounts: Mounts,
+    layers_state: Option<std::path::PathBuf>,
+) -> ! {
     let caps = caps.to_vec();
     let result = (|| -> Result<(), String> {
         let addr = quic::parse_addr(target)?;
         let identity = quic::server_identity(certs)?;
         let trusted = quic::trusted_clients(certs)?;
         let max_age = quic_max_connection_age()?;
+        // THE LAYER HOST (ledger #1188), when the config home has a `layers/` directory:
+        // opened before anything is served, so a configuration that does not check (a
+        // manifest mounting another collaboration's layer, a shape that is not closed) stops
+        // the door here rather than at its first write. `None` without `layers/`: the door is
+        // built exactly as it always was.
+        let layers = ikigai_embedded::layers::open(layers_state.as_deref())?;
         // Flags are POSTURE and win wholesale when given; `--no-config-mounts` composes
         // none; otherwise the machine's own topology from the config home — the same rule as
         // every kernel-building mode.
@@ -2839,13 +2899,27 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
             // servable, still bounded by require_net to the granted provider hosts.
             llm: surface_caps.iter().any(|c| c.starts_with("urn:cap:net:")),
         };
-        let kernel = ikigai_embedded::served_kernel_with_mounts("Remote (QUIC)", surface, resolved);
+        let kernel = ikigai_embedded::served_kernel_hosting(
+            "Remote (QUIC)",
+            surface,
+            resolved,
+            layers.as_ref().map(|hosted| &hosted.host),
+        );
+        // A layer admits a write only when `urn:shacl:validate` says it conforms, so a door
+        // whose validator does not resolve would serve layers that admit nothing: refuse to
+        // start instead, saying why.
+        if layers.is_some() {
+            ikigai_embedded::layers::check_validator(&kernel)?;
+        }
         let signed_door = ikigai_embedded::code_signers_configured();
         let mut faces = vec![if surface.personal {
             "calendar-only"
         } else {
             "host + fs"
         }];
+        if layers.is_some() {
+            faces.push("layers");
+        }
         if surface.llm {
             faces.push("llm");
         }
@@ -2860,6 +2934,36 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
         for line in ikigai_embedded::posture::client_lines(&identities) {
             eprintln!("ikigai: {line}");
         }
+        if let Some(hosted) = &layers {
+            eprintln!(
+                "ikigai: layers: {} — defined in {}, state in {} ({})",
+                match hosted.layer_lines() {
+                    lines if lines.is_empty() => "none defined".to_string(),
+                    lines => lines.join(", "),
+                },
+                hosted.config.join(ikigai_embedded::layers::DIR).display(),
+                hosted.state.display(),
+                hosted.source.as_str()
+            );
+        }
+        // BIND BEFORE THE BANNER (the QUIC face of ledger #1223): the banner is the readiness
+        // signal every harness and supervisor waits for, so it must name a socket that is
+        // already bound — and the BOUND one, so `quic://127.0.0.1:0` announces the port the
+        // kernel chose rather than `:0`, and nobody has to pick a free port by binding one and
+        // releasing it (which a child spawned in between can inherit and hold, on macOS).
+        let socket = ikigai_quic::bind(addr).map_err(|e| format!("bind {target}: {e}"))?;
+        let bound = socket
+            .local_addr()
+            .map_err(|e| format!("bind {target}: {e}"))?;
+        let target = if addr.port() == 0 {
+            format!(
+                "quic://{}",
+                std::net::SocketAddr::new(addr.ip(), bound.port())
+            )
+        } else {
+            target.to_string()
+        };
+        let target = target.as_str();
         eprintln!(
             "ikigai: serving on {target}  ({posture}; surface: {surface}; connections \
              re-minted every {}s)  (Ctrl-C to stop)",
@@ -2885,16 +2989,26 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
             // TTL wait. The certificate SET is frozen — the PEMs were read once and handed
             // to the transport — so which certificates may connect cannot change while this
             // process runs, but WHICH AUTHORITY each gets can, and nothing here reports it.
-            reloads: if enrolment.is_some() {
-                vec![
-                    "clients.json (and the grants it names) — re-read on EVERY connection, \
-                     so which authority each certificate gets is decided then, not now; an \
-                     edit revokes on the next call. The set of certificates that may \
-                     connect at all is frozen at startup."
-                        .to_string(),
-                ]
-            } else {
-                Vec::new()
+            reloads: {
+                let mut reloads = Vec::new();
+                if enrolment.is_some() {
+                    reloads.push(
+                        "clients.json (and the grants it names) — re-read on EVERY connection, \
+                         so which authority each certificate gets is decided then, not now; an \
+                         edit revokes on the next call. The set of certificates that may \
+                         connect at all is frozen at startup."
+                            .to_string(),
+                    );
+                }
+                if layers.is_some() {
+                    reloads.push(
+                        "layers/*.toml — read ONCE, at startup: each layer binds its own \
+                         endpoints, so a new or changed layer takes a restart. \
+                         participants.ttl and collabs/*.toml are re-read on every use."
+                            .to_string(),
+                    );
+                }
+                reloads
             },
         });
         // Announce on the local network, so a client can mount this kernel by NAME rather
@@ -2919,7 +3033,7 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
             let wire_version = ikigai_wire::PROTOCOL_VERSION.to_string();
             match ikigai_discovery::announce_with(
                 name,
-                addr.port(),
+                bound.port(),
                 &[
                     (ikigai_discovery::TXT_SURFACE, surface.as_str()),
                     (ikigai_discovery::TXT_CEILING, posture.as_str()),
@@ -2942,9 +3056,9 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
         };
         // The transport wants the PEMs; the banner wanted the identities. Same list.
         let pems: Vec<String> = trusted.into_iter().map(|client| client.pem).collect();
-        ikigai_quic::serve_bounded(
+        ikigai_quic::serve_bounded_on(
             kernel,
-            addr,
+            socket,
             &identity,
             &pems,
             minter,
@@ -2980,6 +3094,7 @@ fn serve_quic(
     _caps: &[String],
     _announce: bool,
     _mounts: Mounts,
+    _layers_state: Option<std::path::PathBuf>,
 ) -> ! {
     eprintln!("ikigai: `quic://` needs the `quic` feature");
     std::process::exit(1);

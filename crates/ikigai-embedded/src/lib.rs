@@ -56,6 +56,7 @@ pub mod decide;
 pub mod decisions;
 pub mod foaf;
 pub mod jsonl;
+pub mod layers;
 pub mod lisp;
 pub mod passkey;
 pub mod people;
@@ -1975,7 +1976,27 @@ pub fn served_kernel_with_mounts(
     surface: ServedSurface,
     mounts: Vec<MountSpec>,
 ) -> Kernel {
+    served_kernel_hosting(nature, surface, mounts, None)
+}
+
+/// [`served_kernel_with_mounts`], hosting a layer host when one is given (ledger #1188):
+/// [`layers::spaces`] (the layers, then the validator their admission composes) go IN FRONT
+/// of the served surface, and the kernel gets a clock, which a layer needs to stamp a write.
+/// With `None` this is exactly the kernel `served_kernel_with_mounts` always built: no layer,
+/// no validator, no clock.
+///
+/// The door checks the built kernel with [`layers::check_validator`] before it serves, so a
+/// layer that would admit nothing never reaches the wire.
+pub fn served_kernel_hosting(
+    nature: &'static str,
+    surface: ServedSurface,
+    mounts: Vec<MountSpec>,
+    layers: Option<&Arc<ikigai_layers::Host>>,
+) -> Kernel {
     let mut spaces: Vec<Arc<dyn Space>> = Vec::new();
+    if let Some(host) = layers {
+        spaces.extend(layers::spaces(host));
+    }
     // The LLM face sits in front of the base surface (it binds its own namespace;
     // order only matters for a prefix collision, and there is none).
     if surface.llm {
@@ -1992,12 +2013,16 @@ pub fn served_kernel_with_mounts(
     } else {
         composed
     };
-    Kernel::with_meta_renderer(served_root(surface, root), Arc::new(CliRenderer))
+    let kernel = Kernel::with_meta_renderer(served_root(surface, root), Arc::new(CliRenderer))
         // ⚠ Same ordering caveat as `build_watched`: `with_aliases` wraps the ROOT and the
         // mounts were composed into it above, so a `--prefer urn:fn:=…` mount sits INSIDE
         // the alias and never sees a `urn:fn:` request again — the rewrite happens first.
         // A served mount over this family must name `urn:iki:fn:`.
-        .with_aliases(base_alias_table())
+        .with_aliases(base_alias_table());
+    match layers {
+        Some(_) => kernel.with_clock(layers::clock()),
+        None => kernel,
+    }
 }
 
 /// The native HTTP transport backing the `urn:http*` endpoints: a blocking `ureq`

@@ -294,6 +294,40 @@ OS GUI shortcuts (⌘C etc.), so terminal-native editing *is* readline/Emacs. Th
 demo space is composed in `ikigai-embedded`; a real host binds its own
 endpoints there.
 
+## Hosting layers on the QUIC door
+
+When the config home has a **`layers/` directory**, `ikigai serve quic://…` hosts
+[ikigai-layers](https://crates.io/crates/ikigai-layers): independent shared spaces
+(`urn:layer:{layer}`), each a channel (append-only messages) or a tuplespace (work taken
+atomically, with receipts), with the host-wide `urn:layers:feed`, `urn:layers:participants`
+and `urn:collab:{name}`. The config home is the layer host's configuration directory:
+`layers/*.toml` with their shapes and contexts, `participants.ttl`, `collabs/*.toml`, and
+`enrollment.toml`. Without `layers/` the door is built exactly as before.
+
+```bash
+ikigai-layers grants ~/.config/ikigai        # write grants.json + clients.json from the manifests
+ikigai serve quic://0.0.0.0:4434 --name layers
+```
+
+- **Who writes** is the door's enrollment. `ikigai-layers grants <config home>` writes
+  `grants.json` (each participant's `urn:cap:layer:{verb}:{layer}` scopes) and
+  `clients.json` (each certificate fingerprint → its grant, with `principal` = the
+  participant's IRI). The door mints that principal into each connection's capability, and
+  a layer stamps it into every entry, tuple and receipt; a writer that sends an attribution,
+  a time or a sequence is refused. Both files are re-read per connection, so a manifest
+  edit plus a regenerate needs no restart; a new or changed layer definition does.
+- **Admission** composes `urn:shacl:validate`, bound beside the layers, on a kernel with a
+  clock. The door runs one validation through itself before it serves, and **refuses to
+  start** if that fails: a layer without its validator would admit nothing.
+- **The state** (entries, tuples, receipts, feeds) lives in, first match wins:
+  `--layers-state <dir>` on `serve`; `layers.state = "<dir>"` in `config.toml`
+  (instance-scoped as `<name>.layers.state`; relative to the config home, `~/` to `$HOME`);
+  else `~/.ikigai/layers/<name>` under the data home. No environment variable names it. One
+  door per state directory: a layer's feed is kept gapless by a lock inside that process.
+- The banner names each hosted layer and its model, where the state is and which of the three
+  channels chose it, and the surface gains `+ layers`. `--layers-state` on a door that hosts
+  no layer (no `layers/`, or not a QUIC door) is refused rather than ignored.
+
 ## The HTTP door
 
 `ikigai serve --http <port> --routes <file> --routes-only --cap <scope>…` serves the

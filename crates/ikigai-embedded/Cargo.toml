@@ -95,6 +95,10 @@ ikigai-secret = { workspace = true }
 ikigai-xslt = { workspace = true }
 ikigai-jsonld = { workspace = true }
 ikigai-shacl = { workspace = true }
+# The layer host `serve quic://` links when the config home has a `layers/` directory
+# (`layers.rs`, ledger #1188). Bound beside `ikigai-shacl` above: admission composes
+# `urn:shacl:validate`, and a layer whose validator is missing admits nothing.
+ikigai-layers = { workspace = true }
 # LLM inference (urn:llm:ask + urn:llm:<provider>:ask), on the native ureq transport.
 ikigai-llm = { workspace = true }
 # Video-conference scheduling (urn:meeting:schedule + urn:meeting:zoom:schedule), on the same
