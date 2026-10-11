@@ -19,8 +19,8 @@ use async_trait::async_trait;
 use futures::executor::block_on;
 use ikigai_core::{
     ArgRef, Bindings, Capability, Description, Endpoint, Error, Expiry, Grammar, Invocation, Iri,
-    Kernel, Provenance, Representation, Request, Resolution, Resolved, Scope, Space, SpaceEntry,
-    TraceEvent, Tracer, UriTemplate, Verb,
+    Kernel, Limit, Provenance, Representation, Request, Resolution, Resolved, Scope, Space,
+    SpaceEntry, TraceEvent, Tracer, UriTemplate, Verb,
 };
 use serde::{Deserialize, Serialize};
 
@@ -231,7 +231,9 @@ pub fn naming_entry<'a>(entries: &'a [SpaceEntry], target: &Iri) -> Option<&'a S
 /// is what lets a *local* kernel compose a remote one — mount it behind a prefix
 /// ([`Mount`](ikigai_core::Mount)) so only that namespace goes remote. It always
 /// hits (routing is the mount prefix's job); a genuinely-absent remote resource
-/// comes back as an error on invoke, not a resolution miss.
+/// comes back as an error on invoke, not a resolution miss — except under `Meta`,
+/// which is never invoked, so the peer is asked at resolve time and an absent name
+/// is a hit on ⊥, i.e. `Unresolved` (see `ForwardingEndpoint::resolution`).
 pub struct RemoteSpace {
     resolver: Arc<dyn Resolver>,
     names: RemoteNames,
@@ -258,20 +260,19 @@ impl Space for RemoteSpace {
         // request goes over the wire under the name it arrived with. (Even if it
         // were, it would not be a canonical: see `MountedRemote::resolve` below for
         // why a mount never reports one.)
-        Resolution::Hit(Resolved::new(
-            Arc::new(ForwardingEndpoint {
-                resolver: Arc::clone(&self.resolver),
-                name: self.names.name_for(&request.target),
-                // A bare `RemoteSpace` is mounted by a caller that holds the resolver;
-                // it carries no origin label of its own (`MountedRemote` does).
-                origin: None,
-                // …and with no mount identity, a failure here has nothing to be
-                // attributed to, so it is not remembered. See `DescribeHealth`.
-                health: None,
-                request: request.clone(),
-            }),
-            Bindings::new(),
-        ))
+        ForwardingEndpoint {
+            resolver: Arc::clone(&self.resolver),
+            name: self.names.name_for(&request.target),
+            // A bare `RemoteSpace` is mounted by a caller that holds the resolver;
+            // it carries no origin label of its own (`MountedRemote` does).
+            origin: None,
+            // …and with no mount identity, a failure here has nothing to be
+            // attributed to, so it is not remembered. See `DescribeHealth`.
+            health: None,
+            request: request.clone(),
+            contract: None,
+        }
+        .resolution(request)
     }
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
@@ -304,6 +305,100 @@ struct ForwardingEndpoint {
     /// space that built this endpoint tracks it. `None` for a [`RemoteSpace`], which has
     /// no mount identity to attribute a failure to.
     health: Option<Arc<DescribeHealth>>,
+    /// The peer's contract, when it was read at RESOLVE time — which is what a `Meta`
+    /// resolution does (see [`resolution`](Self::resolution)). `None` means nobody has
+    /// asked yet, and [`describe`](Endpoint::describe) asks then, as it always did.
+    contract: Option<Contract>,
+}
+
+/// What forwarding a `Meta` to the peer said about a mounted name.
+enum Contract {
+    /// The peer's own declaration.
+    Read(Box<Description>),
+    /// The peer did not answer with a contract, for this reason. Not "unbound": a peer
+    /// that says nothing binds the name is [`Lookup::Unbound`], and never gets this far.
+    Unavailable(String),
+}
+
+/// Why a contract could not be read — split because the two answers mean different
+/// things to a resolution (ledger #1146).
+enum Lookup {
+    /// The peer resolved nothing at that name: it is not offered there.
+    Unbound,
+    /// The peer answered something other than a contract, or did not answer at all.
+    Unavailable(String),
+}
+
+impl ForwardingEndpoint {
+    /// The resolution a mount reports for `request` (the request as it ARRIVED, under the
+    /// local name), with this endpoint as the hit.
+    ///
+    /// ★ **A `Meta` asks the peer NOW, at resolve time, and an unbound name is
+    /// UNRESOLVED.** Every other verb finds out on invoke — the forward fails with the
+    /// peer's own `Unresolved` — but `Meta` is never invoked: the kernel renders
+    /// [`describe`](Endpoint::describe), which cannot fail. So before ledger #1146 a
+    /// `describe` of a mounted name nothing binds printed a "contract unavailable"
+    /// placeholder and exited 0, and a script could not tell "not offered" from
+    /// "offered" without parsing prose. The answer is core's own ⊥ — a hit on a
+    /// [`Limit`]'s bottom — so the kernel reports the SAME `Unresolved`, byte for byte,
+    /// that an unbound local name gets, and does not continue outward (an OVERRIDE mount
+    /// must not fall through to a local binding of a name it claims). Every
+    /// `entries → Meta → describe` walk drops a hit on ⊥ too, which mirrors the peer:
+    /// a probe expansion the peer cannot resolve is a row its OWN catalog drops.
+    ///
+    /// It costs no round-trip: every caller that `Meta`-resolves describes the hit
+    /// next, and the contract read here is what [`describe`](Endpoint::describe)
+    /// returns, so the one forward moves from describe to resolve. A peer already known
+    /// to be silent is not asked here either — [`DescribeHealth`] — and describes as
+    /// [`unavailable`] exactly as before.
+    fn resolution(mut self, request: &Request) -> Resolution {
+        let silent = self.health.as_ref().is_some_and(|h| h.failing().is_some());
+        if request.verb == Verb::Meta && !silent {
+            match self.lookup() {
+                Ok(description) => self.contract = Some(Contract::Read(Box::new(description))),
+                Err(Lookup::Unbound) => {
+                    return Limit::new(request.target.as_str()).resolve(request, &Scope::empty())
+                }
+                Err(Lookup::Unavailable(reason)) => {
+                    self.contract = Some(Contract::Unavailable(reason))
+                }
+            }
+        }
+        Resolution::Hit(Resolved::new(Arc::new(self), Bindings::new()))
+    }
+
+    /// Forward a `Meta` (JSON face) for the target and read the peer's contract.
+    fn lookup(&self) -> Result<Description, Lookup> {
+        let meta = Request::new(Verb::Meta, self.request.target.clone())
+            .with_arg("as", ArgRef::Inline(b"application/json".to_vec()));
+        match self.resolver.issue_as(meta, &Capability::root()) {
+            Ok((repr, _status)) => serde_json::from_slice::<Description>(&repr.bytes).map_err(
+                // The shape that cost a day: a peer below `ikigai-vocab` 0.1.47 has no
+                // JSON Meta renderer, answers `as=application/json` with the canonical
+                // TURTLE, and the parse fails here — so the media type is named, because
+                // "expected JSON, got text/turtle" is the whole diagnosis.
+                |error| {
+                    Lookup::Unavailable(format!(
+                        "its Meta answer is {} ({} byte(s)), not a JSON Description: {error}",
+                        repr.repr_type,
+                        repr.bytes.len()
+                    ))
+                },
+            ),
+            // The peer's own words for "nothing binds that name here".
+            Err(Error::Unresolved(_)) => Err(Lookup::Unbound),
+            Err(error) => {
+                // Silence here is the same silence an enumeration would meet, so it counts
+                // against the same health — one row's timeout spares every later row.
+                if let Some(health) = &self.health {
+                    health.record(&error);
+                }
+                Err(Lookup::Unavailable(format!(
+                    "it refused the Meta request: {error}"
+                )))
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -345,35 +440,28 @@ impl Endpoint for ForwardingEndpoint {
         // once per catalog row on a manifold read, so without this the transport's
         // deadline would be paid per row and a bounded call would still add up to an
         // unbounded walk — the deadline bounds a CALL, this bounds the WALK.
-        if let Some(reason) = self.health.as_ref().and_then(|health| health.failing()) {
-            return unavailable(
-                self.origin.as_deref(),
-                self.request.target.as_str(),
-                &reason,
-            );
-        }
-        let meta = Request::new(Verb::Meta, self.request.target.clone())
-            .with_arg("as", ArgRef::Inline(b"application/json".to_vec()));
-        let reason = match self.resolver.issue_as(meta, &Capability::root()) {
-            Ok((repr, _status)) => match serde_json::from_slice::<Description>(&repr.bytes) {
-                Ok(description) => return description,
-                // The shape that cost a day: a peer below `ikigai-vocab` 0.1.47 has no
-                // JSON Meta renderer, answers `as=application/json` with the canonical
-                // TURTLE, and the parse fails here — so the media type is named, because
-                // "expected JSON, got text/turtle" is the whole diagnosis.
-                Err(error) => format!(
-                    "its Meta answer is {} ({} byte(s)), not a JSON Description: {error}",
-                    repr.repr_type,
-                    repr.bytes.len()
-                ),
-            },
-            Err(error) => {
-                // Silence here is the same silence an enumeration would meet, so it counts
-                // against the same health — one row's timeout spares every later row.
-                if let Some(health) = &self.health {
-                    health.record(&error);
+        // A `Meta` resolution already asked (see `resolution`): its answer is the answer.
+        let reason = match &self.contract {
+            Some(Contract::Read(description)) => return (**description).clone(),
+            Some(Contract::Unavailable(reason)) => reason.clone(),
+            None => {
+                if let Some(reason) = self.health.as_ref().and_then(|health| health.failing()) {
+                    return unavailable(
+                        self.origin.as_deref(),
+                        self.request.target.as_str(),
+                        &reason,
+                    );
                 }
-                format!("it refused the Meta request: {error}")
+                match self.lookup() {
+                    Ok(description) => return description,
+                    // Asked off a `Meta` resolution — a floor or a routing read on a hit
+                    // that resolved under another verb. The invoke will say "unresolved"
+                    // itself; here there is only a contract to fail to read.
+                    Err(Lookup::Unbound) => {
+                        format!("it resolves nothing at `{}`", self.request.target)
+                    }
+                    Err(Lookup::Unavailable(reason)) => reason,
+                }
             }
         };
         unavailable(
@@ -819,16 +907,15 @@ impl Space for MountedRemote {
         // If a mounted name and a local name should ever share identity, that
         // needs a concept that carries ORIGIN alongside the name; `canonical`,
         // which is a bare `Iri`, cannot express it.
-        Resolution::Hit(Resolved::new(
-            Arc::new(ForwardingEndpoint {
-                resolver: Arc::clone(&self.resolver),
-                name: self.names.name_for(&forwarded.target),
-                origin: Some(self.origin.clone()),
-                health: Some(Arc::clone(&self.health)),
-                request: forwarded,
-            }),
-            Bindings::new(),
-        ))
+        ForwardingEndpoint {
+            resolver: Arc::clone(&self.resolver),
+            name: self.names.name_for(&forwarded.target),
+            origin: Some(self.origin.clone()),
+            health: Some(Arc::clone(&self.health)),
+            request: forwarded,
+            contract: None,
+        }
+        .resolution(request)
     }
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
@@ -1643,6 +1730,174 @@ mod tests {
             naming_entry(&entries, &target).map(|e| e.endpoint.as_str()),
             Some("special")
         );
+    }
+
+    /// A peer that binds ONE name and says so the way a real kernel does — a `Meta` of
+    /// anything else comes back `Unresolved` — counting the `Meta` forwards it serves.
+    #[derive(Default)]
+    struct OneNamePeer {
+        metas: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Resolver for OneNamePeer {
+        fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), Error> {
+            if request.target.as_str() != "urn:status" {
+                return Err(Error::Unresolved(request.target));
+            }
+            let bytes = if request.verb == Verb::Meta {
+                self.metas.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                serde_json::to_vec(&Description::new("status").verb(Verb::Source))
+                    .expect("description serializes")
+            } else {
+                b"ok".to_vec()
+            };
+            Ok((
+                Representation::new(ReprType::new("application/json"), bytes),
+                CacheStatus::Uncacheable,
+            ))
+        }
+
+        fn is_cached(&self, _request: &Request, _capability: &Capability) -> bool {
+            false
+        }
+
+        fn entries(&self) -> Option<Vec<SpaceEntry>> {
+            Some(vec![SpaceEntry::new("urn:status", "status")])
+        }
+    }
+
+    fn meta(target: &str) -> Request {
+        Request::new(Verb::Meta, ikigai_core::Iri::parse(target).unwrap())
+            .with_arg("as", ArgRef::Inline(b"text/turtle".to_vec()))
+    }
+
+    /// Ledger #1146: `describe` of a mounted name the peer does not bind printed a
+    /// "contract unavailable" placeholder and exited 0. It is now the kernel's own
+    /// `Unresolved`, the same error an unbound LOCAL name gets — through an alias mount,
+    /// an override mount and a bare `RemoteSpace` alike.
+    #[test]
+    fn a_meta_of_a_name_the_peer_does_not_bind_is_unresolved() {
+        let spaces: Vec<(&str, Arc<dyn Space>)> = vec![
+            (
+                "urn:gk:nope",
+                Arc::new(MountedRemote::new(
+                    Arc::new(OneNamePeer::default()),
+                    "urn:gk:",
+                    "test://peer",
+                )),
+            ),
+            (
+                "urn:nope",
+                Arc::new(MountedRemote::overriding(
+                    Arc::new(OneNamePeer::default()),
+                    "urn:",
+                    "test://peer",
+                )),
+            ),
+            (
+                "urn:nope",
+                Arc::new(RemoteSpace::new(Arc::new(OneNamePeer::default()))),
+            ),
+        ];
+        for (target, space) in spaces {
+            let kernel = Kernel::new(space);
+            let error = block_on(kernel.issue(meta(target), &Capability::root()))
+                .expect_err("an unbound mounted name must not describe");
+            assert!(
+                matches!(&error, Error::Unresolved(iri) if iri.as_str() == target),
+                "`{target}`: expected Unresolved, got {error:?}"
+            );
+            assert_eq!(
+                error.to_string(),
+                format!("no endpoint resolved for {target}"),
+                "byte-identical to an unbound local name"
+            );
+            let iri = ikigai_core::Iri::parse(target).unwrap();
+            assert!(
+                kernel.describe(&iri).is_none(),
+                "`{target}` has no contract"
+            );
+        }
+    }
+
+    /// The bound half: the peer's own contract comes through, and the forward moved from
+    /// `describe` to `resolve` rather than being paid twice — ONE `Meta` per description.
+    #[test]
+    fn a_meta_of_a_bound_mounted_name_forwards_once() {
+        let peer = Arc::new(OneNamePeer::default());
+        let mounted = MountedRemote::new(
+            Arc::clone(&peer) as Arc<dyn Resolver>,
+            "urn:gk:",
+            "test://peer",
+        );
+        let kernel = Kernel::new(Arc::new(mounted));
+        let iri = ikigai_core::Iri::parse("urn:gk:status").unwrap();
+        let description = kernel.describe(&iri).expect("the peer binds it");
+        assert_eq!(description.id, "status");
+        assert_eq!(
+            peer.metas.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one forward per describe"
+        );
+    }
+
+    /// An OVERRIDE claims its namespace even over a local binding of the same name, so
+    /// a name the PEER does not bind must not fall through to the local one: describing
+    /// the local contract while every invoke goes to the peer would be a lie.
+    #[test]
+    fn an_override_does_not_fall_through_to_a_local_contract() {
+        let local = EndpointSpace::new().bind(
+            Exact::new("urn:nope"),
+            FnEndpoint::new("local", |_inv| {
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    b"local".to_vec(),
+                ))
+            })
+            .with_description(Description::new("local").verb(Verb::Source)),
+        );
+        let root = ikigai_core::Fallback::new(vec![
+            Arc::new(MountedRemote::overriding(
+                Arc::new(OneNamePeer::default()),
+                "urn:",
+                "test://peer",
+            )) as Arc<dyn Space>,
+            Arc::new(local) as Arc<dyn Space>,
+        ]);
+        let kernel = Kernel::new(Arc::new(root));
+        let error = block_on(kernel.issue(meta("urn:nope"), &Capability::root()))
+            .expect_err("the override's peer does not bind it");
+        assert!(matches!(error, Error::Unresolved(_)), "got {error:?}");
+    }
+
+    /// A peer that ANSWERS but not with a contract is still the placeholder — "unknown",
+    /// not "absent" — because only the peer's `Unresolved` says nothing binds the name.
+    #[test]
+    fn a_peer_that_cannot_describe_still_gets_the_placeholder() {
+        struct Refusing;
+        impl Resolver for Refusing {
+            fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), Error> {
+                Err(Error::Endpoint(format!(
+                    "no Meta renderer for {}",
+                    request.target
+                )))
+            }
+            fn is_cached(&self, _request: &Request, _capability: &Capability) -> bool {
+                false
+            }
+            fn entries(&self) -> Option<Vec<SpaceEntry>> {
+                None
+            }
+        }
+        let kernel = Kernel::new(Arc::new(MountedRemote::new(
+            Arc::new(Refusing),
+            "urn:gk:",
+            "test://peer",
+        )));
+        let iri = ikigai_core::Iri::parse("urn:gk:thing").unwrap();
+        let description = kernel.describe(&iri).expect("a placeholder, not a miss");
+        assert_eq!(description.id, "remote");
+        assert_eq!(description.title, "contract unavailable");
     }
 
     /// The wire catalog is rebuilt from the action manifold, but a mounted
