@@ -534,7 +534,11 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 [workspace.dependencies]
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
-ikigai-core = "0.1.95" # 0.1.95 = a Sink/Delete that RAN AND FAILED cuts its target (ledger #1105), so a cached
+ikigai-core = "0.1.96" # 0.1.96 = the floor `ikigai-layers` 0.2.0 asks for (ledger #1188): the release that
+# carried the layer vocabulary its graphs emit. No source here calls an API new in 0.1.96; the pin
+# states it because nothing below it can resolve beside the layer host, so a lower number would
+# claim a combination no build can produce. ⚠ `^0.1.96` is also a ceiling below 0.2.0.
+# Beneath it, still true: 0.1.95 = a Sink/Delete that RAN AND FAILED cuts its target (ledger #1105), so a cached
 # fallback over state a failed write changed stops answering for the old state; and match/contract
 # IRIs are emitted CANONICAL and parsed lenient (ledger #1107), which is what `urn:kernel:validate`
 # echoes back to this host's MCP pre-flight. 0.1.94 refuses a sign in a percent escape (`%+1`) in
@@ -655,7 +659,10 @@ ikigai-core = "0.1.95" # 0.1.95 = a Sink/Delete that RAN AND FAILED cuts its tar
 # holds beneath it: below that a MOUNTED template row whose local name-guess collides with a
 # shorter sibling is dropped from the manifold, so `ikigai mcp` silently stops projecting
 # browse-pr-explain and browse-pr-review.
-ikigai-vocab = "0.1.95" # 0.1.95 = core 0.1.95's lockstep release. Not an API floor; raised with core because this
+ikigai-vocab = "0.1.96" # 0.1.96 = core 0.1.96's lockstep release: it defines the layer family (`ik:Layer`,
+# `ik:Message`, `ik:Offer`, `ik:seq`, …) the graphs of a hosted layer carry (ledger #1182, #1188). Not an
+# API floor; raised with core because this repo's tests validate against the vocabulary the lock resolves.
+# Beneath it: 0.1.95 = core 0.1.95's lockstep release. Not an API floor; raised with core because this
 # repo's tests validate against the vocabulary the lock resolves.
 # Beneath it: 0.1.92 = core 0.1.92's lockstep release; only `owl:versionInfo` moved.
 # Beneath it, still true: 0.1.91 = core 0.1.91's lockstep release: it defines `ik:contract`
@@ -1326,6 +1333,14 @@ ikigai-store = { version = "0.2.14", features = ["persistent"] }
 # `store::grants_for` issues the same lists and this host compiles unchanged; it does not yet offer
 # a worker-sized authority (claim + comment + read, no close), which is ledger #1143's grant.
 ikigai-ledger = "0.8.0"
+# The layer host (`urn:layer:{layer}`, `urn:layers:*`, `urn:collab:{name}`), linked by `serve
+# quic://` when the config home has a `layers/` directory (ledger #1188). 0.2.0 is the first
+# release with BOTH access models the door hosts (the channel and the tuplespace); it is the
+# only line there is, and the one every test here ran against. ⚠ `"0.2.0"` is `<0.3.0`.
+# ⚠ It depends on `ikigai-intray` FROM CRATES.IO (`"0.1.47"`, `<0.2.0`), and intray is a member
+# of THIS workspace: see the `[patch.crates-io]` at the end of this file, which is what keeps
+# one intray in the graph.
+ikigai-layers = "0.2.0"
 # ── Intra-workspace siblings: LOCKSTEP pins, not floors ───────────────────────
 # The seventeen members that take `version.workspace = true` are released TOGETHER, at one
 # version, always. So every sibling pin below states the CURRENT workspace version rather
@@ -1470,3 +1485,23 @@ ureq = "2"
 # ikigai-programs does (ikigai-programs PR #40).
 [profile.dev.package.steel-core]
 opt-level = 3
+
+# ── One ikigai-intray in the graph ────────────────────────────────────────────
+# `ikigai-layers` (a registry crate) depends on `ikigai-intray` FROM CRATES.IO, and intray is
+# a member of THIS workspace. Cargo treats a path package and a registry package as two
+# packages even at one version, so without this the workspace compiled TWO intrays (and,
+# through the registry one, two `ikigai-resolve`s): the host's served spaces on the in-tree
+# code and every tuplespace layer on the published code, a combination no release ships.
+# (`cargo tree -d` showed both; ledger #1188.)
+#
+# This is NOT a local path override in constitution rule 3's sense: it names a directory in
+# THIS repository, which exists on CI and in every clone, never a sibling checkout. And it
+# changes nothing a published build compiles: cargo ignores `[patch]` outside the root
+# workspace, so `cargo install ikigai-cli` resolves intray from crates.io for both edges, and
+# the lockstep release publishes intray at the same version as everything else here. In tree
+# it makes the build the one that ships: one intray, the workspace's.
+# ⚠ It holds only while the workspace's intray satisfies what `ikigai-layers` asks for
+# (`"0.1.47"`, `>=0.1.47, <0.2.0`). A layers release that needs a NEWER intray than this
+# workspace carries is a release-order problem, not something to patch around.
+[patch.crates-io]
+ikigai-intray = { path = "crates/ikigai-intray" }

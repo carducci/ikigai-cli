@@ -326,11 +326,62 @@ pub fn serve_bounded(
     idle: std::time::Duration,
     max_age: Option<std::time::Duration>,
 ) -> io::Result<()> {
+    serve_bounded_on(
+        kernel,
+        bind(addr)?,
+        identity,
+        trusted_client_cert_pems,
+        minter,
+        idle,
+        max_age,
+    )
+}
+
+/// Bind the UDP socket a door serves on, BEFORE it serves: [`serve_bounded_on`] takes it.
+///
+/// ★ **Why a door binds first** (ledger #1188, the QUIC face of ledger #1223). A door that
+/// announces readiness before it binds can only name the address it was GIVEN, so `quic://
+/// 127.0.0.1:0` announced port 0 and every harness had to pick a port itself, by binding one
+/// and releasing it. On macOS a child spawned in the instant between `socket()` and
+/// `FD_CLOEXEC` inherits that socket and holds the port, so the door then fails to bind and
+/// the test reads a door bug. Bound here, the door names [`std::net::UdpSocket::local_addr`]:
+/// port 0 becomes the port the kernel chose, and nobody has to choose one.
+///
+/// A **wildcard** address (`0.0.0.0` or `[::]`) binds ONE dual-stack IPv6 socket
+/// (`IPV6_V6ONLY` off), so it accepts both IPv4 (as v4-mapped) and IPv6: a client dialing
+/// either family reaches it (the `.local`-resolves-to-both-families-and-picks-IPv6 timeout).
+/// A specific address is bound as given, single-family.
+pub fn bind(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
+    let udp = if addr.ip().is_unspecified() {
+        use socket2::{Domain, Protocol, Socket, Type};
+        let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+        socket.set_only_v6(false)?; // dual-stack: also accept IPv4 (v4-mapped)
+        let bind = SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), addr.port());
+        socket.bind(&bind.into())?;
+        socket.into()
+    } else {
+        std::net::UdpSocket::bind(addr)?
+    };
+    udp.set_nonblocking(true)?;
+    Ok(udp)
+}
+
+/// [`serve_bounded`] on a socket [`bind`] already bound, so the caller can name the bound
+/// address (and announce readiness) before serving.
+pub fn serve_bounded_on(
+    kernel: Kernel,
+    socket: std::net::UdpSocket,
+    identity: &Identity,
+    trusted_client_cert_pems: &[String],
+    minter: Minter,
+    idle: std::time::Duration,
+    max_age: Option<std::time::Duration>,
+) -> io::Result<()> {
     let config = server_config(identity, trusted_client_cert_pems, idle)?;
     let endpoint_config = endpoint_config(identity);
     let runtime = Runtime::new()?;
     runtime.block_on(async move {
-        let endpoint = bind_endpoint(config, addr, endpoint_config)?;
+        let endpoint = endpoint_on(config, socket, endpoint_config)?;
         let kernel = Arc::new(kernel);
         while let Some(incoming) = endpoint.accept().await {
             let kernel = Arc::clone(&kernel);
@@ -361,41 +412,18 @@ pub fn serve_bounded(
     })
 }
 
-/// Bind the server endpoint. On a **wildcard** address (`0.0.0.0` or `[::]`), bind a
-/// single **dual-stack** IPv6 socket (`IPV6_V6ONLY` off) so it accepts BOTH IPv4
-/// (as v4-mapped) and IPv6 — a client dialing either family reaches it. This is the
-/// real fix for the `.local`-resolves-to-both-families-and-picks-IPv6 timeout: the
-/// server no longer cares which family the name resolved to. A specific bind address
-/// is honored as-is (`quinn::Endpoint::server`), single-family.
-///
-/// Either way the endpoint runs under `endpoint_config` (see [`endpoint_config`]): what
-/// `quinn::Endpoint::server` would build is a RANDOM stateless-reset key per process.
-fn bind_endpoint(
+/// The server endpoint over a bound socket, under `endpoint_config` (see
+/// [`endpoint_config`]): what `quinn::Endpoint::server` would build is a RANDOM
+/// stateless-reset key per process. Must run inside the Tokio runtime that drives it.
+fn endpoint_on(
     config: quinn::ServerConfig,
-    addr: SocketAddr,
+    socket: std::net::UdpSocket,
     endpoint_config: quinn::EndpointConfig,
 ) -> io::Result<quinn::Endpoint> {
-    if !addr.ip().is_unspecified() {
-        let udp = std::net::UdpSocket::bind(addr)?;
-        udp.set_nonblocking(true)?;
-        return quinn::Endpoint::new(
-            endpoint_config,
-            Some(config),
-            udp,
-            Arc::new(quinn::TokioRuntime),
-        );
-    }
-    use socket2::{Domain, Protocol, Socket, Type};
-    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
-    socket.set_only_v6(false)?; // dual-stack: also accept IPv4 (v4-mapped)
-    let bind = SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), addr.port());
-    socket.bind(&bind.into())?;
-    let udp: std::net::UdpSocket = socket.into();
-    udp.set_nonblocking(true)?;
     quinn::Endpoint::new(
         endpoint_config,
         Some(config),
-        udp,
+        socket,
         Arc::new(quinn::TokioRuntime),
     )
 }
@@ -2937,9 +2965,9 @@ mod restart {
         // bind, boundedly, rather than racing it.
         let mut tries = 0;
         let endpoint = loop {
-            match rt
-                .block_on(async { bind_endpoint(config.clone(), addr, endpoint_config.clone()) })
-            {
+            match rt.block_on(async {
+                endpoint_on(config.clone(), bind(addr)?, endpoint_config.clone())
+            }) {
                 Ok(endpoint) => break endpoint,
                 Err(e) if e.kind() == io::ErrorKind::AddrInUse && tries < 100 => {
                     tries += 1;
