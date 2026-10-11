@@ -77,6 +77,8 @@ fn exhaust_and_recover() {
     let kernel = Kernel::new(Arc::new(
         EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
     ));
+    // Everything this process holds before the door exists; the door adds its listener.
+    let baseline = open_fds();
     let door = {
         let path = path.clone();
         std::thread::spawn(move || ikigai_ipc::serve(kernel, &path))
@@ -89,6 +91,15 @@ fn exhaust_and_recover() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_serves(&path, "control");
+
+    // ★ Wait for the door to let go of every connection made so far (ledger #803, #870). The
+    // client hangs up FIRST here, and the door's per-connection thread closes its end only
+    // when it notices — later, on its own schedule. A server-side descriptor still open when
+    // the table is filled below is one more slot freed DURING the exhaustion, and the door's
+    // accept takes that slot instead of failing: no episode, no log line, a red test with
+    // nothing wrong in the door. Measured under load on macOS: every failing run had one such
+    // descriptor open at this point (5 of 5), and no run without one failed (0 of 62).
+    settle_fds(baseline + 1);
 
     // Exhaust the table, then free exactly one slot and spend it on a client socket: the door's
     // accept has no descriptor to give the server side of it — EMFILE.
@@ -124,6 +135,30 @@ fn exhaust_and_recover() {
         "the socket door ended after recovering"
     );
     let _ = std::fs::remove_file(&path);
+}
+
+/// How many descriptors this process has open, the directory handle that counts them
+/// included (so two readings compare exactly). `/dev/fd` lists them on macOS and Linux.
+fn open_fds() -> usize {
+    std::fs::read_dir("/dev/fd")
+        .expect("/dev/fd lists this process's descriptors")
+        .count()
+}
+
+/// Wait, boundedly, until this process holds exactly `expected` descriptors.
+fn settle_fds(expected: usize) {
+    let mut now = open_fds();
+    for _ in 0..500 {
+        if now == expected {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        now = open_fds();
+    }
+    panic!(
+        "expected {expected} open descriptors (the baseline and the door's listener), found \
+         {now} 5s after the test closed its connections: the door is holding (or lost) one"
+    );
 }
 
 /// Lower THIS process's soft `RLIMIT_NOFILE` (the child's only), keeping the hard limit.

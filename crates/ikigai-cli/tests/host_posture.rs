@@ -31,7 +31,7 @@
 #![cfg(all(feature = "embedded", feature = "ipc", feature = "web", unix))]
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -125,10 +125,11 @@ fn start(home: &Path, args: &[&str], ready: &'static str) -> (Door, String) {
 ///
 /// ⚠ **The IPC banner is not a readiness signal.** `serve_ipc` prints `serving on <path>`
 /// and then calls `ikigai_ipc::serve`, which is what binds — so a client that raced the
-/// banner got `No such file or directory` roughly half the time. (The HTTP door has the
-/// same ordering; [`get`] retries its connect for the same reason.) Reported up rather than
-/// changed here: moving a banner is a behaviour change for every log and test that reads
-/// one, and the tests in `mount_posture.rs` never connect, so nothing had noticed.
+/// banner got `No such file or directory` roughly half the time. Reported up rather than
+/// changed here: moving a banner is a behavior change for every log and test that reads
+/// one, and the tests in `mount_posture.rs` never connect, so nothing had noticed. (The
+/// HTTP door had the same ordering and no longer does: it binds first, ledger #1223, see
+/// [`bound_port`].)
 fn wait_for_socket(path: &str) {
     for _ in 0..TRIES {
         if Path::new(path).exists() {
@@ -153,40 +154,41 @@ fn ask(home: &Path, connect: &str, command: &str) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
-/// A port nothing is listening on: bound, read back, released. Racy in principle and the
-/// only option the standard library offers; the window is microseconds and the alternative
-/// is a hard-coded port that collides with a developer's own server.
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("a loopback port")
-        .local_addr()
-        .expect("its address")
-        .port()
+/// The port an HTTP door BOUND, read off its banner (`serving HTTP on 127.0.0.1:<port>`).
+///
+/// ★ The door is started with `--http 0` and the KERNEL picks the port (ledger #1223). What
+/// stood here chose one itself — bind `127.0.0.1:0`, read the port, release it — and on
+/// macOS a released port is not reliably free: `socket()` and `FD_CLOEXEC` are two calls
+/// there, so a child spawned by one of this binary's other tests in that window inherits
+/// the listener and keeps the port LISTENING after this test dropped it. The door then
+/// failed to bind (EADDRINUSE, exit 1) while `get` connected into the inheritor's backlog
+/// and read `ECONNRESET` when the inheritor exited: ~2% of runs under load, and the CI
+/// failure the item names. A banner that printed before the bind could not carry the
+/// bound port, which is why the harness had to guess; the door now binds first.
+fn bound_port(banner: &str) -> u16 {
+    let port = banner
+        .lines()
+        .find_map(|line| line.split("serving HTTP on ").nth(1))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|addr| addr.parse::<std::net::SocketAddr>().ok())
+        .map(|addr| addr.port())
+        .unwrap_or_else(|| panic!("no bound address on the banner: {banner}"));
+    assert_ne!(
+        port, 0,
+        "the banner must name the port the door BOUND, not the one it was asked for: {banner}"
+    );
+    port
 }
 
 /// `GET path` over plain HTTP/1.1, returning (status line, body). Written by hand rather
 /// than with a client crate: the assertion is about the STATUS a public door answers with,
 /// and adding a dependency to read one line of it would be the larger change.
+///
+/// One connect, no retry: the door binds before it prints the banner [`start`] waits for,
+/// so a refused connect here is a real failure, not a race to paper over.
 fn get(port: u16, path: &str) -> (String, String) {
-    let mut last = None;
-    let mut connected = None;
-    for _ in 0..TRIES {
-        match TcpStream::connect(("127.0.0.1", port)) {
-            Ok(stream) => {
-                connected = Some(stream);
-                break;
-            }
-            // The banner prints before `serve_with` binds, so a connect can lose the race
-            // by a few milliseconds.
-            Err(e) => {
-                last = Some(e);
-                std::thread::sleep(GAP);
-            }
-        }
-    }
-    let mut stream = connected.unwrap_or_else(|| {
-        panic!("nothing accepted on {port} within {PATIENCE:?}: {last:?}");
-    });
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .unwrap_or_else(|e| panic!("nothing accepted on {port}: {e}"));
     stream
         .write_all(
             format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
@@ -312,12 +314,8 @@ fn a_declined_topology_is_reported_as_a_decline_not_as_emptiness() {
 fn the_public_http_door_refuses_posture_and_a_granted_one_serves_it() {
     let home = scratch("http", &["prefer urn:iki:store:=/tmp/iki-hp-absent-d.sock"]);
 
-    let public = free_port();
-    let (_door, _) = start(
-        &home,
-        &["serve", "--http", &public.to_string()],
-        "serving HTTP on",
-    );
+    let (_door, banner) = start(&home, &["serve", "--http", "0"], "serving HTTP on");
+    let public = bound_port(&banner);
     let (status, body) = get(public, "/host/posture");
     assert!(
         status.contains("403"),
@@ -332,18 +330,12 @@ fn the_public_http_door_refuses_posture_and_a_granted_one_serves_it() {
         "and it leaks no path while refusing: {body}"
     );
 
-    let granted = free_port();
-    let (_door, _) = start(
+    let (_door, banner) = start(
         &home,
-        &[
-            "serve",
-            "--http",
-            &granted.to_string(),
-            "--cap",
-            "urn:cap:host:posture",
-        ],
+        &["serve", "--http", "0", "--cap", "urn:cap:host:posture"],
         "serving HTTP on",
     );
+    let granted = bound_port(&banner);
     let (status, body) = get(granted, "/host/posture");
     assert!(status.contains("200"), "{status} {body}");
     assert!(
