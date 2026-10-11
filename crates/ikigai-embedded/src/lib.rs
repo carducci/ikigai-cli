@@ -561,12 +561,21 @@ fn host_history() -> FnEndpoint {
 /// the principal minted from the client certificate, so a connected peer can `source
 /// urn:host:identity` to see the `ws/<id>` segment its cert scoped it to — capability-on-
 /// the-wire, made observable. Only the ROOT capability reports `root`; see [`identity_of`].
+///
+/// When the capability carries a principal (core's `urn:cap:principal:<iri>`, minted by a
+/// QUIC door per connection since ledger #1179, `urn:iki:host:{name}:client:<fp>` unless
+/// the enrolment names the client), a second line says WHO: `principal <iri>`. The first
+/// line is unchanged, so a reader of it is unaffected.
 fn host_identity() -> FnEndpoint {
     FnEndpoint::new("host-identity", move |inv: &Invocation<'_>| {
         let who = identity_of(inv.capability);
+        let mut text = format!("identity {who}\n");
+        if let Some(principal) = inv.capability.principal() {
+            text.push_str(&format!("principal {principal}\n"));
+        }
         Ok(Representation::new(
             ReprType::new("text/plain").with_param("charset", "utf-8"),
-            format!("identity {who}\n").into_bytes(),
+            text.into_bytes(),
         ))
     })
     .with_description(
@@ -597,7 +606,13 @@ fn identity_of(capability: &ikigai_core::Capability) -> String {
     {
         return id.to_string();
     }
-    match scopes.len() {
+    // A principal scope names the caller and grants nothing, so it is not counted as one
+    // of the session's scopes (it is reported on its own line by `host_identity`).
+    let granted = scopes
+        .iter()
+        .filter(|scope| !scope.starts_with(ikigai_core::PRINCIPAL_SCOPE_PREFIX))
+        .count();
+    match granted {
         0 => "anonymous (no authority)".to_string(),
         1 => "scoped (1 scope, no workspace)".to_string(),
         n => format!("scoped ({n} scopes, no workspace)"),

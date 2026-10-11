@@ -42,6 +42,10 @@ usage:
                                named in grants.json, so each gets its own scopes, an unenrolled
                                one is REFUSED, and editing the file revokes on the next
                                connection. `cert add-client` prints the fingerprint to enrol.
+                               Each client is named urn:iki:host:<name>:client:<fingerprint>
+                               (or its entry's `principal`), and a connection is closed once it
+                               is quic.max_connection_age seconds old (default 600), so the
+                               next call reconnects under the enrolment as it is then.
   ikigai serve <q> --announce  also advertise this kernel on the local network (mDNS), so clients
                                can mount it by name; `source urn:peer:list` shows who is out there
   ikigai serve <s> --prefer …  a served host may take --mount/--override/--prefer too, so IT owns
@@ -2245,6 +2249,31 @@ fn quic_idle_timeout() -> std::time::Duration {
         .unwrap_or(ikigai_quic::DEFAULT_IDLE_TIMEOUT)
 }
 
+/// How old a served QUIC connection may grow before the door closes it and the client's
+/// next call reconnects, minted afresh (ledger #1179): `quic.max_connection_age` in the
+/// config home, in seconds, default [`DEFAULT_MAX_CONNECTION_AGE`].
+///
+/// The door re-reads `clients.json` per CONNECTION, so this bound is what makes an edit a
+/// revocation within a known time rather than "whenever the client next reconnects", which
+/// for a standing mount may be never. An unusable value stops `serve` (a revocation bound
+/// that silently became the default is a bound nobody chose).
+#[cfg(all(feature = "embedded", feature = "quic"))]
+fn quic_max_connection_age() -> Result<std::time::Duration, String> {
+    match ikigai_embedded::config::get("quic.max_connection_age") {
+        None => Ok(DEFAULT_MAX_CONNECTION_AGE),
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(secs) if secs > 0 => Ok(std::time::Duration::from_secs(secs)),
+            _ => Err(format!(
+                "quic.max_connection_age = `{raw}` is not a positive number of seconds"
+            )),
+        },
+    }
+}
+
+/// [`quic_max_connection_age`]'s default: ten minutes (design, ledger #1170 section 15).
+#[cfg(all(feature = "embedded", feature = "quic"))]
+const DEFAULT_MAX_CONNECTION_AGE: std::time::Duration = std::time::Duration::from_secs(600);
+
 #[cfg(all(feature = "embedded", feature = "quic"))]
 fn connect_mount_quic(
     target: &str,
@@ -2537,6 +2566,7 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
         let addr = quic::parse_addr(target)?;
         let identity = quic::server_identity(certs)?;
         let trusted = quic::trusted_clients(certs)?;
+        let max_age = quic_max_connection_age()?;
         // Flags are POSTURE and win wholesale when given; `--no-config-mounts` composes
         // none; otherwise the machine's own topology from the config home — the same rule as
         // every kernel-building mode.
@@ -2629,6 +2659,29 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
                 file_root.display()
             ));
         }
+        // WHO each connection is (ledger #1179): every posture names its client, so an
+        // endpoint can ask who it serves (`inv.capability.principal()`) and a log can
+        // attribute a call to a certificate. An enrolled client is named by its entry's
+        // `principal` when it has one; every other client by Brian's convention,
+        // `urn:iki:host:{name}:client:<fp>`, `{name}` being this instance's (`--name`, else
+        // `serve`). Checked once here, against a placeholder fingerprint, because a name
+        // core cannot carry as a principal would otherwise make every connection quietly
+        // anonymous: `Session::authority` falls back to minting nothing.
+        let host = ikigai_embedded::instance_name();
+        ikigai_core::principal_scope(&ikigai_embedded::clients::default_principal(
+            host,
+            &"0".repeat(64),
+        ))
+        .map_err(|e| {
+            format!(
+                "this instance's name `{host}` cannot name its clients \
+                 (urn:iki:host:{host}:client:<fingerprint>): {e} — pick another `--name`"
+            )
+        })?;
+        let principal_of = move |fingerprint: &str, enrolled: Option<String>| {
+            enrolled
+                .unwrap_or_else(|| ikigai_embedded::clients::default_principal(host, fingerprint))
+        };
         // The enrolment is re-read per connection inside the minter (that is what makes
         // an edit a revocation), so the startup read is used only to CHOOSE the posture
         // and to report it.
@@ -2643,17 +2696,19 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
                 .map_or_else(|| "clients.json".into(), |p| p.display().to_string());
             let root = file_root.clone();
             std::sync::Arc::new(move |peer: &ikigai_quic::PeerIdentity| {
-                match ikigai_embedded::clients::authority(&peer.fingerprint, &ceiling) {
-                    Ok((grant, capability)) => {
+                match ikigai_embedded::clients::authorize(&peer.fingerprint, &ceiling) {
+                    Ok(authority) => {
+                        let grant = authority.grant;
                         // A grant's fs scopes are written the way the CLIENT addresses
                         // files (`urn:file:notes/…`), so resolve them against this
                         // connection's own workspace — the namespace its IRIs land in.
                         let capability = ikigai_embedded::tenant::root_fs_scopes(
-                            &capability,
+                            &authority.capability,
                             &ikigai_embedded::tenant::tenant_root(&root, &peer.segment_id),
                         );
+                        let principal = principal_of(&peer.fingerprint, authority.principal);
                         eprintln!(
-                            "ikigai: client {} → grant \"{grant}\" ({})",
+                            "ikigai: client {} → grant \"{grant}\" ({}) as {principal}",
                             short_fingerprint(&peer.fingerprint),
                             match capability.scopes() {
                                 None => "unrestricted".to_string(),
@@ -2663,7 +2718,7 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
                         Some(ikigai_quic::Session {
                             capability,
                             file_segment: peer.segment_id.clone(),
-                            principal: None,
+                            principal: Some(principal),
                         })
                     }
                     // The FULL fingerprint, so debugging a denied client is a copy-paste
@@ -2692,7 +2747,7 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
                         format!("urn:cap:fs:delete:{seg}"),
                     ]),
                     file_segment: peer.segment_id.clone(),
-                    principal: None,
+                    principal: Some(principal_of(&peer.fingerprint, None)),
                 })
             })
         } else {
@@ -2708,7 +2763,9 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
                         &ikigai_embedded::tenant::tenant_root(&root, &peer.segment_id),
                     ),
                     file_segment: peer.segment_id.clone(),
-                    principal: None,
+                    // Shared authority, but not a shared NAME: the bound is everyone's, the
+                    // principal is still the certificate's own.
+                    principal: Some(principal_of(&peer.fingerprint, None)),
                 })
             })
         };
@@ -2785,7 +2842,11 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
         for line in ikigai_embedded::posture::client_lines(&identities) {
             eprintln!("ikigai: {line}");
         }
-        eprintln!("ikigai: serving on {target}  ({posture}; surface: {surface})  (Ctrl-C to stop)");
+        eprintln!(
+            "ikigai: serving on {target}  ({posture}; surface: {surface}; connections \
+             re-minted every {}s)  (Ctrl-C to stop)",
+            max_age.as_secs()
+        );
         // ★ The same facts the four lines above just printed, recorded as a RESOURCE. This
         // is the door the whole item came from: the peer that cost plasma a ~120s manifold
         // (#408) had composed two mounts back at its own caller, and the only way to learn
@@ -2862,8 +2923,16 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
         };
         // The transport wants the PEMs; the banner wanted the identities. Same list.
         let pems: Vec<String> = trusted.into_iter().map(|client| client.pem).collect();
-        ikigai_quic::serve_with(kernel, addr, &identity, &pems, minter, quic_idle_timeout())
-            .map_err(|e| e.to_string())
+        ikigai_quic::serve_bounded(
+            kernel,
+            addr,
+            &identity,
+            &pems,
+            minter,
+            quic_idle_timeout(),
+            Some(max_age),
+        )
+        .map_err(|e| e.to_string())
     })();
     match result {
         Ok(()) => std::process::exit(0),

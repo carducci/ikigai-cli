@@ -86,7 +86,10 @@ pub fn generate() -> Identity {
 /// addresses files as if its segment were the root and never sees another's.
 ///
 /// ★ **`principal` is WHO, never WHAT.** It names the client the minter recognized (an IRI
-/// the host derives from the certificate, such as `urn:iki:gonk:client:<fingerprint>`).
+/// the host derives from the certificate; the convention every host's door follows is
+/// `urn:iki:host:{name}:client:<fingerprint>`, the fingerprint being [`fingerprint`]'s
+/// lowercase hex SHA-256 of the certificate DER, unless the host's enrolment names the
+/// client otherwise).
 /// [`dispatch`] carries it two ways:
 ///
 /// - **minted into the capability** ([`Session::authority`]): core 0.1.93's
@@ -226,6 +229,16 @@ pub type Minter = Arc<dyn Fn(&PeerIdentity) -> Option<Session> + Send + Sync>;
 /// *authorization* is missing.
 const UNAUTHORIZED: u32 = 1;
 
+/// The QUIC application close code for a connection closed because it reached the door's
+/// connection-age bound ([`serve_bounded`]). Not an error: the client's next call redials,
+/// and the new connection is minted afresh, which is the point.
+const AGED: u32 = 3;
+
+/// How long a connection that reached its age bound mid-call waits for the peer to
+/// acknowledge that call's reply before the door closes it. A reply the door has finished
+/// writing is not yet DELIVERED, and closing at once would throw it away.
+const REPLY_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// How long a connection may be SILENT before either side declares it dead.
 ///
 /// Generous on purpose, mirroring `ipc.timeout` (cli #259): the server says nothing
@@ -276,6 +289,43 @@ pub fn serve_with(
     minter: Minter,
     idle: std::time::Duration,
 ) -> io::Result<()> {
+    serve_bounded(
+        kernel,
+        addr,
+        identity,
+        trusted_client_cert_pems,
+        minter,
+        idle,
+        None,
+    )
+}
+
+/// [`serve_with`], closing every connection once it is `max_age` old (`None`: never).
+///
+/// ★ **Why a door bounds connection age** (ledger #1179). The [`Minter`] runs once per
+/// CONNECTION, so the authority it minted — and the principal it named — holds for as long
+/// as that connection lives. A host that re-reads its enrolment per connection makes an
+/// edit a revocation only on the client's NEXT connection, and a client that reuses one
+/// connection (a daemon's standing mount, an MCP server) may never make one. The bound
+/// turns "eventually, if the client reconnects" into "within `max_age`".
+///
+/// What the client sees: nothing, normally. The bound is checked BETWEEN calls (calls on a
+/// connection are answered one at a time), so a call in progress when it passes finishes
+/// and its reply is delivered (waited for up to five seconds) before the door closes with
+/// code 3; a connection that is idle when it passes is closed then. The resolver from
+/// [`connect_with`] heals onto a new connection at its next call, minted afresh — refused,
+/// if the client was revoked. ⚠ One race remains: a call the client opens in the instant
+/// the door closes fails as a lost reply, and a Sink or Delete is then NOT replayed (the
+/// resolver's rule for any lost reply); the caller sees a transient error and decides.
+pub fn serve_bounded(
+    kernel: Kernel,
+    addr: SocketAddr,
+    identity: &Identity,
+    trusted_client_cert_pems: &[String],
+    minter: Minter,
+    idle: std::time::Duration,
+    max_age: Option<std::time::Duration>,
+) -> io::Result<()> {
     let config = server_config(identity, trusted_client_cert_pems, idle)?;
     let endpoint_config = endpoint_config(identity);
     let runtime = Runtime::new()?;
@@ -293,7 +343,9 @@ pub fn serve_with(
                     // an operator editing the authority config revokes a client's rights
                     // on its next connection rather than at the end of some TTL.
                     match minter(&PeerIdentity::of(&connection)) {
-                        Some(session) => serve_connection(&kernel, connection, &session).await,
+                        Some(session) => {
+                            serve_connection_aged(&kernel, connection, &session, max_age).await
+                        }
                         // Authenticated but not authorized: close rather than serve. The
                         // alternative — falling back to a shared ceiling — is how a
                         // forgotten config entry silently becomes an over-grant.
@@ -453,7 +505,21 @@ fn peer_cert_id(connection: &quinn::Connection) -> String {
 ///
 /// Every reply is encoded AT THE VERSION THE CONNECTION NEGOTIATED ([`Reply::for_peer`]),
 /// so a v7 client never meets a variant it cannot decode.
+/// (The unbounded form, which this crate's tests drive directly; a door goes through
+/// [`serve_connection_aged`].)
+#[cfg(test)]
 async fn serve_connection(kernel: &Kernel, connection: quinn::Connection, session: &Session) {
+    serve_connection_aged(kernel, connection, session, None).await;
+}
+
+/// [`serve_connection`], closing the connection once it is `max_age` old — see
+/// [`serve_bounded`] for when, and what a client sees.
+async fn serve_connection_aged(
+    kernel: &Kernel,
+    connection: quinn::Connection,
+    session: &Session,
+    max_age: Option<std::time::Duration>,
+) {
     let Some(version) = negotiated_version(&connection) else {
         connection.close(
             NO_VERSION.into(),
@@ -461,7 +527,27 @@ async fn serve_connection(kernel: &Kernel, connection: quinn::Connection, sessio
         );
         return;
     };
-    while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+    // tokio's clock, not `std::time::Instant` (banned workspace-wide for wasm's sake): this
+    // crate is native-only, and the deadline is compared only with tokio's own timers.
+    let deadline = max_age.map(|age| tokio::time::Instant::now() + age);
+    let aged = |connection: &quinn::Connection| {
+        connection.close(
+            AGED.into(),
+            b"this door bounds connection age; reconnect to continue",
+        )
+    };
+    loop {
+        let next = match deadline {
+            Some(at) => match tokio::time::timeout_at(at, connection.accept_bi()).await {
+                Ok(next) => next,
+                // Idle when the bound passed: nothing is in flight, so close now.
+                Err(_elapsed) => return aged(&connection),
+            },
+            None => connection.accept_bi().await,
+        };
+        let Ok((mut send, mut recv)) = next else {
+            return;
+        };
         let bytes = match recv.read_to_end(MAX_MESSAGE).await {
             Ok(bytes) => bytes,
             Err(_) => return,
@@ -475,6 +561,11 @@ async fn serve_connection(kernel: &Kernel, connection: quinn::Connection, sessio
         if let Ok(out) = encode(&reply.for_peer(version)) {
             let _ = send.write_all(&out).await;
             let _ = send.finish();
+        }
+        // The bound passed while this call ran: let its reply land, then close.
+        if deadline.is_some_and(|at| tokio::time::Instant::now() >= at) {
+            let _ = tokio::time::timeout(REPLY_GRACE, send.stopped()).await;
+            return aged(&connection);
         }
     }
 }

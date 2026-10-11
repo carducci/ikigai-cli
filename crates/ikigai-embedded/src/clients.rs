@@ -22,6 +22,13 @@
 //! }
 //! ```
 //!
+//! An object entry may also carry a `principal`: the IRI the door names that client by
+//! (`"principal": "urn:collab:participant:bobby"`). Without one the door names it
+//! [`default_principal`]`(host, fingerprint)` = `urn:iki:host:{host}:client:<fingerprint>`,
+//! the convention every host's door follows (ledger #1179). The principal is WHO, never
+//! WHAT: it is minted into the connection's capability as core's principal scope and
+//! stamped on every request, and grants nothing by itself.
+//!
 //! The key is the **stable** certificate fingerprint — lowercase hex SHA-256 of the
 //! leaf DER, what `openssl x509 -noout -fingerprint -sha256` prints. Colons and case
 //! are accepted and normalized away, so the tooling's own output pastes in unedited.
@@ -50,6 +57,47 @@ use std::path::PathBuf;
 
 use ikigai_core::Capability;
 
+/// The IRI a host's door names an enrolled client by when its `clients.json` entry names
+/// no `principal`: `urn:iki:host:{host}:client:<fingerprint>`, where `host` is the serving
+/// instance's name (`--name`) and the fingerprint is folded the way enrolment keys are
+/// (lowercase hex, colons dropped), so `openssl`'s spelling and ours name one client.
+///
+/// Brian's convention, 2026-10-10 (ledger #1170): one shape for every host's minted client
+/// IRI, so a log or a ledger can attribute across hosts without a per-host rule.
+///
+/// ```
+/// use ikigai_embedded::clients::default_principal;
+///
+/// let fp = "6F:1C:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:AB:CD";
+/// assert_eq!(
+///     default_principal("layers", fp),
+///     "urn:iki:host:layers:client:6f1c00000000000000000000000000000000000000000000000000000000abcd"
+/// );
+/// ```
+pub fn default_principal(host: &str, fingerprint: &str) -> String {
+    format!("urn:iki:host:{host}:client:{}", normalize(fingerprint))
+}
+
+/// The authority one connection runs under, as [`authorize`] decides it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Authority {
+    /// The grant name the certificate is enrolled under (or the explicit default).
+    pub grant: String,
+    /// `operator ceiling ∩ grant`.
+    pub capability: Capability,
+    /// The `principal` the client's OWN entry names, if it names one. `None` means the
+    /// door names it [`default_principal`]; a client admitted only by the shared
+    /// `default` grant never has one, because a principal names one certificate.
+    pub principal: Option<String>,
+}
+
+/// One enrolled certificate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Entry {
+    grant: String,
+    principal: Option<String>,
+}
+
 /// Where the per-identity client map is read from: `$IKIGAI_CLIENTS` else
 /// `clients.json` in the [config home](crate::config::config_home) — beside `grants.json`,
 /// which it references by name. "Beside" is the whole point, so both resolve the config
@@ -65,7 +113,7 @@ pub fn clients_path() -> Option<PathBuf> {
 /// shared default (`None` when they wrote none — absence is never a default).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Enrolment {
-    clients: BTreeMap<String, String>,
+    clients: BTreeMap<String, Entry>,
     default_grant: Option<String>,
 }
 
@@ -88,8 +136,17 @@ impl Enrolment {
     pub fn grant_for(&self, fingerprint: &str) -> Option<&str> {
         self.clients
             .get(&normalize(fingerprint))
-            .map(String::as_str)
+            .map(|entry| entry.grant.as_str())
             .or_else(|| self.default_grant())
+    }
+
+    /// The `principal` a fingerprint's OWN entry names, if any. Never the default's: the
+    /// shared default grant admits certificates nobody enrolled by name, and no IRI can
+    /// name all of them.
+    pub fn principal_for(&self, fingerprint: &str) -> Option<&str> {
+        self.clients
+            .get(&normalize(fingerprint))
+            .and_then(|entry| entry.principal.as_deref())
     }
 
     /// Every enrolled grant name (plus the default), deduped — the operator's full
@@ -98,7 +155,7 @@ impl Enrolment {
         let mut names: Vec<String> = self
             .clients
             .values()
-            .cloned()
+            .map(|entry| entry.grant.clone())
             .chain(self.default_grant.clone())
             .collect();
         names.sort();
@@ -127,8 +184,13 @@ pub fn enrolment() -> Result<Option<Enrolment>, String> {
 }
 
 /// Parse the `clients.json` shape. Both entry spellings are accepted: the object form
-/// `{"grant": "…", "label": "…"}` (the label is for humans reading the file and the
-/// server's logs) and the bare string form `"…"`.
+/// `{"grant": "…", "label": "…", "principal": "…"}` (the label is for humans reading the
+/// file and the server's logs; the principal is optional, see the module docs) and the
+/// bare string form `"…"`.
+///
+/// A `principal` that core could not carry as a principal (not an absolute IRI, a `*`,
+/// over 512 bytes) is an ERROR, like every other unusable entry: silently minting none
+/// would serve that client under a name its operator never wrote.
 fn parse(text: &str) -> Result<Enrolment, String> {
     let v: serde_json::Value =
         serde_json::from_str(text).map_err(|e| format!("not valid JSON: {e}"))?;
@@ -140,20 +202,39 @@ fn parse(text: &str) -> Result<Enrolment, String> {
             .as_object()
             .ok_or("`clients` must be an object of fingerprint → grant")?;
         for (fingerprint, entry) in map {
-            let grant = match entry {
-                serde_json::Value::String(name) => name.clone(),
-                serde_json::Value::Object(_) => entry
-                    .get("grant")
-                    .and_then(|g| g.as_str())
-                    .ok_or_else(|| format!("client `{fingerprint}` has no `grant`"))?
-                    .to_string(),
+            let parsed = match entry {
+                serde_json::Value::String(name) => Entry {
+                    grant: name.clone(),
+                    principal: None,
+                },
+                serde_json::Value::Object(_) => Entry {
+                    grant: entry
+                        .get("grant")
+                        .and_then(|g| g.as_str())
+                        .ok_or_else(|| format!("client `{fingerprint}` has no `grant`"))?
+                        .to_string(),
+                    principal: match entry.get("principal") {
+                        None | Some(serde_json::Value::Null) => None,
+                        Some(serde_json::Value::String(iri)) => {
+                            ikigai_core::principal_scope(iri).map_err(|e| {
+                                format!("client `{fingerprint}` names an unusable principal: {e}")
+                            })?;
+                            Some(iri.clone())
+                        }
+                        Some(_) => {
+                            return Err(format!(
+                                "client `{fingerprint}`: `principal` must be an IRI string"
+                            ))
+                        }
+                    },
+                },
                 _ => {
                     return Err(format!(
                         "client `{fingerprint}` must be a grant name or an object with one"
                     ))
                 }
             };
-            clients.insert(normalize(fingerprint), grant);
+            clients.insert(normalize(fingerprint), parsed);
         }
     }
     let default_grant = match v.get("default") {
@@ -199,6 +280,12 @@ fn normalize(key: &str) -> String {
 /// `operator ceiling (--cap) ∩ per-identity grant`, and the wire clamp then applies the
 /// third term (`∩ carried capability`) per call.
 pub fn authority(fingerprint: &str, ceiling: &Capability) -> Result<(String, Capability), String> {
+    authorize(fingerprint, ceiling).map(|authority| (authority.grant, authority.capability))
+}
+
+/// [`authority`], plus the `principal` the client's own entry names — read from the SAME
+/// reading of the file, so a grant and a name can never come from two different edits.
+pub fn authorize(fingerprint: &str, ceiling: &Capability) -> Result<Authority, String> {
     let enrolment = match enrolment()? {
         Some(enrolment) => enrolment,
         // The file went away while serving. That is a revocation, not a licence.
@@ -209,7 +296,12 @@ pub fn authority(fingerprint: &str, ceiling: &Capability) -> Result<(String, Cap
             ))
         }
     };
-    authority_in(&enrolment, fingerprint, ceiling, crate::grant_scopes)
+    let (grant, capability) = authority_in(&enrolment, fingerprint, ceiling, crate::grant_scopes)?;
+    Ok(Authority {
+        grant,
+        capability,
+        principal: enrolment.principal_for(fingerprint).map(str::to_string),
+    })
 }
 
 /// [`authority`] over an already-parsed enrolment and an explicit grant lookup — the
@@ -413,6 +505,65 @@ mod tests {
         assert!(parse(r#"{"default": 7}"#).is_err());
         // Legal: no `clients` key at all — the file with everyone removed.
         assert!(parse("{}").unwrap().is_empty());
+    }
+
+    /// An entry may name the principal its client is minted as; a bare-string entry, an
+    /// object without one, and a stranger admitted by the shared default name none, so the
+    /// door falls back to [`default_principal`] (ledger #1179).
+    #[test]
+    fn an_entry_may_name_its_principal_and_the_default_names_nobody() {
+        let alice = "a".repeat(64);
+        let stranger = "0".repeat(64);
+        let e = parse(&format!(
+            r#"{{"clients": {{
+                "{FP}": {{"grant": "everything", "principal": "urn:collab:participant:bobby"}},
+                "{alice}": {{"grant": "contacts-ro", "label": "alice"}}
+            }}, "default": "contacts-ro"}}"#
+        ))
+        .unwrap();
+        assert_eq!(e.principal_for(FP), Some("urn:collab:participant:bobby"));
+        // The key folds the same way for the principal as for the grant.
+        assert_eq!(
+            e.principal_for(&FP.to_uppercase()),
+            Some("urn:collab:participant:bobby")
+        );
+        assert_eq!(e.principal_for(&alice), None);
+        assert_eq!(e.grant_for(&stranger), Some("contacts-ro"));
+        assert_eq!(e.principal_for(&stranger), None, "the default names nobody");
+    }
+
+    /// A principal core could not carry is refused with the file, never minted as nothing.
+    #[test]
+    fn an_unusable_principal_is_an_error() {
+        for bad in [r#""not an iri""#, r#""urn:x:*""#, "7"] {
+            let text = format!(
+                r#"{{"clients": {{"{FP}": {{"grant": "everything", "principal": {bad}}}}}}}"#
+            );
+            let refused = parse(&text).unwrap_err();
+            assert!(refused.contains("principal"), "{bad}: {refused}");
+        }
+    }
+
+    /// The default form is exact: the host's name and the folded fingerprint, nothing else.
+    #[test]
+    fn the_default_principal_is_exact() {
+        assert_eq!(
+            default_principal("serve", FP),
+            format!("urn:iki:host:serve:client:{FP}")
+        );
+        let openssl = FP
+            .to_uppercase()
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| std::str::from_utf8(pair).unwrap())
+            .collect::<Vec<_>>()
+            .join(":");
+        assert_eq!(
+            default_principal("serve", &openssl),
+            default_principal("serve", FP)
+        );
+        // And core can carry it as a principal.
+        assert!(ikigai_core::principal_scope(&default_principal("layers", FP)).is_ok());
     }
 
     /// The served surface is chosen at startup from the operator's whole declared
