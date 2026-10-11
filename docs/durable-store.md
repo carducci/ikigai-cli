@@ -164,9 +164,12 @@ this module's and both silent:
 * A `sink` with no remainder **reads piped stdin** — that is how a secret gets in without
   reaching the command line. The reader is installed only when stdin is *not* a terminal
   (`main.rs` checks `is_terminal`), so an interactive one-shot is unaffected. In a
-  NON-interactive context whose stdin is an open pipe nobody closes — a supervisor, a CI
-  step, an agent harness — `ikigai -c 'sink urn:X'` blocks until EOF. Redirect
-  `< /dev/null` in scripts.
+  NON-interactive context whose stdin is an open pipe nobody writes — a supervisor, a CI
+  step, an agent harness — `ikigai -c 'sink urn:X'` waits 2 s for the first byte, then
+  sends the sink with NO content and says so on stderr (ledger #1088); a sink that
+  requires `content` then refuses rather than writing an empty body. A producer slower
+  than that to say anything loses the race. Redirect `< /dev/null` in scripts to skip
+  the wait.
 * A `source` reads piped stdin only when it would otherwise fail for want of it: one
   REQUIRED argument left unnamed and no value given (ledger #1166). So a query never has
   to be quoted onto the command line:

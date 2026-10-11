@@ -37,11 +37,11 @@ usage:
   ikigai serve [<target>]      run a kernel server (a Unix socket path, or quic://addr to bind)
   ikigai serve <q> --cap <s>   serve under a fixed capability ceiling <s> every client is clamped to
                                (with clients.json below, the OUTER bound each grant narrows within)
-  ikigai serve <q>             per-identity authority when ~/.config/ikigai/clients.json enrols
+  ikigai serve <q>             per-identity authority when ~/.config/ikigai/clients.json enrolls
                                certificates — it maps a client's SHA-256 fingerprint to a grant
                                named in grants.json, so each gets its own scopes, an unenrolled
                                one is REFUSED, and editing the file revokes on the next
-                               connection. `cert add-client` prints the fingerprint to enrol.
+                               connection. `cert add-client` prints the fingerprint to enroll.
                                Each client is named urn:iki:host:<name>:client:<fingerprint>
                                (or its entry's `principal`), and a connection is closed once it
                                is quic.max_connection_age seconds old (default 600), so the
@@ -2143,7 +2143,7 @@ const PEER_DISCOVERY_WAIT: std::time::Duration = std::time::Duration::from_milli
 /// attacker-controlled — anything on the LAN can claim to be `plasma` — so a named mount
 /// REQUIRES a pinned server certificate, by the deployed convention
 /// `<config>/ikigai/quic-<name>/`. An impostor gets a failed handshake; an unenrolled peer
-/// gets a refusal that says how to enrol it, rather than a connection.
+/// gets a refusal that says how to enroll it, rather than a connection.
 ///
 /// That convention is also why this is ergonomic: the name determines both the address (by
 /// announcement) and the identity (by directory), so `--prefer urn:llm:=peer:plasma` needs
@@ -2174,7 +2174,7 @@ fn resolve_peer(name: &str, certs: &Certs) -> Result<(String, Certs), String> {
             return Err(format!(
                 "peer:{name}: found it at {addr}, but this machine holds no pinned \
                  certificate for it ({}/server.crt). Discovery supplies an address, never \
-                 trust — enrol the peer first (on {name}: `ikigai cert add-client <this \
+                 trust — enroll the peer first (on {name}: `ikigai cert add-client <this \
                  host>`, then copy its server.crt here), or pass --cert-dir.",
                 dir.display()
             ));
@@ -2744,7 +2744,7 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
                         diagnose(format_args!(
                             "ikigai: REFUSED a trusted client certificate — {why}\n  \
                              fingerprint: {}\n  \
-                             to enrol it, add it to the `clients` map in {path}",
+                             to enroll it, add it to the `clients` map in {path}",
                             peer.fingerprint
                         ));
                         None

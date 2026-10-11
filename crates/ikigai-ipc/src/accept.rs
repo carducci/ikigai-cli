@@ -14,6 +14,19 @@
 use std::io;
 use std::time::Duration;
 
+/// Write one diagnostic line to stderr, and DROP it if stderr cannot take it (ledger #1217).
+///
+/// The twin of `ikigai-cli`'s in-service `diagnose` (ledger #1208). `eprintln!` PANICS when
+/// the write fails, and a door's stderr is whatever its supervisor handed it: under a harness
+/// that stopped reading, a pipe whose read end has closed (EPIPE; Rust ignores SIGPIPE, so the
+/// write returns the error). These lines are written by the accept loop itself, so the panic
+/// would end [`serve`](crate::serve) and with it the whole door, for a log line nobody was
+/// reading. A diagnostic that cannot be written is lost; the door is not.
+fn diagnose(line: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let _ = writeln!(io::stderr().lock(), "{line}");
+}
+
 /// The first wait after an exhaustion error.
 pub(crate) const BACKOFF_FLOOR: Duration = Duration::from_millis(10);
 /// The longest wait between retries during one exhaustion episode.
@@ -80,10 +93,10 @@ impl Backoff {
     pub(crate) fn failed(&mut self, e: &io::Error) -> Duration {
         let wait = match self.next {
             None => {
-                eprintln!(
+                diagnose(format_args!(
                     "ikigai-ipc: accept failing ({e}); backing off up to {}ms and retrying",
                     BACKOFF_CEILING.as_millis()
-                );
+                ));
                 BACKOFF_FLOOR
             }
             Some(wait) => wait,
@@ -97,11 +110,11 @@ impl Backoff {
     /// Record a connection handed to its thread, closing the episode if one was open.
     pub(crate) fn succeeded(&mut self) {
         if self.next.take().is_some() {
-            eprintln!(
+            diagnose(format_args!(
                 "ikigai-ipc: accept recovered after {} failed attempts (~{}ms backed off)",
                 self.failures,
                 self.waited.as_millis()
-            );
+            ));
             self.failures = 0;
             self.waited = Duration::ZERO;
         }
@@ -143,6 +156,66 @@ mod tests {
             backoff.failed(&e),
             BACKOFF_FLOOR,
             "a new episode starts at the floor"
+        );
+    }
+
+    /// Set in the child [`an_exhaustion_episode_survives_a_closed_stderr`] spawns.
+    const CLOSED_STDERR_CHILD: &str = "IKIGAI_IPC_TEST_CLOSED_STDERR_CHILD";
+    /// What the child prints once both episode lines were written, so a child that ran no
+    /// test (a filter that matched nothing) cannot pass for one that survived.
+    const SURVIVED: &str = "ikigai-ipc-accept-survived";
+
+    /// ledger #1217: an exhaustion episode's two log lines go to stderr, and the accept loop
+    /// writes them itself, so a panic there ends [`serve`](crate::serve) — the whole socket
+    /// door, not one connection. Reproduced with this test binary re-run as a child whose
+    /// stderr is a pipe with its read end CLOSED before the child writes (EPIPE; Rust ignores
+    /// SIGPIPE, so the write returns the error and `eprintln!` panics on it).
+    #[test]
+    fn an_exhaustion_episode_survives_a_closed_stderr() {
+        use std::io::{Read, Write};
+        use std::process::{Command, Stdio};
+
+        if std::env::var_os(CLOSED_STDERR_CHILD).is_some() {
+            // Wait until the parent has closed our stderr's read end, so the writes below
+            // are known to hit a closed pipe rather than racing the close.
+            let _ = io::stdin().read(&mut [0u8; 1]);
+            let mut backoff = Backoff::default();
+            backoff.failed(&io::Error::other("exhausted"));
+            backoff.succeeded();
+            println!("{SURVIVED}");
+            return;
+        }
+        let mut child = Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "accept::tests::an_exhaustion_episode_survives_a_closed_stderr",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CLOSED_STDERR_CHILD, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the test binary as a child");
+        drop(child.stderr.take());
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(b"x")
+            .expect("release the child");
+        let mut out = String::new();
+        child
+            .stdout
+            .take()
+            .expect("piped stdout")
+            .read_to_string(&mut out)
+            .expect("read the child's stdout");
+        let status = child.wait().expect("reap the child");
+        assert!(
+            status.success() && out.contains(SURVIVED),
+            "the accept loop's log lines must not panic on a closed stderr: {status}\n{out}"
         );
     }
 }
