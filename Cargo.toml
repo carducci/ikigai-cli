@@ -1017,7 +1017,14 @@ ikigai-repo = "0.2.0" # 0.2.0 = naming only: names its `space()` `urn:iki:space:
 # Repository browsing (urn:repo:{root}:tree/file/state/hash/explain +
 # urn:iki:annotation:*) over configured roots — opt-in via `browse.root` config lines
 # (embedded host).
-ikigai-browse = "0.18.2" # 0.18.2 is a SECURITY floor (ledger #1126): it never serves `.git` (refused at
+ikigai-browse = "0.18.4" # 0.18.4 is a PERFORMANCE floor (ledger #1131, #1198): every annotation and
+# finding write commits on the archive's one long-lived writer thread. RocksDB seeds a memtable
+# skiplist from the thread id and this host's socket door spawns a thread per connection, so writes
+# from fresh threads left later reads 6x to 68x slower until the memtable flushed (the store's
+# ledger #1127 trap, in browse's own writes). 0.18.3 (ledger #1130) lists a symlink iff it is served
+# (escaping, dangling, looping and `.git` links are dropped) and adds `ikigai_browse::doctor`. No
+# API this host calls changed; it compiles unchanged.
+# Beneath it, still true: 0.18.2 is a SECURITY floor (ledger #1126): it never serves `.git` (refused at
 # the jail, hidden from the listing). 0.18.1 answered `.git/config`, a credentialed remote included,
 # to an ordinary browse read grant.
 # Beneath it, still true: 0.18.1: `^0.5.0` was a CEILING thirteen minors behind. The Rust API this host calls
@@ -1239,7 +1246,11 @@ ikigai-meeting = "0.1.2" # 0.1.2 = the Zoom `account_id` moves out of the token 
 # ⚠ …and 0.2.12 (ledger #1127), a PERFORMANCE floor: every update runs on the store's one writer
 # thread. Each used to commit on a fresh thread, and RocksDB seeds its memtable skiplist from the
 # thread id, so reads after a bulk write ran 2x to 14x slower in release until the memtable flushed.
-ikigai-store = { version = "0.2.12", features = ["persistent"] }
+# ⚠ …and 0.2.14 (ledger #1198). 0.2.13 (ledger #1132) is a PERFORMANCE floor: a graph-scoped update
+# copies only its footprint into the scratch store, not the whole graph, so a ledger append no longer
+# costs O(ledger). 0.2.14 (ledger #1207) adds `DurableStore::shared_writer()`, the writer thread for
+# raw-handle hosts; this host does not call it yet. Both are additive here.
+ikigai-store = { version = "0.2.14", features = ["persistent"] }
 # The work ledger (`urn:iki:ledger:*`): items, comments, labels, links, claims and
 # `next`, as RDF in the store above. It owns no bytes — every read is a scoped SPARQL
 # query at `urn:iki:store:graph-select` and every write a scoped UPDATE at
@@ -1276,7 +1287,16 @@ ikigai-store = { version = "0.2.12", features = ["persistent"] }
 # 0.6.2 is a SECURITY floor (ledger #1085): its own store floor is 0.2.10, so the grants the ledger
 # issues carry no SPARQL egress; this host's store pin is already there, and the ledger's is taken
 # so the two cannot be resolved apart off-tree.
-ikigai-ledger = "0.6.2"
+# ⚠ 0.8.0, and `"0.8.0"` is a RANGE `>=0.8.0, <0.9.0`; `^0.6.2` was a CEILING below it (ledger #1198).
+# 0.7.0 (ledger #1178, #1143, #1147) adds per-verb grants beside `write:{ledger}`: `claim:`,
+# `comment:` and `close:{ledger}` (`Ledger::cap_claim`/`cap_comment`/`cap_close`); keyed comments;
+# a claim release with `from=` is a compare-and-set and `renew=true` never takes; and a CLOSE
+# RELEASES THE CLAIM, recorded in a comment. 0.8.0 (ledger #1199) adds the awaiting-dispatcher
+# state (`comment handback=true`, `next` does not offer it) and records a claim's holder as the
+# caller's principal when the capability carries one. `write:{ledger}` still covers every verb, so
+# `store::grants_for` issues the same lists and this host compiles unchanged; it does not yet offer
+# a worker-sized authority (claim + comment + read, no close), which is ledger #1143's grant.
+ikigai-ledger = "0.8.0"
 # ── Intra-workspace siblings: LOCKSTEP pins, not floors ───────────────────────
 # The seventeen members that take `version.workspace = true` are released TOGETHER, at one
 # version, always. So every sibling pin below states the CURRENT workspace version rather
