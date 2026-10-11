@@ -109,6 +109,13 @@ fn free_port() -> u16 {
 /// Start `serve quic://127.0.0.1:<port>` with `extra` flags; returns the door, its address
 /// and its stderr up to the banner.
 fn serve(home: &Path, certs: &Path, extra: &[&str]) -> (Door, String, String) {
+    serve_with(home, certs, extra, true)
+}
+
+/// [`serve`], choosing whether the reader keeps draining stderr after the banner
+/// (`drain`) or CLOSES the pipe there — what a supervisor or harness that stops reading
+/// does to a door (ledger #1208).
+fn serve_with(home: &Path, certs: &Path, extra: &[&str], drain: bool) -> (Door, String, String) {
     let target = format!("quic://127.0.0.1:{}", free_port());
     let mut args = vec![
         "serve",
@@ -124,9 +131,10 @@ fn serve(home: &Path, certs: &Path, extra: &[&str]) -> (Door, String, String) {
         .expect("the door starts");
     let stderr = child.stderr.take().expect("piped stderr");
     let (tx, rx) = mpsc::channel();
-    // ⚠ The reader keeps DRAINING after the banner rather than dropping the pipe: the door
-    // logs a line per enrolled connection, and a write to a closed stderr panics the
-    // connection's task, which a client sees as `connection lost`.
+    // The reader keeps DRAINING after the banner (unless asked not to) so the door's log is
+    // a pipe someone reads, as under launchd. Until ledger #1208 that was load-bearing: the
+    // door logged a line per enrolled connection with `eprintln!`, and a write to a closed
+    // stderr panicked the connection's task, which a client saw as `connection lost`.
     std::thread::spawn(move || {
         let mut seen = String::new();
         let mut lines = BufReader::new(stderr).lines().map_while(Result::ok);
@@ -138,7 +146,10 @@ fn serve(home: &Path, certs: &Path, extra: &[&str]) -> (Door, String, String) {
             }
         }
         let _ = tx.send(seen);
-        lines.for_each(drop);
+        if drain {
+            lines.for_each(drop);
+        }
+        // Not draining: `lines` drops here, and with it the pipe's only read end.
     });
     let door = Door(child);
     let seen = rx
@@ -332,5 +343,48 @@ fn an_unusable_connection_age_stops_the_door() {
     assert!(!out.status.success(), "the door must not start");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("quic.max_connection_age"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// ledger #1208: a door whose stderr has CLOSED still serves. The per-identity posture logs
+/// one line per connection; with `eprintln!` that write hit EPIPE and panicked the
+/// connection's task, so every client saw `connection lost`. Harmless under launchd (stderr
+/// is a file) but fatal under any supervisor or harness that stops reading.
+#[test]
+fn a_closed_stderr_does_not_drop_a_connection() {
+    let home = scratch("epipe");
+    let certs = certs(&home, &["alice"]);
+    let alice = fingerprint(&certs.join("clients/alice.crt"));
+    std::fs::write(
+        config_home(&home).join("grants.json"),
+        r#"{"reader": ["urn:cap:space:read"]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        config_home(&home).join("clients.json"),
+        format!(r#"{{"clients": {{"{alice}": {{"grant": "reader", "label": "alice"}}}}}}"#),
+    )
+    .unwrap();
+    let (_door, target, banner) = serve_with(&home, &certs, &["--name", "closed"], false);
+    assert!(banner.contains("serving on"), "{banner}");
+    // Two connections: the first one's log line meets the closed pipe, and a door that
+    // survived it must still mint the second.
+    for attempt in 1..=2 {
+        let seen = ok(
+            ask_as(
+                &home,
+                &certs,
+                Some("alice"),
+                &target,
+                "source urn:host:identity",
+            ),
+            &format!("connection {attempt} with stderr closed"),
+        );
+        assert_eq!(
+            principal_of(&seen),
+            Some(format!("urn:iki:host:closed:client:{alice}")),
+            "connection {attempt}: {seen}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&home);
 }

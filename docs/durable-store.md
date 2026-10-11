@@ -153,7 +153,7 @@ ikigai -c 'sink urn:iki:store:update INSERT DATA { GRAPH <urn:demo:g> { <urn:dem
 echo 'INSERT DATA { <urn:a> <urn:b> 42 }' | ikigai -c 'sink urn:iki:store:update'
 ```
 
-⚠ **Two engine behaviours to know before you write your first update**, neither of them
+⚠ **Engine behaviors to know before you write your first update**, none of them
 this module's and both silent:
 
 * On `sink`, the text after the IRI is taken **verbatim** — quotes included. So
@@ -167,6 +167,12 @@ this module's and both silent:
   NON-interactive context whose stdin is an open pipe nobody closes — a supervisor, a CI
   step, an agent harness — `ikigai -c 'sink urn:X'` blocks until EOF. Redirect
   `< /dev/null` in scripts.
+* A `source` reads piped stdin only when it would otherwise fail for want of it: one
+  REQUIRED argument left unnamed and no value given (ledger #1166). So a query never has
+  to be quoted onto the command line:
+  `cat q.rq | ikigai -c 'source urn:iki:store:graph-select graph=urn:iki:ledger:graph:default'`.
+  And when it is, quote with `"…"`: the engine does not treat `'…'` as quotes, so a `;`,
+  `|`, `(` or `)` inside single quotes still splits the line.
 
 ## Typing at the ledger
 
@@ -201,7 +207,7 @@ one capability. The catalog lists the canonical template (`urn:iki:ledger:{ledge
 and never the sugar, so a tool reading the manifold expands the `ledger` argument's
 declared default rather than looking for the short name.
 
-⚠ The two engine behaviours in the section above apply here unchanged: the text after the
+⚠ The engine behaviors in the section above apply here unchanged: the text after the
 IRI is **verbatim**, quotes included, and a `sink` with no remainder reads piped stdin.
 
 ### Loading a batch

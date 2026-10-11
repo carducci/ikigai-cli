@@ -2350,7 +2350,9 @@ fn run_repl(engine: Engine, plain: bool, commands: &[String], topology: &[String
     if !commands.is_empty() {
         // A batch fed on a NON-TTY stdin (`printf %s "$v" | ikigai -c 'sink urn:secret:x'`)
         // routes that stdin to the first content-less `sink` — so a secret is piped in, never
-        // placed on the command line. A TTY stdin is left alone (nothing to read, no block).
+        // placed on the command line — or to the first `source` stage left with one REQUIRED
+        // argument and no value for it (`cat q.rq | ikigai -c 'source …:graph-select graph=G'`,
+        // ledger #1166). A TTY stdin is left alone (nothing to read, no block).
         #[cfg(not(target_family = "wasm"))]
         {
             use std::io::IsTerminal;
@@ -2526,6 +2528,21 @@ const FINGERPRINT_SHOWN: usize = 16;
 #[cfg(all(feature = "embedded", feature = "quic"))]
 fn short_fingerprint(full: &str) -> &str {
     &full[..full.len().min(FINGERPRINT_SHOWN)]
+}
+
+/// Write one diagnostic line to stderr, and DROP it if stderr cannot take it (ledger #1208).
+///
+/// For what a door says while it serves — per connection, per discovery event — never for
+/// what it says before it serves or as it dies. `eprintln!` PANICS when the write fails, and
+/// a door's stderr is whatever its supervisor handed it: under launchd a file, but under a
+/// harness or supervisor that stops reading, a pipe whose read end has closed (EPIPE; Rust
+/// ignores SIGPIPE, so the write returns the error). The panic then lands in the
+/// CONNECTION'S task, and the client sees `connection lost` for a log line nobody was
+/// reading. A diagnostic that cannot be written is lost; the connection it describes is not.
+#[cfg(all(feature = "embedded", feature = "quic"))]
+fn diagnose(line: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
 }
 
 /// The trusted client certificates as identities: label, SHORT fingerprint, and the file
@@ -2707,14 +2724,14 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
                             &ikigai_embedded::tenant::tenant_root(&root, &peer.segment_id),
                         );
                         let principal = principal_of(&peer.fingerprint, authority.principal);
-                        eprintln!(
+                        diagnose(format_args!(
                             "ikigai: client {} → grant \"{grant}\" ({}) as {principal}",
                             short_fingerprint(&peer.fingerprint),
                             match capability.scopes() {
                                 None => "unrestricted".to_string(),
                                 Some(s) => format!("{} scope(s)", s.len()),
                             }
-                        );
+                        ));
                         Some(ikigai_quic::Session {
                             capability,
                             file_segment: peer.segment_id.clone(),
@@ -2724,12 +2741,12 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
                     // The FULL fingerprint, so debugging a denied client is a copy-paste
                     // rather than a packet capture.
                     Err(why) => {
-                        eprintln!(
+                        diagnose(format_args!(
                             "ikigai: REFUSED a trusted client certificate — {why}\n  \
                              fingerprint: {}\n  \
                              to enrol it, add it to the `clients` map in {path}",
                             peer.fingerprint
-                        );
+                        ));
                         None
                     }
                 }
@@ -2907,7 +2924,8 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
                     (ikigai_discovery::TXT_CEILING, posture.as_str()),
                     (ikigai_discovery::TXT_VERSION, wire_version.as_str()),
                 ],
-                |event| eprintln!("ikigai: {event}"),
+                // Fires on the announcer's own thread for as long as the door serves.
+                |event| diagnose(format_args!("ikigai: {event}")),
             ) {
                 Ok(handle) => Some(handle),
                 // Not fatal: a kernel that cannot announce still serves everyone who knows
