@@ -2704,6 +2704,28 @@ fn serve_quic(
         // A `clients.json` that exists but does not parse stops the server here: a
         // broken authority config must not degrade into serving everyone under 2 or 3.
         let enrolment = ikigai_embedded::clients::enrolment()?;
+        // ★ A door that HOSTS LAYERS needs posture 1, and refuses to start without it (ledger
+        // #1281). Layers are for participants: each certificate is named by its enrollment and
+        // granted exactly its layer actions. Without a `clients.json` the door fell to posture
+        // 3 (or to a shared `--cap` ceiling), where no participant has a grant and every
+        // trusted certificate got fs read, write and delete in its own segment: a door built
+        // for layers serving a filesystem instead. The edge guarded it with an `ExecStartPre`
+        // file test; the door should not need one. A door WITHOUT `layers/` is unchanged.
+        if let (Some(hosted), None) = (&layers, &enrolment) {
+            let clients = ikigai_embedded::clients::clients_path()
+                .map_or_else(|| "clients.json".into(), |p| p.display().to_string());
+            let grants = ikigai_embedded::grants_path()
+                .map_or_else(|| "grants.json".into(), |p| p.display().to_string());
+            return Err(format!(
+                "this door hosts layers (defined in {}) but enrolls no certificates: there is \
+                 no {clients}. A layer door serves only per-identity grants, so it will not \
+                 start without them. Generate the enrollment with `ikigai-layers grants {}` \
+                 (it writes {clients} and {grants}), or remove the `layers/` directory to \
+                 serve without layers.",
+                hosted.config.join("layers").display(),
+                hosted.config.display(),
+            ));
+        }
         // A served connection addresses files only inside `file_root/<segment>` — the
         // file module's jail refuses absolute IRI paths and anything outside its root
         // whatever the capability says, and the transport roots each tenant at its own

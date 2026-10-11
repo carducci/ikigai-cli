@@ -316,6 +316,9 @@ ikigai serve quic://0.0.0.0:4434 --name layers
   a layer stamps it into every entry, tuple and receipt; a writer that sends an attribution,
   a time or a sequence is refused. Both files are re-read per connection, so a manifest
   edit plus a regenerate needs no restart; a new or changed layer definition does.
+  **A door that hosts layers refuses to start without a `clients.json`**, `--cap` or not: it
+  would otherwise fall to the per-client-workspace posture, where no participant has a grant
+  and every trusted certificate gets a private filesystem instead.
 - **Admission** composes `urn:shacl:validate`, bound beside the layers, on a kernel with a
   clock. The door runs one validation through itself before it serves, and **refuses to
   start** if that fails: a layer without its validator would admit nothing.

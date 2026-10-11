@@ -718,3 +718,82 @@ fn without_a_layers_directory_serve_is_unchanged() {
     );
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// Start `serve quic://127.0.0.1:0 --name layers` with `extra` flags and report how it
+/// ENDED: `Ok(banner)` when it printed `serving on` (the door is killed), `Err((code, stderr))`
+/// when it exited first.
+fn start_or_refuse(home: &Path, certs: &Path, extra: &[&str]) -> Result<String, (i32, String)> {
+    let mut args = vec![
+        "serve",
+        "quic://127.0.0.1:0",
+        "--name",
+        "layers",
+        "--cert-dir",
+        certs.to_str().unwrap(),
+    ];
+    args.extend_from_slice(extra);
+    let mut child = spawn(home, &args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the door starts");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut seen = String::new();
+        let mut served = false;
+        let mut lines = BufReader::new(stderr).lines().map_while(Result::ok);
+        for line in lines.by_ref() {
+            seen.push_str(&line);
+            seen.push('\n');
+            if line.contains("serving on") {
+                served = true;
+                break;
+            }
+        }
+        let _ = tx.send((served, seen));
+        lines.for_each(drop);
+    });
+    let (served, seen) = rx
+        .recv_timeout(PATIENCE)
+        .unwrap_or_else(|e| panic!("`{args:?}` neither served nor exited: {e}"));
+    if served {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(seen);
+    }
+    // stderr reached EOF: the process is exiting. `wait`, never `try_wait` (field guide 9h).
+    let status = child.wait().expect("the door's exit status");
+    Err((status.code().unwrap_or(-1), seen))
+}
+
+/// ledger #1281: a door whose config home has `layers/` but NO `clients.json` used to start in
+/// the per-client-workspace posture, where every trusted certificate gets fs read, write and
+/// delete in its own segment and no participant has a grant. A door that hosts layers is for
+/// participants, so it refuses to start without per-identity grants, under `--cap` too, and
+/// says which file is missing. Without `layers/`, the same config home still serves as before.
+#[test]
+fn a_layer_door_without_per_identity_grants_refuses_to_start() {
+    let home = scratch("nogrants");
+    let certs = certs(&home);
+    configure_layers(&home, &certs);
+    std::fs::remove_file(config_home(&home).join("clients.json")).unwrap();
+
+    for extra in [&[][..], &["--cap", "urn:cap:space:read"][..]] {
+        let (code, stderr) = start_or_refuse(&home, &certs, extra)
+            .expect_err("a layer door with no clients.json must not serve");
+        assert_ne!(code, 0, "{extra:?}: a refusal exits non-zero: {stderr}");
+        assert!(
+            stderr.contains("clients.json") && stderr.contains("grants.json"),
+            "{extra:?}: the refusal names the per-identity grants it needs: {stderr}"
+        );
+        assert!(!stderr.contains("serving on"), "{extra:?}: {stderr}");
+    }
+
+    // The same config home without `layers/` is the door it always was.
+    std::fs::remove_dir_all(config_home(&home).join("layers")).unwrap();
+    let banner = start_or_refuse(&home, &certs, &[]).expect("a door without layers/ serves");
+    assert!(banner.contains("per-client workspaces"), "{banner}");
+    let _ = std::fs::remove_dir_all(&home);
+}
