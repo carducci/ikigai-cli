@@ -177,7 +177,8 @@ enum Mode {
         caps: Vec<String>,
         /// `--http <port|addr>`: serve the inbound HTTP face instead of IPC/QUIC.
         /// A bare port binds `127.0.0.1:<port>` (loopback — TLS terminates at the
-        /// fronting proxy, e.g. Apache); a full `host:port` overrides the bind.
+        /// fronting proxy, e.g. Apache); a full `host:port` overrides the bind. Port `0`
+        /// takes a free port from the kernel, and the banner names the one bound.
         http: Option<String>,
         /// `--trust-proxy`: honor `X-Forwarded-Proto`/`-For` from the upstream (enable
         /// ONLY behind a proxy you control, e.g. Apache). Drives HTTPS detection for HSTS.
@@ -3190,6 +3191,8 @@ fn serve_ipc(_path: Option<String>, _mounts: Mounts) -> ! {
 /// terminate at the fronting proxy (Apache holds the cert), so a bare `--http <port>`
 /// binds loopback (`127.0.0.1`) — never a cleartext socket on the public interface.
 /// A full `host:port` overrides the bind (e.g. `0.0.0.0:8080` behind a firewall).
+/// The socket is bound BEFORE the banner prints, so the banner is a readiness signal and
+/// names the address actually bound (port `0` → the kernel's choice).
 /// S0 resolves every request under the public capability; the per-tenant door (the
 /// identity→capability lookup) fills the same seam in a later slice.
 #[cfg(all(feature = "embedded", feature = "web"))]
@@ -3406,6 +3409,24 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
     } else {
         "no proxy trust"
     };
+    // ★ BIND BEFORE THE BANNER, and name the address that was BOUND (ledger #1223). The
+    // banner used to print the configured address and `serve_with` bound it afterwards, so
+    // the banner was not a readiness signal and `--http 0` announced port 0. That pushed
+    // every harness into choosing a port itself — bind `:0`, read the port, release it, hand
+    // it over — and on macOS a released port is not reliably free: `socket()` and
+    // `FD_CLOEXEC` are two calls there, so a child spawned by another thread in between
+    // inherits the listener and holds the port LISTENING after the harness dropped it. This
+    // door then failed to bind (EADDRINUSE), and the harness's connect landed in the
+    // inheritor's backlog and was reset. Binding here lets `--http 0` take a free port from
+    // the kernel atomically, and makes the banner true the moment it prints.
+    let listener = match runtime.block_on(tokio::net::TcpListener::bind(addr)) {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!("ikigai: HTTP serve error: could not bind {addr}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let addr = listener.local_addr().unwrap_or(addr);
     eprintln!(
         "ikigai: serving HTTP on {addr}  ({posture}; {route_note}; {cors_note}; {push_note}{proxy_note}; terminate TLS at your proxy)  (Ctrl-C to stop)"
     );
@@ -3435,7 +3456,9 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
             Vec::new()
         },
     });
-    match runtime.block_on(ikigai_web::serve_with(kernel, cap_fn, addr, config)) {
+    match runtime.block_on(ikigai_web::serve_with_listener(
+        kernel, cap_fn, listener, config,
+    )) {
         Ok(()) => std::process::exit(0),
         Err(e) => {
             eprintln!("ikigai: HTTP serve error: {e}");
