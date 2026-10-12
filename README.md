@@ -671,15 +671,17 @@ The engine drives a `Resolver` — the seam in `ikigai-resolve` (`issue` / `is_c
 renderer-agnostic REPL engine over that seam; `ikigai-wire` is the postcard Call/Reply
 protocol the remote transports speak. The transports are feature-gated:
 
-| crate | feature | targets |
-|-------|---------|---------|
-| `ikigai-embedded` | `embedded` (default) | native + wasm |
+| crate | `ikigai-cli` feature | targets |
+|-------|----------------------|---------|
+| `ikigai-embedded` | `embedded` (default) | native (mDNS discovery, SMTP, the filesystem) |
 | `ikigai-ipc`      | `ipc` (default) | Unix only (Unix domain socket) |
 | `ikigai-quic`     | `quic` (opt-in) | native (QUIC + mutually-pinned TLS) |
 
 `quic` is opt-in (it pulls quinn/rustls/tokio); the default build is `embedded` +
-`ipc`. The WebAssembly build enables only `embedded`; `ipc`/`quic` are gated out
-by target.
+`ipc`. None of the three builds for WebAssembly: `ikigai-embedded` pulls `socket2`
+through `mdns-sd` and `lettre`, which has no wasm32 target. The wasm face is
+`ikigai-engine` on its own (ikigai-web-demo runs a kernel in a browser through it), and
+CI's `wasm-lib` job checks exactly that crate.
 
 The modules and pieces the host composes, each published on crates.io from this workspace:
 
