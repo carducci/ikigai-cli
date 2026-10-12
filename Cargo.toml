@@ -654,7 +654,12 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 [workspace.dependencies]
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
-ikigai-core = "0.1.96" # 0.1.96 = the floor `ikigai-layers` 0.2.0 asks for (ledger #1188): the release that
+ikigai-core = "0.1.98" # 0.1.98 = core main after the YANKED 0.1.97, which shipped from a draft vocabulary
+# branch: a lock must never hold 0.1.97, and a floor above it says so. 0.1.98 carries ledger #1352 (a `%` in the
+# other name positions is a character), #1356 (an authored scope is escaped, parsed, else a literal, in every
+# face) and #791 (the floor memo degrades past its bound). Not an API floor: no source here calls anything new
+# in it. ⚠ `^0.1.98` is also a ceiling below 0.2.0.
+# Beneath it, still true: 0.1.96 = the floor `ikigai-layers` 0.2.0 asks for (ledger #1188): the release that
 # carried the layer vocabulary its graphs emit. No source here calls an API new in 0.1.96; the pin
 # states it because nothing below it can resolve beside the layer host, so a lower number would
 # claim a combination no build can produce. ⚠ `^0.1.96` is also a ceiling below 0.2.0.
@@ -779,7 +784,9 @@ ikigai-core = "0.1.96" # 0.1.96 = the floor `ikigai-layers` 0.2.0 asks for (ledg
 # holds beneath it: below that a MOUNTED template row whose local name-guess collides with a
 # shorter sibling is dropped from the manifold, so `ikigai mcp` silently stops projecting
 # browse-pr-explain and browse-pr-review.
-ikigai-vocab = "0.1.96" # 0.1.96 = core 0.1.96's lockstep release: it defines the layer family (`ik:Layer`,
+ikigai-vocab = "0.1.98" # 0.1.98 = core 0.1.98's lockstep release, past the YANKED 0.1.97 (a draft vocabulary).
+# Not an API floor; raised with core because this repo's tests validate against the vocabulary the lock resolves.
+# Beneath it: 0.1.96 = core 0.1.96's lockstep release: it defines the layer family (`ik:Layer`,
 # `ik:Message`, `ik:Offer`, `ik:seq`, …) the graphs of a hosted layer carry (ledger #1182, #1188). Not an
 # API floor; raised with core because this repo's tests validate against the vocabulary the lock resolves.
 # Beneath it: 0.1.95 = core 0.1.95's lockstep release. Not an API floor; raised with core because this
@@ -1415,7 +1422,10 @@ ikigai-meeting = "0.1.2" # 0.1.2 = the Zoom `account_id` moves out of the token 
 # ⚠ …and 0.2.18 (ledger #1327), a SECURITY floor taken with `ikigai-intray`'s: the store's own doors
 # were already time-bounded (since 0.2.7), and 0.2.18 hands the same deadline, token and overdue cap to
 # a consumer as `EvaluationBudget`, which intray's `match=` now runs under. Additive for this host.
-ikigai-store = { version = "0.2.18", features = ["persistent"] }
+# ⚠ …and 0.2.19 (ledger #1333, #1354), a SECURITY floor taken with `ikigai-intray`'s: an update's triple
+# terms are bounded in what it leaves in the store (#1333), and a `<<( )>>` template nests to
+# MAX_RDF_NESTING rather than being refused as too branchy (#1354). No signature changed.
+ikigai-store = { version = "0.2.19", features = ["persistent"] }
 # The work ledger (`urn:iki:ledger:*`): items, comments, labels, links, claims and
 # `next`, as RDF in the store above. It owns no bytes — every read is a scoped SPARQL
 # query at `urn:iki:store:graph-select` and every write a scoped UPDATE at
@@ -1461,7 +1471,14 @@ ikigai-store = { version = "0.2.18", features = ["persistent"] }
 # caller's principal when the capability carries one. `write:{ledger}` still covers every verb, so
 # `store::grants_for` issues the same lists and this host compiles unchanged; it does not yet offer
 # a worker-sized authority (claim + comment + read, no close), which is ledger #1143's grant.
-ikigai-ledger = "0.8.0"
+# ⚠ 0.11.0, and `"0.11.0"` is a RANGE `>=0.11.0, <0.12.0`; `^0.8.0` was a CEILING three minors below it.
+# 0.9.0 (ledger #1128) adds `urn:iki:ledger:{ledger}:count` and reserves the ledger name `count`. 0.10.0
+# (ledger #1315) adds the `about:{ledger}` grant (`Ledger::cap_about`), and `item:{id}:about` now DECLARES the
+# family `urn:cap:ledger:*` (enforcement stays exact). 0.11.0 (ledger #1329) adds `ClaimKind::Agent` and makes
+# `ClaimKind` `#[non_exhaustive]`. Nothing here names `ClaimKind`, matches on it, or names a ledger `count`, and
+# `store::grants_for` issues the same lists (write:{ledger} still covers about), so this host compiles and
+# behaves unchanged; `tests/ledger.rs` runs against it.
+ikigai-ledger = "0.11.0"
 # The layer host (`urn:layer:{layer}`, `urn:layers:*`, `urn:collab:{name}`), linked by `serve
 # quic://` when the config home has a `layers/` directory (ledger #1188). 0.2.2 is a true FLOOR,
 # not a lock preference (ledger #1295): since 0.2.1 the host validates every write itself, and

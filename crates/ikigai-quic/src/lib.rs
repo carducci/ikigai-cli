@@ -239,17 +239,47 @@ const AGED: u32 = 3;
 /// writing is not yet DELIVERED, and closing at once would throw it away.
 const REPLY_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How long a connection may be SILENT before either side declares it dead.
+/// How long a CALL may be silent: the default per-call deadline ([`connect_with`] starts
+/// [`QuicResolver::with_call_timeout`] at the `idle` it is given), and a SERVER's idle timeout.
 ///
 /// Generous on purpose, mirroring `ipc.timeout` (cli #259): the server says nothing
 /// until a resolution finishes, so for a long resolution — a 70B loading ~40GB, a
 /// hard question generating for minutes — the silence IS the work. quinn's ~30s
 /// default killed exactly those calls mid-generation while the model kept computing.
-/// The cost is symmetric: a peer that dies MID-REQUEST now takes up to this long to
-/// notice (the 5s dial bound still catches a dead peer at connect time). A deadline
-/// that cannot tell "hung" from "busy" reports the wrong thing confidently, which is
-/// worse than reporting late. `quic.timeout` (seconds) in the host config overrides.
+/// A deadline that cannot tell "hung" from "busy" reports the wrong thing confidently,
+/// which is worse than reporting late. `quic.timeout` (seconds) in the host config overrides.
+///
+/// ★ Until cli 0.1.56 this was also how long a peer that died MID-REQUEST took to notice.
+/// Now the client pings and its connection's idle timeout is [`LIVENESS_TIMEOUT`], so a dead
+/// peer is found in seconds while a silent call keeps this much patience (ledger
+/// [#1359](http://localhost:1060/l/default/item/1359)). A server built with it and talking to
+/// a client older than 0.1.56 (which does not ping) still idles out at this bound, as before.
 pub const DEFAULT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long a CLIENT's connection may go without hearing anything from its peer before it is
+/// declared dead: the QUIC idle timeout a client actually runs with (capped by the `idle` it
+/// was given, if that is shorter), negotiated down to the server's too, since QUIC takes the
+/// smaller of the two. Since cli 0.1.56 (ledger
+/// [#1359](http://localhost:1060/l/default/item/1359)).
+///
+/// A peer that vanishes (power, network, a wedged host) without closing is found within this
+/// bound by BOTH ends, where it used to cost the whole [`DEFAULT_IDLE_TIMEOUT`]. It can be
+/// this short because the client pings ([`KEEP_ALIVE_INTERVAL`]): a live peer is never silent
+/// at the transport, however long the call it is working on.
+///
+/// Why fifteen seconds: short enough that a dead peer is found while a person is still
+/// waiting, long enough to ride out a Wi-Fi roam or a congested link that loses two pings in
+/// a row. quinn's own default idle timeout is thirty seconds with no pings at all.
+pub const LIVENESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How often a client PINGs a connection that has carried nothing else for that long: a third
+/// of [`LIVENESS_TIMEOUT`], so a live connection is declared dead only after three pings in a
+/// row (or their acknowledgments) are lost, and quinn's loss recovery probes again in
+/// between. A busy connection sends no pings at all. The cost of an idle one is one small
+/// packet each way every five seconds, which also keeps a NAT's UDP mapping warm (those
+/// commonly expire after thirty seconds or more) through a long silent call.
+pub const KEEP_ALIVE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(LIVENESS_TIMEOUT.as_secs() / 3);
 
 /// The deadline for a peer's **self-description** — an `Entries` enumeration or a `Meta`
 /// issue — as opposed to [`DEFAULT_IDLE_TIMEOUT`], which bounds a *resolution*.
@@ -587,7 +617,7 @@ async fn serve_connection_aged(
             Err(_) => return,
         };
         let reply = match decode::<Call>(&bytes) {
-            Ok(call) => dispatch(kernel, call, session),
+            Ok(call) => dispatch_off_worker(kernel, call, session),
             Err(e) => Reply::ErrorTyped(ikigai_wire::WireError::Endpoint(format!(
                 "malformed call: {e}"
             ))),
@@ -642,6 +672,31 @@ fn localize(request: &mut Request, segment: &str) {
         if let Ok(rooted) = Iri::parse(format!("urn:file:{segment}/{rel}")) {
             request.target = rooted;
         }
+    }
+}
+
+/// [`dispatch`], from a door's async task, WITHOUT stalling the transport while it runs.
+///
+/// ★ A resolution is synchronous and may run for minutes (a model generating), and it runs
+/// on a runtime worker. tokio puts a task woken by the running one in that worker's LIFO
+/// slot, which no other worker may steal, and reading the call to its end wakes the
+/// CONNECTION'S DRIVER there. Blocking the worker then froze the connection for the whole
+/// resolution: no packet read, no acknowledgment sent. Nothing needed either while nothing
+/// pinged, but a client that pings (cli 0.1.56, ledger
+/// [#1359](http://localhost:1060/l/default/item/1359)) hears no acknowledgment and declares
+/// a live, working peer dead at its liveness bound, which is exactly the honest long call
+/// keep-alive must keep (`keep_alive::an_honest_call_silent_past_the_old_idle_window_still_answers`
+/// failed that way against this door before this function). `block_in_place` hands the
+/// worker's queued tasks, the LIFO slot included, to another thread first. It exists only on
+/// a multi-thread runtime, which is what every door here builds ([`serve_bounded_on`]); on
+/// any other, the call is made in place as before.
+fn dispatch_off_worker(kernel: &Kernel, call: Call, session: &Session) -> Reply {
+    let multi_thread = Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    if multi_thread {
+        tokio::task::block_in_place(|| dispatch(kernel, call, session))
+    } else {
+        dispatch(kernel, call, session)
     }
 }
 
@@ -755,7 +810,9 @@ pub fn connect(
 /// [`connect`] with an explicit idle timeout (see [`DEFAULT_IDLE_TIMEOUT`]).
 ///
 /// The resolver's per-call deadline ([`QuicResolver::with_call_timeout`]) starts at the same
-/// value as `idle`: see that method for why.
+/// value as `idle`: see that method for why. The connection itself pings and runs under the
+/// shorter [`LIVENESS_TIMEOUT`] (or `idle`, if that is shorter still), so a dead peer is
+/// found in seconds however patient the calls are.
 pub fn connect_with(
     addr: SocketAddr,
     identity: &Identity,
@@ -1077,10 +1134,14 @@ impl QuicResolver {
     /// it.
     ///
     /// ★ **Why the default is the idle timeout.** The server says nothing until a resolution
-    /// finishes and nothing pings (no keep-alive is configured), so a silent resolution could not
-    /// outlive the idle timeout against an honest peer. Starting the deadline there removes
-    /// the unbounded cases and changes nothing that used to succeed; and an operator who
-    /// raised `quic.timeout` for long model calls keeps them, because the deadline follows.
+    /// finishes, and before cli 0.1.56 nothing pinged, so a silent resolution could not outlive
+    /// the idle timeout against an honest peer. Starting the deadline there removed the
+    /// unbounded cases and changed nothing that used to succeed; and an operator who raised
+    /// `quic.timeout` for long model calls keeps them, because the deadline follows. Since
+    /// 0.1.56 the client pings ([`KEEP_ALIVE_INTERVAL`]), so the connection no longer ends a
+    /// silent call at all: this deadline is the ONE bound on a call's silence, which is what
+    /// made keep-alive safe to turn on (ledger
+    /// [#1359](http://localhost:1060/l/default/item/1359)).
     /// A caller that knows its calls are short (a mirror pass over a layer host) sets a short
     /// one here, or per call with [`issue_as_within`](Self::issue_as_within).
     pub fn with_call_timeout(mut self, call_timeout: Option<std::time::Duration>) -> Self {
@@ -1402,24 +1463,53 @@ fn server_config_accepting(
     Ok(config)
 }
 
-/// A transport config carrying the idle timeout. Each side enforces its OWN, so both
-/// the server and the client builders apply it.
+/// A transport config carrying the idle timeout and nothing else: what a SERVER runs with
+/// ([`server_config`]). Each side enforces its own idle timeout, and QUIC NEGOTIATES the
+/// smaller of the two (RFC 9000 section 10.1), so the client's [`client_transport`] decides
+/// how soon a connection to a new client dies, whatever this side was configured with.
 ///
-/// Keep-alive stays absent, and the reason is NOT that a ping would keep a dead peer's
-/// connection alive: RFC 9000 section 10.1 restarts the idle timer on a send only for the
-/// FIRST ack-eliciting packet after a packet was received, so pings to a dead or stopped peer
-/// cannot hold its connection open past `idle` (an earlier version of this comment said
-/// they could, ledger #1288). What a keep-alive WOULD change is the other case: a peer whose
-/// QUIC stack still acknowledges while its kernel is wedged would keep the connection alive
-/// indefinitely, so a resolution stuck there would never time out, where today the idle
-/// timeout ends it. Pinging would let `idle` shrink (a dead peer found in seconds, a long
-/// silent resolution still alive because the peer's stack acks) at the price of that
-/// unbounded wedge, unless a per-call deadline comes with it. That is a design decision, not
-/// made here.
+/// ★ **The server does not ping** (ledger [#1359](http://localhost:1060/l/default/item/1359)).
+/// Keep-alive is safe only for a caller that bounds its own calls, because a peer whose QUIC
+/// stack still answers while its kernel is wedged keeps a pinged connection alive for ever,
+/// and then only a per-call deadline ends the call. The client has that deadline
+/// ([`QuicResolver::with_call_timeout`], cli 0.1.56). A client older than it has none, and a
+/// server that pinged would hand that client the unbounded wedge; not pinging leaves it the
+/// idle bound it always had (`keep_alive::an_older_client_without_pings_keeps_its_idle_bound`).
+/// A new client pings for both ends: the server hears the pings and the client hears the
+/// acknowledgments, so both idle timers restart.
 fn transport(idle: std::time::Duration) -> io::Result<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(quinn::IdleTimeout::try_from(idle).map_err(other)?));
     Ok(transport)
+}
+
+/// A CLIENT's transport: the liveness bound ([`LIVENESS_TIMEOUT`], or `idle` if shorter) as
+/// its idle timeout, and a PING every third of it ([`KEEP_ALIVE_INTERVAL`]) whenever nothing
+/// else was sent (ledger [#1359](http://localhost:1060/l/default/item/1359)).
+///
+/// What keep-alive changes, and what it does not. Pinging does not find a dead peer sooner:
+/// the idle timeout does that, and RFC 9000 section 10.1 restarts the idle timer on a send
+/// only for the first ack-eliciting packet after one was received, so pings to a dead peer
+/// cannot hold its connection open (ledger #1288 corrected an earlier comment that said they
+/// could). What pinging does is keep a connection to a LIVE but silent peer open, and that is
+/// what lets the idle timeout shrink from the five-minute silence an honest resolution may
+/// need to the fifteen seconds a dead peer is allowed to hide: the silence of a long call no
+/// longer reaches the idle timer, and its bound is the call deadline instead (which starts
+/// at `idle`, the old idle timeout, so the patience a call gets is unchanged).
+fn client_transport(idle: std::time::Duration) -> io::Result<quinn::TransportConfig> {
+    let (bound, ping) = liveness(idle);
+    let mut transport = transport(bound)?;
+    transport.keep_alive_interval(ping);
+    Ok(transport)
+}
+
+/// The client's idle timeout and keep-alive interval for a configured `idle`: the liveness
+/// bound capped at `idle`, and a third of it. A zero `idle` is QUIC's "no idle timeout", as it
+/// always was here, and then nothing pings (a zero interval would ping without pause).
+fn liveness(idle: std::time::Duration) -> (std::time::Duration, Option<std::time::Duration>) {
+    let bound = idle.min(LIVENESS_TIMEOUT);
+    let ping = bound / 3;
+    (bound, (!ping.is_zero()).then_some(ping))
 }
 
 /// How long a dial may run before the peer is declared unreachable.
@@ -1490,12 +1580,12 @@ fn client_config_offering(
         .map_err(other)?;
     tls.alpn_protocols = alpns;
     let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(other)?;
-    // The idle timeout is OURS to set (see [`DEFAULT_IDLE_TIMEOUT`]): quinn's ~30s
-    // default killed long-silent work (a 70B generating) mid-request. Keep-alive stays
-    // off — an earlier attempt showed pinging makes a DEAD peer take LONGER to notice
-    // (RFC 9000 restarts the idle timer on ack-eliciting sends); see [`transport`].
+    // The idle timeout and keep-alive are OURS to set: quinn's ~30s default idle killed
+    // long-silent work (a 70B generating) mid-request, and it pings nothing. The client pings
+    // and keeps a short liveness bound; the silence of a long call is the call deadline's to
+    // bound. See [`client_transport`].
     let mut config = quinn::ClientConfig::new(Arc::new(quic));
-    config.transport_config(Arc::new(transport(idle)?));
+    config.transport_config(Arc::new(client_transport(idle)?));
     Ok(config)
 }
 
@@ -1949,11 +2039,13 @@ mod tests {
             .with_arg("in", ArgRef::Inline(text.as_bytes().to_vec()))
     }
 
-    /// The idle timeout decides whether LONG-SILENT WORK survives: the server says
+    /// `idle` (`quic.timeout`) decides whether LONG-SILENT WORK survives: the server says
     /// nothing while a resolution runs, and quinn's old ~30s default killed a hard
     /// LLM question mid-generation (observed bug->plasma) while the model kept
     /// computing. A client outliving the silence gets the reply; one with a shorter
-    /// idle than the work loses the connection.
+    /// `idle` than the work misses its call deadline, which starts at `idle`. Since cli
+    /// 0.1.56 it is that DEADLINE that ends the call, not the connection: the client pings,
+    /// so the connection stays up (ledger #1359).
     #[test]
     fn a_slow_resolution_survives_a_generous_idle_and_dies_under_a_short_one() {
         let server_id = generate();
@@ -2020,9 +2112,12 @@ mod tests {
             std::time::Duration::from_secs(1),
         )
         .unwrap();
+        let missed = impatient
+            .issue(req())
+            .expect_err("a 1s idle must not survive 3s of silent work");
         assert!(
-            impatient.issue(req()).is_err(),
-            "a 1s idle must not survive 3s of silent work"
+            matches!(&missed, Error::Timeout(said) if said.contains("did not answer within 1s")),
+            "ended by the call deadline the 1s idle set, not a lost connection: {missed:?}"
         );
         drop(impatient);
         // 10s of patience: the same call completes.
@@ -2738,8 +2833,17 @@ mod reconnect_tests {
     }
 
     /// Serve exactly one connection on `server_cfg` at `addr`, then return — the caller
-    /// spawns this again to simulate a server that went away and came back.
-    fn serve_one(server_cfg: quinn::ServerConfig, addr: SocketAddr) -> thread::JoinHandle<()> {
+    /// spawns this again to simulate a server that went away and came back. With `stop`, the
+    /// server goes away when it fires, closing its endpoint; without, when the client leaves.
+    ///
+    /// ⚠ The server must be TOLD to go away (ledger #1359). This used to wait for the
+    /// connection to idle out, and since cli 0.1.56 a client pings, so a connection between
+    /// two live peers never idles out: the first server would have served for ever.
+    fn serve_one(
+        server_cfg: quinn::ServerConfig,
+        addr: SocketAddr,
+        stop: Option<tokio::sync::oneshot::Receiver<()>>,
+    ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
             let rt = Runtime::new().unwrap();
             rt.block_on(async move {
@@ -2757,7 +2861,19 @@ mod reconnect_tests {
                 )));
                 if let Some(incoming) = endpoint.accept().await {
                     if let Ok(connection) = incoming.await {
-                        serve_connection(&kernel, connection, &session).await;
+                        let serving = tokio::spawn(async move {
+                            serve_connection(&kernel, connection, &session).await;
+                        });
+                        match stop {
+                            Some(stop) => {
+                                let _ = stop.await;
+                                endpoint.close(0u32.into(), b"going away");
+                                serving.abort();
+                            }
+                            None => {
+                                let _ = serving.await;
+                            }
+                        }
                     }
                 }
                 // Let the close frame flush before the endpoint drops.
@@ -2789,10 +2905,10 @@ mod reconnect_tests {
         let port = probe.local_addr().unwrap();
         drop(probe);
 
-        // First server instance. A SHORT idle timeout, explicitly: noticing the dead
-        // first connection costs up to the idle bound, and this test is about the
+        // First server instance. A SHORT idle timeout, explicitly: this test is about the
         // reconnect, not about sitting out the generous production default.
-        let first = serve_one(cfg(), port);
+        let (go_away, stop) = tokio::sync::oneshot::channel();
+        let first = serve_one(cfg(), port, Some(stop));
         let client = connect_with(
             port,
             &client_id,
@@ -2802,12 +2918,13 @@ mod reconnect_tests {
         .unwrap();
         assert_eq!(client.issue(upper("one")).unwrap().0.bytes, b"ONE");
 
-        // The server goes away — this is what leaves the resolver holding a dead connection.
+        // The server goes away — this is what leaves the resolver holding a closed connection.
+        go_away.send(()).unwrap();
         first.join().unwrap();
 
         // It comes back at the same address, and the resolver — which never restarted —
         // must recover on its own rather than fail forever.
-        let second = serve_one(cfg(), port);
+        let second = serve_one(cfg(), port, None);
         // Give the new instance a moment to bind.
         thread::sleep(std::time::Duration::from_millis(200));
         assert_eq!(
@@ -2818,57 +2935,6 @@ mod reconnect_tests {
 
         drop(client);
         second.join().unwrap();
-    }
-}
-
-#[cfg(test)]
-mod idle_timeout {
-    use super::*;
-    use std::net::SocketAddr;
-    use tokio::runtime::Runtime;
-
-    /// The configured idle timeout actually reaches the connection: a QUIET
-    /// connection (nothing sent either way) closes once it elapses. Guards the
-    /// regression where the transport config was built but never applied.
-    #[test]
-    fn a_quiet_connection_dies_at_the_configured_idle_timeout() {
-        let server_id = generate();
-        let client_id = generate();
-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server_cfg = server_config(
-            &server_id,
-            std::slice::from_ref(&client_id.cert_pem),
-            std::time::Duration::from_secs(30),
-        )
-        .unwrap();
-        let rt = Runtime::new().unwrap();
-        let endpoint = rt
-            .block_on(async { quinn::Endpoint::server(server_cfg, addr) })
-            .unwrap();
-        let server_addr = endpoint.local_addr().unwrap();
-        let _server = std::thread::spawn(move || {
-            rt.block_on(async move {
-                let incoming = endpoint.accept().await.unwrap();
-                let _connection = incoming.await.unwrap();
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-            });
-        });
-        let client = connect_with(
-            server_addr,
-            &client_id,
-            &server_id.cert_pem,
-            std::time::Duration::from_secs(1),
-        )
-        .unwrap();
-        std::thread::sleep(std::time::Duration::from_secs(3));
-        let reason = {
-            let conn = client.wire.connection().clone();
-            conn.close_reason()
-        };
-        assert!(
-            reason.is_some(),
-            "a 1s idle must close a connection quiet for 3s"
-        );
     }
 }
 
@@ -3509,5 +3575,308 @@ mod call_deadline {
         let (addr, client_id, server_pem) = slow_peer(Duration::ZERO);
         let client = connect_with(addr, &client_id, &server_pem, IDLE).unwrap();
         assert_eq!(client.call_timeout(), Some(IDLE));
+    }
+}
+
+/// ledger [#1359](http://localhost:1060/l/default/item/1359): the client PINGS, so a quiet
+/// connection to a live peer stays up, a long silent call survives a short liveness bound,
+/// and a peer that vanishes without closing is found in seconds rather than at the call
+/// deadline. The server does NOT ping, so an older client (no call deadline) keeps exactly
+/// the idle bound it always had.
+#[cfg(test)]
+mod keep_alive {
+    use super::*;
+    use ikigai_core::{EndpointSpace, Exact, FnEndpoint, Invocation, ReprType, Verb};
+    use std::net::UdpSocket;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// A UDP relay between one client and `upstream` that can be CUT: from then on it drops
+    /// every datagram both ways and sends nothing of its own. That is what a peer that loses
+    /// power or its network looks like from the other end: no close frame, no stateless
+    /// reset, no ICMP, only silence. A closed socket on loopback is NOT that (it answers
+    /// port-unreachable, and a restarted server resets), which is why this test needs a relay.
+    struct Relay {
+        addr: SocketAddr,
+        cut: Arc<AtomicBool>,
+    }
+
+    impl Relay {
+        fn to(upstream: SocketAddr) -> Relay {
+            let front = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let back = UdpSocket::bind("127.0.0.1:0").unwrap();
+            back.connect(upstream).unwrap();
+            let addr = front.local_addr().unwrap();
+            let cut = Arc::new(AtomicBool::new(false));
+            let client = Arc::new(Mutex::new(None::<SocketAddr>));
+            {
+                let (front, back) = (front.try_clone().unwrap(), back.try_clone().unwrap());
+                let (cut, client) = (Arc::clone(&cut), Arc::clone(&client));
+                std::thread::spawn(move || {
+                    let mut buf = vec![0u8; 65_536];
+                    while let Ok((n, from)) = front.recv_from(&mut buf) {
+                        *client.lock().unwrap() = Some(from);
+                        if !cut.load(Ordering::SeqCst) {
+                            let _ = back.send(&buf[..n]);
+                        }
+                    }
+                });
+            }
+            {
+                let cut = Arc::clone(&cut);
+                std::thread::spawn(move || {
+                    let mut buf = vec![0u8; 65_536];
+                    while let Ok(n) = back.recv(&mut buf) {
+                        let to = *client.lock().unwrap();
+                        if let (false, Some(to)) = (cut.load(Ordering::SeqCst), to) {
+                            let _ = front.send_to(&buf[..n], to);
+                        }
+                    }
+                });
+            }
+            Relay { addr, cut }
+        }
+
+        fn cut(&self) {
+            self.cut.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A server built exactly as [`serve`] builds one (`idle` for its idle timeout) that
+    /// accepts every call, reads it whole and never answers. Each connection reports how it
+    /// ended, and when.
+    fn mute_peer(
+        idle: Duration,
+    ) -> (
+        SocketAddr,
+        Identity,
+        String,
+        mpsc::Receiver<(Instant, quinn::ConnectionError)>,
+    ) {
+        let server_id = generate();
+        let client_id = generate();
+        let config =
+            server_config(&server_id, std::slice::from_ref(&client_id.cert_pem), idle).unwrap();
+        let rt = Runtime::new().unwrap();
+        let endpoint = rt
+            .block_on(async { quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()) })
+            .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let (ended, endings) = mpsc::channel();
+        std::thread::spawn(move || {
+            rt.block_on(async move {
+                while let Some(incoming) = endpoint.accept().await {
+                    let Ok(connection) = incoming.await else {
+                        continue;
+                    };
+                    let ended = ended.clone();
+                    tokio::spawn(async move {
+                        let streams = connection.clone();
+                        tokio::spawn(async move {
+                            while let Ok((send, mut recv)) = streams.accept_bi().await {
+                                tokio::spawn(async move {
+                                    let _ = recv.read_to_end(MAX_MESSAGE).await;
+                                    // Hold the reply half open: never answer, never finish.
+                                    let _ = send.stopped().await;
+                                });
+                            }
+                        });
+                        let reason = connection.closed().await;
+                        // Native-only test code: the moment the server gave up is the measurement.
+                        #[allow(clippy::disallowed_methods)]
+                        let now = Instant::now();
+                        let _ = ended.send((now, reason));
+                    });
+                }
+            });
+        });
+        (addr, client_id, server_id.cert_pem, endings)
+    }
+
+    /// A peer that answers `urn:test:slow` after `delay` of SILENCE (a blocking sleep: the
+    /// connection carries nothing while it works), its server built with idle timeout `idle`.
+    fn slow_peer(delay: Duration, idle: Duration) -> (SocketAddr, Identity, String) {
+        let server_id = generate();
+        let client_id = generate();
+        let config =
+            server_config(&server_id, std::slice::from_ref(&client_id.cert_pem), idle).unwrap();
+        let rt = Runtime::new().unwrap();
+        let endpoint = rt
+            .block_on(async { quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()) })
+            .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let slow = FnEndpoint::new("slow", move |_: &Invocation<'_>| {
+            std::thread::sleep(delay);
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"slow".to_vec(),
+            ))
+        });
+        let kernel = Arc::new(Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:slow"), slow),
+        )));
+        std::thread::spawn(move || {
+            rt.block_on(async move {
+                while let Some(incoming) = endpoint.accept().await {
+                    let kernel = Arc::clone(&kernel);
+                    tokio::spawn(async move {
+                        if let Ok(connection) = incoming.await {
+                            let session = Session {
+                                capability: Capability::root(),
+                                file_segment: String::new(),
+                                principal: None,
+                            };
+                            serve_connection(&kernel, connection, &session).await;
+                        }
+                    });
+                }
+            });
+        });
+        (addr, client_id, server_id.cert_pem)
+    }
+
+    fn source(iri: &str) -> Request {
+        Request::new(Verb::Source, Iri::parse(iri).unwrap())
+    }
+
+    /// ★ The claim of ledger #1359, at the DEFAULTS a host runs with: a peer that vanishes in
+    /// the middle of a call is found in seconds, by both ends. Before keep-alive the client
+    /// learned nothing until its call deadline (the five-minute `quic.timeout`; sixty seconds
+    /// here, so a regression fails in one minute rather than five), and the server until its
+    /// own five-minute idle timeout.
+    #[test]
+    // Native-only (QUIC is not built for wasm); elapsed time is the measurement.
+    #[allow(clippy::disallowed_methods)]
+    fn a_peer_that_vanishes_mid_call_is_found_in_seconds_by_both_ends() {
+        let (server, client_id, server_pem, endings) = mute_peer(DEFAULT_IDLE_TIMEOUT);
+        let relay = Relay::to(server);
+        let deadline = Duration::from_secs(60);
+        let client = connect(relay.addr, &client_id, &server_pem)
+            .unwrap()
+            .with_call_timeout(Some(deadline));
+        let call = std::thread::spawn(move || {
+            let result = client.issue(source("urn:test:anything"));
+            (Instant::now(), result)
+        });
+        // Let the call reach the peer, then the peer vanishes.
+        std::thread::sleep(Duration::from_secs(1));
+        relay.cut();
+        let cut = Instant::now();
+
+        let (failed, result) = call.join().unwrap();
+        let error = result.expect_err("a vanished peer is an error");
+        let found = failed - cut;
+        assert!(
+            found < Duration::from_secs(30),
+            "the client found the vanished peer in {found:?}: the liveness bound \
+             ({LIVENESS_TIMEOUT:?}) and one bounded redial, not the {deadline:?} call deadline"
+        );
+        assert!(
+            !error.to_string().contains("did not answer within"),
+            "found by the transport, not the call deadline: {error}"
+        );
+
+        let (closed, reason) = endings
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the server gave up on the vanished client too");
+        assert!(
+            matches!(reason, quinn::ConnectionError::TimedOut),
+            "{reason:?}"
+        );
+        let found = closed.saturating_duration_since(cut);
+        assert!(
+            found < Duration::from_secs(25),
+            "the server found the vanished client in {found:?}"
+        );
+    }
+
+    /// The other half of the claim: an HONEST long call, silent for longer than the liveness
+    /// bound, still answers inside its call deadline, because the client's pings keep the
+    /// connection alive while the peer works. Scaled down: a one-second bound on both sides
+    /// (what was the whole idle window) and three seconds of silent work.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn an_honest_call_silent_past_the_old_idle_window_still_answers() {
+        let window = Duration::from_secs(1);
+        let (addr, client_id, server_pem) = slow_peer(Duration::from_secs(3), window);
+        let client = connect_with(addr, &client_id, &server_pem, window)
+            .unwrap()
+            .with_call_timeout(Some(Duration::from_secs(10)));
+        let start = Instant::now();
+        let (answer, _) = client
+            .issue(source("urn:test:slow"))
+            .expect("the pings kept the connection alive through 3s of silence");
+        assert_eq!(answer.bytes, b"slow");
+        assert!(
+            start.elapsed() >= Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    /// Keep-alive is actually applied: a quiet connection (no call at all) to a live peer
+    /// outlives its one-second liveness bound. Guards the regression where a transport config
+    /// is built and never applied, which a vanished-peer test alone cannot see.
+    #[test]
+    fn a_quiet_connection_to_a_live_peer_stays_up() {
+        let (addr, client_id, server_pem, _endings) = mute_peer(Duration::from_secs(30));
+        let client = connect_with(addr, &client_id, &server_pem, Duration::from_secs(1)).unwrap();
+        std::thread::sleep(Duration::from_secs(3));
+        let reason = client.wire.connection().close_reason();
+        assert!(
+            reason.is_none(),
+            "closed while both peers lived: {reason:?}"
+        );
+    }
+
+    /// The numbers a host actually runs with: at the default `quic.timeout`, fifteen seconds
+    /// of liveness and a ping every five; a shorter `idle` caps the bound and the ping follows
+    /// it; zero is "no idle timeout", and nothing pings.
+    #[test]
+    fn the_liveness_bound_and_ping_interval() {
+        assert_eq!(
+            liveness(DEFAULT_IDLE_TIMEOUT),
+            (Duration::from_secs(15), Some(Duration::from_secs(5)))
+        );
+        assert_eq!(KEEP_ALIVE_INTERVAL, Duration::from_secs(5));
+        assert_eq!(
+            liveness(Duration::from_secs(3)),
+            (Duration::from_secs(3), Some(Duration::from_secs(1)))
+        );
+        assert_eq!(liveness(Duration::ZERO), (Duration::ZERO, None));
+        for idle in [
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+            DEFAULT_IDLE_TIMEOUT,
+        ] {
+            let (bound, ping) = liveness(idle);
+            assert!(ping.is_some_and(|ping| ping < bound), "{idle:?}");
+        }
+    }
+
+    /// ★ The SERVER does not ping, so a client older than keep-alive (no pings and, before
+    /// cli 0.1.56, no call deadline either) sees exactly the idle bound it always had. If the
+    /// server pinged, a server whose kernel wedged while its QUIC stack answered would hold
+    /// such a client for ever: the unbounded wedge `transport` warned of, for the one client
+    /// with no deadline to end it. Simulated with a client built on the plain idle-only
+    /// transport, one second, quiet for three.
+    #[test]
+    fn an_older_client_without_pings_keeps_its_idle_bound() {
+        let (addr, client_id, server_pem, _endings) = mute_peer(Duration::from_secs(30));
+        let mut config = client_config(&client_id, &server_pem, Duration::from_secs(1)).unwrap();
+        config.transport_config(Arc::new(transport(Duration::from_secs(1)).unwrap()));
+        let rt = Runtime::new().unwrap();
+        let reason = rt.block_on(async move {
+            let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            endpoint.set_default_client_config(config);
+            let connection = endpoint.connect(addr, "ikigai").unwrap().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            connection.close_reason()
+        });
+        assert!(
+            matches!(reason, Some(quinn::ConnectionError::TimedOut)),
+            "the server kept a ping-less client's quiet connection alive: {reason:?}"
+        );
     }
 }
