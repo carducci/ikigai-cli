@@ -126,6 +126,23 @@ members = ["crates/*"]
 #   timeout, the socket timeout), now over the WHOLE call; `call.timeout` in the config home
 #   overrides (a serving host's mounts take two thirds of it). IPC's describe deadline likewise
 #   bounds the whole exchange, and both name the peer.
+# - THE EDGE DOOR'S FLOORS (ledger #1327, #1326, #1295): `ikigai-layers` "0.2.4" (0.2.3 bounds
+#   JSON-LD nesting, so a 12 KB nested `say` no longer aborts the host; 0.2.4 refuses `rd match=`
+#   unless a layer opts in), `ikigai-shacl` "0.3.4" (a recursive shape over a long chain in the
+#   data aborted the host) and `ikigai-store` "0.2.18" (`EvaluationBudget`). These are what
+#   devtools' `services/edge/layers-door-check` refuses a binary below.
+# - `match=` RUNS UNDER A TIME BUDGET (ledger #1327, the cli half). intray evaluated a caller's
+#   ASK against every pending tuple bounded by size, nesting and stack, never by time: a 340-byte
+#   cross product of 7 patterns held a thread for 9 s on ONE 7-triple tuple (debug), growing about
+#   10x a pattern. `rd match=` and `take match=` now run inside one `ikigai_store::EvaluationBudget`
+#   per mounted space (cloned, so the overdue cap is shared): the caller is answered with a typed
+#   `Timeout` at the budget (5 s base, more under a `urn:cap:store:budget:<ms>` grant, the 120 s
+#   ceiling for root), each evaluation gets the cancellation token and the scan checks it between
+#   tuples, and the store's algebra bounds (`check_query`) now refuse an over-wide join before it is
+#   planned. `ikigai_intray::space_with_budget` and `SpaceEndpoint::with_evaluation_budget` (new,
+#   additive). ⚠ Behavior: a template past the algebra bounds is refused as `InvalidArgument` on
+#   `match`; while too many abandoned evaluations are still running, a new match is refused at once
+#   as `Unavailable`.
 #
 # 0.1.54 was A REQUEST-DERIVED FILE NAME IS ONE ENTRY ON EVERY PLATFORM.
 # ⚠ Stacked on 0.1.53, which was merged and preflighted READY but NOT on crates.io: publishing
@@ -1078,7 +1095,9 @@ ikigai-jsonld = "0.2.1" # 0.2.1 is a SECURITY floor: JSON-LD nesting past 64 is 
 # operators could not be narrowed to before matching fell through to the LLM residual.
 # SHACL validation (urn:shacl:validate) — rudof's validator is native-only (gated off wasm),
 # so it's linked natively here; the browser serves the same resource via shacl-engine (JS).
-ikigai-shacl = "0.3.3" # 0.3.3 = validation runs on a SIZED pool (ledger #1121, #1102): rudof validated on
+ikigai-shacl = "0.3.4" # 0.3.4 = a SECURITY floor (ledger #1326): a recursive shape over a long chain in the
+# data overflowed the stack and ABORTED the host; the edge door's `layers-door-check` refuses anything older.
+# Beneath it, still true: 0.3.3 = validation runs on a SIZED pool (ledger #1121, #1102): rudof validated on
 # rayon's default 2 MiB worker threads, where a deep caller query can overflow the stack, and a
 # stack overflow ABORTS the host process. It also shares the store's SERVICE refusal text
 # (ledger #1108) and refuses a WHERE rudof misreads. A safety floor.
@@ -1393,7 +1412,10 @@ ikigai-meeting = "0.1.2" # 0.1.2 = the Zoom `account_id` moves out of the token 
 # copies only its footprint into the scratch store, not the whole graph, so a ledger append no longer
 # costs O(ledger). 0.2.14 (ledger #1207) adds `DurableStore::shared_writer()`, the writer thread for
 # raw-handle hosts; this host does not call it yet. Both are additive here.
-ikigai-store = { version = "0.2.14", features = ["persistent"] }
+# ⚠ …and 0.2.18 (ledger #1327), a SECURITY floor taken with `ikigai-intray`'s: the store's own doors
+# were already time-bounded (since 0.2.7), and 0.2.18 hands the same deadline, token and overdue cap to
+# a consumer as `EvaluationBudget`, which intray's `match=` now runs under. Additive for this host.
+ikigai-store = { version = "0.2.18", features = ["persistent"] }
 # The work ledger (`urn:iki:ledger:*`): items, comments, labels, links, claims and
 # `next`, as RDF in the store above. It owns no bytes — every read is a scoped SPARQL
 # query at `urn:iki:store:graph-select` and every write a scoped UPDATE at
@@ -1450,7 +1472,11 @@ ikigai-ledger = "0.8.0"
 # ⚠ It depends on `ikigai-intray` FROM CRATES.IO (`"0.1.47"`, `<0.2.0`), and intray is a member
 # of THIS workspace: see the `[patch.crates-io]` at the end of this file, which is what keeps
 # one intray in the graph.
-ikigai-layers = "0.2.2"
+# ⚠ …and 0.2.4 is the edge door's SECURITY floor (ledger #1326, #1327): 0.2.3 bounds JSON-LD nesting
+# before the parse (a 12 KB `say` nested 1,500 deep overflowed the stack and ABORTED the host), and
+# 0.2.4 refuses `rd match=` unless a layer's definition says `match = true`. devtools'
+# `services/edge/layers-door-check` refuses a binary that links anything older. `"0.2.4"` is `<0.3.0`.
+ikigai-layers = "0.2.4"
 # ── Intra-workspace siblings: LOCKSTEP pins, not floors ───────────────────────
 # The seventeen members that take `version.workspace = true` are released TOGETHER, at one
 # version, always. So every sibling pin below states the CURRENT workspace version rather

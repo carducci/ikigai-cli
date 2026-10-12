@@ -46,7 +46,11 @@ spargebra = { version = "0.4", features = ["sep-0006"] }
 # own (`urn:iki:store:load`, which means nothing to a match). It exists only from 0.2.11.
 # 0.2.14 is taken with the root's (ledger #1198; 0.2.12 was the writer-thread perf fix, ledger
 # #1127) so the two pins cannot resolve apart off-tree; the API floor above is unchanged.
-ikigai-store = "0.2.14"
+# ⚠ 0.2.18 is an API floor (ledger #1327): `budget::EvaluationBudget`, the time budget every `match=`
+# evaluation runs under (the caller answered with a `Timeout` at the budget, the evaluation handed a
+# cancellation token, abandoned evaluations counted and capped), and `budget::check_query`, the
+# algebra bounds. Both exist only from 0.2.18.
+ikigai-store = "0.2.18"
 
 [dev-dependencies]
 futures = { workspace = true }
