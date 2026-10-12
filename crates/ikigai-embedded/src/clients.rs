@@ -149,6 +149,22 @@ impl Enrolment {
             .and_then(|entry| entry.principal.as_deref())
     }
 
+    /// The key `named` is enrolled under, folded the way every key is (an `openssl`
+    /// fingerprint, colons and case, names the same client), when the file enrolls it.
+    pub fn key_for(&self, named: &str) -> Option<String> {
+        let key = normalize(named);
+        self.clients.contains_key(&key).then_some(key)
+    }
+
+    /// Every enrolled key whose OWN entry names `principal`, sorted.
+    pub fn keys_with_principal(&self, principal: &str) -> Vec<String> {
+        self.clients
+            .iter()
+            .filter(|(_, entry)| entry.principal.as_deref() == Some(principal))
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
     /// Every enrolled grant name (plus the default), deduped — the operator's full
     /// declared intent, which is what decides the served SURFACE at startup.
     pub fn grant_names(&self) -> Vec<String> {
@@ -191,7 +207,7 @@ pub fn enrolment() -> Result<Option<Enrolment>, String> {
 /// A `principal` that core could not carry as a principal (not an absolute IRI, a `*`,
 /// over 512 bytes) is an ERROR, like every other unusable entry: silently minting none
 /// would serve that client under a name its operator never wrote.
-fn parse(text: &str) -> Result<Enrolment, String> {
+pub(crate) fn parse(text: &str) -> Result<Enrolment, String> {
     let v: serde_json::Value =
         serde_json::from_str(text).map_err(|e| format!("not valid JSON: {e}"))?;
     let mut clients = BTreeMap::new();

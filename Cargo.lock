@@ -3013,6 +3013,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tokio",
+ "tokio-rustls",
  "toml 0.8.23",
 ]
 
@@ -3263,9 +3264,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-jsonld"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "827d8cbdb90445352ef080c2ea0b9720fbd21a6f9fa0c724119f70b0e9e57025"
+checksum = "5dff89027caa76225d5fb3dd92ad2fc68ba576f38bb5fd75018ba153a0e9c8ad"
 dependencies = [
  "async-trait",
  "contextual",
@@ -3276,16 +3277,19 @@ dependencies = [
 
 [[package]]
 name = "ikigai-layers"
-version = "0.2.4"
+version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92ffeda2b08292f56c602cc457dd29db42e8f6539466c5e5aea3bb5f260ad7fc"
+checksum = "0e0806b4fcb978b1dc48639cc3d11c564261edda55ae02f5ad2294c48eee6300"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "futures",
  "futures-timer",
  "ikigai-core",
  "ikigai-intray",
+ "ikigai-jsonld",
  "ikigai-shacl",
+ "ikigai-store",
  "oxrdf",
  "oxrdfio",
  "oxttl",

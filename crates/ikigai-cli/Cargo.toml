@@ -16,7 +16,8 @@ default = ["embedded", "ipc"]
 embedded = ["dep:ikigai-embedded"]
 ipc = ["dep:ikigai-ipc"]   # Unix only; the dep is empty elsewhere
 quic = ["dep:ikigai-quic", "dep:ikigai-discovery", "dep:ikigai-wire"] # opt-in; pulls quinn/rustls/tokio
-web = ["dep:ikigai-web", "dep:tokio", "dep:serde_yaml"] # opt-in inbound HTTP face; pulls Tokio (like quic)
+web = ["dep:ikigai-web", "dep:tokio", "dep:serde_yaml", "dep:tokio-rustls"] # opt-in inbound HTTP face; pulls Tokio (like quic). With `quic` too, it also opens a layer door's HTTPS front (`--layers-https`), whose TLS is tokio-rustls
+
 # The durable RDF store (`urn:iki:store:*`) and the work ledger that rides on it. Opt-in
 # like `quic` and `web`, and it implies `embedded` because the store is bound in the
 # embedded root space and nowhere else — a served kernel must not hand a remote caller a
@@ -68,7 +69,12 @@ ikigai-web = { workspace = true, optional = true }
 # A runtime for the `web` serve loop (ikigai-web is async). Feature-gated so the
 # default/wasm binary never pulls Tokio; matches the `quic` transport's posture.
 # net+time so the runtime's `enable_all()` has the io+time drivers on its own.
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "io-util"], optional = true }
+# The layers HTTPS front's TLS (`src/front.rs`), over the rustls ikigai-quic already links: the
+# server config is ikigai-quic's (`https_server_tls`, ring, the door's own certificate), so no
+# second crypto provider is chosen here. `tls12` because an HTTP client on an older runtime may
+# speak only TLS 1.2.
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"], optional = true }
 # YAML authoring of the non-LD route table (parses to the same value tree as JSON). Only the
 # `web`-featured loader uses it. (serde_yaml 0.9 is archived-but-stable; swap to serde_yml if
 # a maintained fork is preferred.)

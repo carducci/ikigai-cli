@@ -48,7 +48,7 @@ pub use push::{PushConfig, DEFAULT_PUSH_PATH};
 use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request, Verb};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 /// A parsed HTTP request — what the router and the capability function see.
@@ -771,24 +771,8 @@ pub async fn serve_with_listener(
             .max_connections
             .min(tokio::sync::Semaphore::MAX_PERMITS),
     ));
-    // An accept error ends this loop only when the listener itself is dead; one connection's
-    // failure is skipped and running out of descriptors is waited out (ledger #720, `accept`).
-    let mut backoff = accept::Backoff::default();
     loop {
-        let (sock, peer) = match listener.accept().await {
-            Ok(accepted) => {
-                backoff.succeeded();
-                accepted
-            }
-            Err(e) => match accept::classify(&e) {
-                accept::Fault::Skip => continue,
-                accept::Fault::BackOff => {
-                    tokio::time::sleep(backoff.failed(&e)).await;
-                    continue;
-                }
-                accept::Fault::Fatal => return Err(e),
-            },
-        };
+        let (sock, peer) = accept_next(&listener).await?;
         let shared = Arc::clone(&shared);
         match Arc::clone(&permits).try_acquire_owned() {
             Ok(permit) => {
@@ -802,6 +786,29 @@ pub async fn serve_with_listener(
             Err(_) => {
                 tokio::spawn(async move { refuse_busy(sock, &shared.config).await });
             }
+        }
+    }
+}
+
+/// Accept the next connection the way every door this crate serves accepts them (ledger
+/// #720): an error that belongs to one would-be connection (aborted, reset) is skipped, running
+/// out of descriptors or memory is waited out with a bounded, doubling backoff (logged once when
+/// it starts and once when it ends), and only a DEAD listener (`EBADF`, `ENOTSOCK`, `EINVAL`)
+/// returns its error. A door with its own router (a TLS front) accepts with this, so one
+/// `EMFILE` cannot end it either.
+pub async fn accept_next(listener: &TcpListener) -> std::io::Result<(TcpStream, SocketAddr)> {
+    let mut backoff = accept::Backoff::default();
+    loop {
+        match listener.accept().await {
+            Ok(accepted) => {
+                backoff.succeeded();
+                return Ok(accepted);
+            }
+            Err(e) => match accept::classify(&e) {
+                accept::Fault::Skip => continue,
+                accept::Fault::BackOff => tokio::time::sleep(backoff.failed(&e)).await,
+                accept::Fault::Fatal => return Err(e),
+            },
         }
     }
 }
@@ -895,7 +902,7 @@ enum Head {
 }
 
 /// Read up to the end of the headers (the blank line), into `buf`.
-async fn read_head(sock: &mut TcpStream, buf: &mut Vec<u8>) -> std::io::Result<Head> {
+async fn read_head<S: AsyncRead + Unpin>(sock: &mut S, buf: &mut Vec<u8>) -> std::io::Result<Head> {
     let mut tmp = [0u8; 1024];
     loop {
         if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -912,31 +919,84 @@ async fn read_head(sock: &mut TcpStream, buf: &mut Vec<u8>) -> std::io::Result<H
     }
 }
 
-async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::io::Result<()> {
-    let wt = shared.config.write_timeout;
+/// Read ONE request off `sock` under `config`'s limits, exactly as the edge reads every
+/// request it serves: the head within [`EdgeConfig::header_timeout`] and 64 KiB, a body only
+/// by `Content-Length` (a transfer coding is refused, not ignored), at most
+/// [`EdgeConfig::max_body_bytes`] (refused with `413`, never truncated), delivered within
+/// [`EdgeConfig::body_timeout`], and never a partial one.
+///
+/// `Ok(Some(request))` is a whole request, `peer` set on it. `Ok(None)` means there is nothing
+/// to answer: the client hung up before a request arrived, or the request was REFUSED and the
+/// refusal has already been written to `sock` (`400`, `408`, `413`, `431` or `501`, as
+/// `text/plain`). A door with a router of its own (a TLS front, say) reads with this and
+/// answers with [`write_response`], so the parsing and the bounds are this crate's in every
+/// door rather than a copy per door.
+///
+/// ```
+/// use ikigai_web::{read_request, write_response, EdgeConfig, Response};
+/// use tokio::io::{AsyncReadExt, AsyncWriteExt};
+///
+/// # #[tokio::main]
+/// # async fn main() {
+/// let config = EdgeConfig::default();
+/// let (mut client, mut server) = tokio::io::duplex(4096);
+/// client
+///     .write_all(b"POST /say?as=application%2Fjson HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi")
+///     .await
+///     .unwrap();
+/// let req = read_request(&mut server, None, &config).await.unwrap().expect("a request");
+/// assert_eq!((req.method.as_str(), req.path.as_str()), ("POST", "/say"));
+/// assert_eq!(req.query, vec![("as".to_string(), "application/json".to_string())]);
+/// assert_eq!(req.body, b"hi");
+/// let answer = Response::new(200, "application/json", br#"{"ok":true}"#.to_vec());
+/// write_response(&mut server, answer, &config).await.unwrap();
+/// drop(server);
+/// let mut out = String::new();
+/// client.read_to_string(&mut out).await.unwrap();
+/// assert!(out.starts_with("HTTP/1.1 200 OK\r\n"), "{out}");
+/// assert!(out.ends_with(r#"{"ok":true}"#), "{out}");
+///
+/// // Over the body bound: refused here, answered, and nothing is handed to the caller.
+/// let small = EdgeConfig { max_body_bytes: 1, ..EdgeConfig::default() };
+/// let (mut client, mut server) = tokio::io::duplex(4096);
+/// client.write_all(b"POST /say HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi").await.unwrap();
+/// assert!(read_request(&mut server, None, &small).await.unwrap().is_none());
+/// drop(server);
+/// let mut out = String::new();
+/// client.read_to_string(&mut out).await.unwrap();
+/// assert!(out.starts_with("HTTP/1.1 413 Payload Too Large"), "{out}");
+/// # }
+/// ```
+pub async fn read_request<S>(
+    sock: &mut S,
+    peer: Option<IpAddr>,
+    config: &EdgeConfig,
+) -> std::io::Result<Option<HttpRequest>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let wt = config.write_timeout;
     // THE HEADERS ARE READ UNDER A DEADLINE. Without one a client that sends a byte every few
     // seconds (slow-loris) holds this connection, and its place under the cap, forever.
     let mut buf = Vec::new();
     let header_end =
-        match tokio::time::timeout(shared.config.header_timeout, read_head(&mut sock, &mut buf))
-            .await
-        {
+        match tokio::time::timeout(config.header_timeout, read_head(sock, &mut buf)).await {
             Err(_) => {
                 let resp = Resp::text(408, "Request Timeout", "request headers took too long");
-                return write_within(&mut sock, resp, wt).await;
+                return refused(sock, resp, wt).await;
             }
             Ok(read) => match read? {
                 Head::End(pos) => pos,
-                Head::Closed => return Ok(()),
+                Head::Closed => return Ok(None),
                 Head::TooLarge => {
                     let resp = Resp::text(431, "Request Header Fields Too Large", "");
-                    return write_within(&mut sock, resp, wt).await;
+                    return refused(sock, resp, wt).await;
                 }
             },
         };
     let mut req = match parse_head(&buf[..header_end]) {
         Ok(r) => r,
-        Err(why) => return write_within(&mut sock, Resp::text(400, "Bad Request", why), wt).await,
+        Err(why) => return refused(sock, Resp::text(400, "Bad Request", why), wt).await,
     };
     // THE FRAMING IS SETTLED BEFORE A BODY BYTE IS READ. Everything here decides how much
     // an anonymous client may make this process hold and hand onward, and this door is
@@ -948,14 +1008,14 @@ async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::
     // Content-Length" would both skip the bound below and hand the endpoint the raw chunk
     // framing as if it were the submission.
     if req.header("transfer-encoding").is_some() {
-        return write_within(
-            &mut sock,
+        return refused(
+            sock,
             Resp::text(501, "Not Implemented", "unsupported transfer-encoding"),
             wt,
         )
         .await;
     }
-    let max = shared.config.max_body_bytes;
+    let max = config.max_body_bytes;
     // A `Content-Length` that is present but unreadable is a disagreement about framing,
     // not a zero-length body: treating it as 0 would silently deliver whatever trailed the
     // headers in the read buffer as the body.
@@ -964,8 +1024,8 @@ async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::
         Some(raw) => match raw.parse() {
             Ok(n) => n,
             Err(_) => {
-                return write_within(
-                    &mut sock,
+                return refused(
+                    sock,
                     Resp::text(400, "Bad Request", "malformed Content-Length"),
                     wt,
                 )
@@ -982,8 +1042,8 @@ async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::
     // the endpoint had no way to tell from a complete submission, and the submitter was
     // told nothing — mangled input accepted, rather than large input refused.
     if cl > max {
-        return write_within(
-            &mut sock,
+        return refused(
+            sock,
             Resp::text(413, "Payload Too Large", "request body too large"),
             wt,
         )
@@ -993,8 +1053,8 @@ async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::
     // but checked against `max` too so a deliberately small `max_body_bytes` still holds.
     let mut body = buf[header_end + 4..].to_vec();
     if body.len() > max {
-        return write_within(
-            &mut sock,
+        return refused(
+            sock,
             Resp::text(413, "Payload Too Large", "request body too large"),
             wt,
         )
@@ -1018,10 +1078,10 @@ async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::
         }
         Ok::<(), std::io::Error>(())
     };
-    match tokio::time::timeout(shared.config.body_timeout, read_body).await {
+    match tokio::time::timeout(config.body_timeout, read_body).await {
         Err(_) => {
             let resp = Resp::text(408, "Request Timeout", "request body took too long");
-            return write_within(&mut sock, resp, wt).await;
+            return refused(sock, resp, wt).await;
         }
         Ok(read) => read?,
     }
@@ -1030,8 +1090,8 @@ async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::
     // endpoint back in the position this whole block exists to get it out of: unable to
     // tell an incomplete body from a complete one.
     if body.len() < cl {
-        return write_within(
-            &mut sock,
+        return refused(
+            sock,
             Resp::text(400, "Bad Request", "incomplete request body"),
             wt,
         )
@@ -1039,7 +1099,24 @@ async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::
     }
     body.truncate(cl);
     req.body = body;
-    req.peer = Some(peer);
+    req.peer = peer;
+    Ok(Some(req))
+}
+
+/// Write a refusal [`read_request`] decided on, and report that there is no request.
+async fn refused<S: AsyncWrite + Unpin>(
+    sock: &mut S,
+    resp: Resp,
+    limit: std::time::Duration,
+) -> std::io::Result<Option<HttpRequest>> {
+    write_within(sock, resp, limit).await.map(|()| None)
+}
+
+async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::io::Result<()> {
+    let wt = shared.config.write_timeout;
+    let Some(req) = read_request(&mut sock, Some(peer), &shared.config).await? else {
+        return Ok(());
+    };
 
     // Resolve the route once; it drives the target IRI + per-route cap (in respond) and the
     // per-route CORS/CSP (in the policy layer). No match → the mechanical default throughout.
@@ -1859,15 +1936,8 @@ fn verb_for_method(method: &str) -> Option<Verb> {
 /// The body follows [`EdgeConfig::error_body`]: the message as `text/plain` by default, the
 /// typed object of [`error_json`] when the door asked for JSON.
 fn error_resp(config: &EdgeConfig, e: &ikigai_core::Error) -> Resp {
-    use ikigai_core::Error;
-    let (status, reason) = match e {
-        Error::Denied(_) => (403, "Forbidden"),
-        Error::NotFound(_) | Error::Unresolved(_) => (404, "Not Found"),
-        Error::MissingArgument(_) | Error::InvalidArgument { .. } => (400, "Bad Request"),
-        Error::Conflict(_) => (409, "Conflict"),
-        _ if e.is_transient() => (503, "Service Unavailable"),
-        _ => (500, "Internal Server Error"),
-    };
+    let status = error_status(e);
+    let reason = reason_phrase(status);
     match config.error_body {
         ErrorBody::Json => Resp {
             content_type: "application/json".to_string(),
@@ -1876,6 +1946,105 @@ fn error_resp(config: &EdgeConfig, e: &ikigai_core::Error) -> Resp {
         },
         ErrorBody::Text => Resp::text(status, reason, &format!("{e}")),
     }
+}
+
+/// The HTTP status a typed kernel error is answered with, in every door this crate serves:
+/// `Denied` 403, `NotFound`/`Unresolved` 404, a missing or invalid argument 400, `Conflict`
+/// 409, a transient error 503, anything else 500.
+///
+/// ```
+/// use ikigai_core::Error;
+/// use ikigai_web::error_status;
+///
+/// assert_eq!(error_status(&Error::Denied("no".into())), 403);
+/// assert_eq!(error_status(&Error::Conflict("taken by bob".into())), 409);
+/// assert_eq!(error_status(&Error::MissingArgument("tuple".into())), 400);
+/// assert_eq!(error_status(&Error::Timeout("slow".into())), 503);
+/// ```
+pub fn error_status(e: &ikigai_core::Error) -> u16 {
+    use ikigai_core::Error;
+    match e {
+        Error::Denied(_) => 403,
+        Error::NotFound(_) | Error::Unresolved(_) => 404,
+        Error::MissingArgument(_) | Error::InvalidArgument { .. } => 400,
+        Error::Conflict(_) => 409,
+        _ if e.is_transient() => 503,
+        _ => 500,
+    }
+}
+
+/// The reason phrase for a status this crate answers with; `""` for one it never sends.
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        304 => "Not Modified",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        406 => "Not Acceptable",
+        408 => "Request Timeout",
+        409 => "Conflict",
+        412 => "Precondition Failed",
+        413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
+        421 => "Misdirected Request",
+        429 => "Too Many Requests",
+        431 => "Request Header Fields Too Large",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
+        503 => "Service Unavailable",
+        _ => "",
+    }
+}
+
+/// A response a door with its own router writes with [`write_response`]: a status, a
+/// content type (empty for none), extra headers and a body. `Content-Length` and
+/// `Connection: close` are always written; one request is served per connection, as the edge
+/// serves them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Response {
+    pub status: u16,
+    pub content_type: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl Response {
+    /// `status` with `body` as `content_type` and no extra headers.
+    pub fn new(status: u16, content_type: &str, body: Vec<u8>) -> Response {
+        Response {
+            status,
+            content_type: content_type.to_string(),
+            headers: Vec::new(),
+            body,
+        }
+    }
+
+    /// One more header.
+    pub fn with_header(mut self, name: &str, value: &str) -> Response {
+        self.headers.push((name.to_string(), value.to_string()));
+        self
+    }
+}
+
+/// Write `response` to `sock` within [`EdgeConfig::write_timeout`], then flush. The other half
+/// of [`read_request`]: the head is formatted exactly as the edge formats its own answers.
+pub async fn write_response<S: AsyncWrite + Unpin>(
+    sock: &mut S,
+    response: Response,
+    config: &EdgeConfig,
+) -> std::io::Result<()> {
+    let resp = Resp {
+        content_type: response.content_type,
+        body: response.body,
+        headers: response.headers,
+        ..Resp::status(response.status, reason_phrase(response.status))
+    };
+    write_within(sock, resp, config.write_timeout).await
 }
 
 /// Layer the edge policy onto every response: security headers, and CORS headers when the
@@ -2686,8 +2855,8 @@ fn now_rfc3339() -> String {
 
 /// [`write`] under a deadline: a client that stops reading cannot hold the connection past
 /// `limit`. On expiry the connection is simply dropped — there is no one left to tell.
-async fn write_within(
-    sock: &mut TcpStream,
+async fn write_within<S: AsyncWrite + Unpin>(
+    sock: &mut S,
     resp: Resp,
     limit: std::time::Duration,
 ) -> std::io::Result<()> {
@@ -2701,7 +2870,7 @@ async fn write_within(
 }
 
 /// Write the response and close the connection.
-async fn write(sock: &mut TcpStream, resp: Resp) -> std::io::Result<()> {
+async fn write<S: AsyncWrite + Unpin>(sock: &mut S, resp: Resp) -> std::io::Result<()> {
     let head = head_of(&resp, Some(resp.body.len()));
     sock.write_all(head.as_bytes()).await?;
     sock.write_all(&resp.body).await?;

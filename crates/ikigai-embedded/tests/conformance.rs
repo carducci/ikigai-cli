@@ -179,6 +179,8 @@ const INHERITED: &[(&str, &str)] = &[
     ("jsonld-compact", "ikigai-jsonld"),
     ("jsonld-expand", "ikigai-jsonld"),
     ("jsonld-flatten", "ikigai-jsonld"),
+    // 0.2.2 (ledger #1371, through ikigai-layers 0.2.7): the prune the layer host's JSON faces use.
+    ("jsonld-prune", "ikigai-jsonld"),
     ("llm-ask", "ikigai-llm"),
     ("llm-config", "ikigai-llm"),
     ("llm-models", "ikigai-llm"),
