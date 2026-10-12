@@ -199,8 +199,8 @@
 //! ```
 
 use crate::{
-    apply_edge_policy, error_resp, head_of, iri_from_path, write_within, EdgeConfig, HttpRequest,
-    Resp, RouteTable, Shared,
+    apply_edge_policy, error_resp, head_of, iri_from_path, write_within, EdgeConfig, ErrorBody,
+    HttpRequest, Resp, RouteTable, Shared,
 };
 use ikigai_core::{CutBatch, CutEvent, Iri, ListenSpec, CAP_LISTEN, LISTEN_CAPACITY};
 use std::time::Duration;
@@ -460,8 +460,16 @@ pub(crate) async fn stream(
     let listener = match shared.kernel.listen(subs.listen_spec(push.queue), &cap) {
         Ok(listener) => listener,
         Err(e) => {
-            let mut resp = error_resp(&e);
-            if matches!(e, ikigai_core::Error::Denied(_)) {
+            // A denial names the token the stream needs, in whichever body the door speaks:
+            // the bare sentence as text, a `denied` object carrying it as JSON.
+            let e = match e {
+                ikigai_core::Error::Denied(_) => {
+                    ikigai_core::Error::Denied(format!("an event stream needs `{CAP_LISTEN}`"))
+                }
+                other => other,
+            };
+            let mut resp = error_resp(config, &e);
+            if config.error_body == ErrorBody::Text && matches!(e, ikigai_core::Error::Denied(_)) {
                 resp.body = format!("an event stream needs `{CAP_LISTEN}`").into_bytes();
             }
             return write_within(&mut sock, refuse(resp), wt).await;
@@ -779,6 +787,39 @@ mod tests {
             !stream.seen.contains("text/event-stream"),
             "{}",
             stream.seen
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_stream_names_the_token_in_the_doors_error_body() {
+        use ikigai_core::CAP_LISTEN;
+        let refused = "GET /_ikigai/push HTTP/1.1\r\nHost: x\r\nCookie: session=mute\r\n\r\n";
+        let (addr, _kernel) = serve(pushing(PushConfig::default())).await;
+        let text = roundtrip(addr, refused).await;
+        assert!(text.starts_with("HTTP/1.1 403 "), "{text}");
+        assert!(
+            text.ends_with(&format!("\r\n\r\nan event stream needs `{CAP_LISTEN}`")),
+            "{text}"
+        );
+        let (addr, _kernel) = serve(EdgeConfig {
+            error_body: crate::ErrorBody::Json,
+            ..pushing(PushConfig::default())
+        })
+        .await;
+        let json = roundtrip(addr, refused).await;
+        assert!(json.starts_with("HTTP/1.1 403 "), "{json}");
+        assert!(
+            json.contains("Content-Type: application/json\r\n"),
+            "{json}"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(json.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "kind": "denied",
+                "message": format!("denied: an event stream needs `{CAP_LISTEN}`"),
+            })
         );
     }
 

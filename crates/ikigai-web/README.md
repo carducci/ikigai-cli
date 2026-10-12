@@ -83,6 +83,17 @@ default) admits everything. The doctest on `AdmitFn` pins the behavior.
   current state refuses the request) → 409, transient → 503, else 500. A failed
   `If-Match` / `If-None-Match` stays 412: that is a precondition the caller stated, and
   it is checked before the write reaches the endpoint.
+- **Error bodies:** the error's message as `text/plain` by default. A door that sets
+  `EdgeConfig::error_body` to `ErrorBody::Json` answers the same status with a typed
+  `application/json` object instead: `kind` (core's `Error::kind()`, one stable word),
+  `message` (the same text the plain body carries), and the variant's own fields
+  (`name` and `detail` for an invalid argument, `name` for a missing one, `target` for an
+  unresolved path, `depth` and `target` for a nesting refusal). `ikigai_web::error_json`
+  renders it, so a host can produce the same body elsewhere. Refusals the edge makes on
+  its own (`405`, `406`, `413`, a strict route variable's `400`) stay `text/plain`.
+- **A write's answer:** a `PUT`/`POST` or `DELETE` whose endpoint answers with a
+  representation is `200` with it — a take returns what it took — and an empty answer
+  is `204`.
 
 ## Content negotiation
 
@@ -144,8 +155,11 @@ capability), and `Origin` whenever CORS allows any origin.
 `If-None-Match` on a read yields `304`, carrying the same `ETag`, `Cache-Control` and `Vary`. Writes
 are conditional: `If-Match` / `If-None-Match` are checked against the resource's
 current ETag before the mutation (optimistic concurrency → `412`; `If-None-Match: *`
-is create-only). `DELETE` is idempotent — a repeat delete of a resource we deleted
-returns `204`, while one that never existed is `404`.
+is create-only). `DELETE` is idempotent — a repeat of a delete that succeeded
+returns `204`, while one that never existed is `404` carrying the endpoint's message.
+"A repeat" means the same path AND the same query arguments (in any order; `as` and the
+provenance names do not count): one path can front many things chosen by an argument,
+and a delete of one of them says nothing about the others.
 
 `PATCH` is read-modify-write through a **content-type registry**: the request
 `Content-Type` selects a patch strategy (RFC 7386 JSON Merge Patch today) that
