@@ -203,6 +203,9 @@ fn a_budget_grant_raises_the_base_and_a_legitimate_match_still_answers() {
     let (k, id) = seeded("budget-grant", budget.clone());
     // 1 ms is too little for a k=5 cross product (~90 ms, debug) …
     assert_timeout(matching(&k, "rd", &reader(), &template(5)), 1);
+    // Let that worker end first: the default overdue cap follows the core count, and on a
+    // small runner one overdue evaluation already refuses the next (`Unavailable`).
+    settles(&budget);
     // … and a `urn:cap:store:budget:<ms>` grant raises it, as at the store's own doors.
     let granted = vec![CAP_READ.to_string(), cap_budget(30_000)];
     let matches = "ASK { ?s <urn:t:p3> \"v3\" }";
