@@ -74,6 +74,7 @@ pub mod scheduling;
 #[cfg(feature = "store")]
 pub mod store;
 pub mod tenant;
+pub mod tokens;
 use ikigai_time::JobRegistry;
 use ikigai_vocab::TurtleRenderer;
 use notify::{RecursiveMode, Watcher};

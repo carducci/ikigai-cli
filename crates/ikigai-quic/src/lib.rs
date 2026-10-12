@@ -413,12 +413,38 @@ pub fn serve_bounded_on(
     idle: std::time::Duration,
     max_age: Option<std::time::Duration>,
 ) -> io::Result<()> {
+    serve_shared_on(
+        Arc::new(kernel),
+        socket,
+        identity,
+        trusted_client_cert_pems,
+        minter,
+        idle,
+        max_age,
+    )
+}
+
+/// [`serve_bounded_on`] over a kernel the caller SHARES with another door.
+///
+/// ★ Two doors onto one kernel must be one kernel, not two kernels over the same state: a
+/// kernel's cache and its golden threads are its own, so a write through one would cut a thread
+/// only the other's readers hang from, and a read through the second could answer from a cache
+/// the write never touched. A host serving a second face (an HTTPS front for participants who
+/// speak only HTTP) hands both doors this one `Arc`.
+pub fn serve_shared_on(
+    kernel: Arc<Kernel>,
+    socket: std::net::UdpSocket,
+    identity: &Identity,
+    trusted_client_cert_pems: &[String],
+    minter: Minter,
+    idle: std::time::Duration,
+    max_age: Option<std::time::Duration>,
+) -> io::Result<()> {
     let config = server_config(identity, trusted_client_cert_pems, idle)?;
     let endpoint_config = endpoint_config(identity);
     let runtime = Runtime::new()?;
     runtime.block_on(async move {
         let endpoint = endpoint_on(config, socket, endpoint_config)?;
-        let kernel = Arc::new(kernel);
         while let Some(incoming) = endpoint.accept().await {
             let kernel = Arc::clone(&kernel);
             let minter = Arc::clone(&minter);
@@ -1587,6 +1613,53 @@ fn client_config_offering(
     let mut config = quinn::ClientConfig::new(Arc::new(quic));
     config.transport_config(Arc::new(client_transport(idle)?));
     Ok(config)
+}
+
+/// The TLS configuration for an HTTPS face that presents the SAME server identity as this
+/// QUIC door: a client that pins the door's certificate pins the HTTPS face with the same
+/// file. TLS 1.3 and 1.2 (an HTTP client on an older runtime may speak only 1.2), ALPN
+/// `http/1.1`, and NO client certificate: an HTTPS face authenticates its callers some other
+/// way (a bearer token bound to an enrolled participant, say), so it does not ask for one.
+///
+/// ```
+/// let identity = ikigai_quic::generate();
+/// let tls = ikigai_quic::https_server_tls(&identity).unwrap();
+/// assert_eq!(tls.alpn_protocols, vec![b"http/1.1".to_vec()]);
+/// ```
+pub fn https_server_tls(identity: &Identity) -> io::Result<rustls::ServerConfig> {
+    let mut tls = rustls::ServerConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .map_err(other)?
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![load_cert(&identity.cert_pem)?],
+            load_key(&identity.key_pem)?,
+        )
+        .map_err(other)?;
+    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(tls)
+}
+
+/// The client half of [`https_server_tls`]: trust exactly the pinned server certificate (no
+/// CA, no name check: the certificate IS the identity, as on the QUIC transport), present no
+/// client certificate, offer ALPN `http/1.1`.
+///
+/// ```
+/// let server = ikigai_quic::generate();
+/// let tls = ikigai_quic::pinned_https_client_tls(&server.cert_pem).unwrap();
+/// assert_eq!(tls.alpn_protocols, vec![b"http/1.1".to_vec()]);
+/// assert!(ikigai_quic::pinned_https_client_tls("not a certificate").is_err());
+/// ```
+pub fn pinned_https_client_tls(trusted_server_cert_pem: &str) -> io::Result<rustls::ClientConfig> {
+    let verifier = Arc::new(PinnedPeer::new(load_cert(trusted_server_cert_pem)?));
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .map_err(other)?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(tls)
 }
 
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {

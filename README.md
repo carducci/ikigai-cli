@@ -348,6 +348,64 @@ ikigai serve quic://0.0.0.0:4434 --name layers
   channels chose it, and the surface gains `+ layers`. `--layers-state` on a door that hosts
   no layer (no `layers/`, or not a QUIC door) is refused rather than ignored.
 
+### The HTTPS front: a participant with only an HTTP client
+
+A door that hosts layers can also serve the participant verbs over HTTPS, for a participant
+that has an HTTP client and a JSON parser and nothing else (ikigai-cli 0.1.57+, built with
+`--features quic,web`). It is off unless `--layers-https <host:port>` on `serve quic://…`, or
+`layers.https` in `config.toml` (instance-scoped as `<name>.layers.https`), names an address:
+
+```bash
+ikigai layers-token mint urn:collab:participant:relay --label "relay host"   # prints the token once
+ikigai serve quic://0.0.0.0:4434 --name layers --layers-https 0.0.0.0:4435
+# the certificate's name is `ikigai`, so a name-checking client is pointed at that name
+curl --cacert server.crt --resolve ikigai:4435:<door address> https://ikigai:4435/layers/me \
+     -H "Authorization: Bearer $TOKEN"
+```
+
+- **One authority, two faces.** The front serves the QUIC door's own kernel and mints each
+  request with the QUIC door's own per-identity grants: a participant's layers, admission,
+  shapes, refusals and receipts are the same whichever face it uses, and a take raced between
+  the two has exactly one winner.
+- **A token is bound to ONE enrolled participant**: a `clients.json` entry (its fingerprint, or
+  a participant IRI that exactly one entry names), and it mints that entry's grant and
+  principal. `ikigai layers-token list` and `revoke <id>` manage them; `layer-tokens.json`
+  beside `clients.json` keeps their SHA-256 hashes, never the tokens, and is read on every
+  request, so a revocation (or removing the participant's `clients.json` entry) refuses its
+  next request. No token, or one the file does not hold: `401`.
+- **TLS (1.3 or 1.2) with the door's server certificate**, the one a QUIC client pins; an
+  HTTPS client pins the same file. ⚠ Its subject name is `ikigai`, not the host's, so a client
+  that checks names either connects by that name (`--resolve` above) or pins the certificate
+  or its key and skips the name check, as the QUIC client does.
+- **GET and POST only**, every answer JSON:
+
+  | method | path | answers |
+  | --- | --- | --- |
+  | GET | `/layers/me`, `/layers/feed?after=talk:3,tasks:0&wait=` | JSON |
+  | GET | `/layer/{layer}/entries`, `/entry/{id}`, `/graph/{slug}`, `/latest?about=` | JSON-LD |
+  | GET | `/layer/{layer}/feed?after=&wait=` | JSON (a long poll, `wait` up to 60 s) |
+  | GET | `/layer/{layer}/rd` (pending tuples), `?state=taken` (receipts), `?tuple=<iri>` | JSON; one tuple JSON-LD |
+  | GET | `/layer/{layer}/receipt/{id}`, `/layer/{layer}/context` | JSON-LD |
+  | POST | `/layer/{layer}/say`, `/layer/{layer}/out` (the body: JSON-LD or Turtle) | `{"@id"}` |
+  | POST | `/layer/{layer}/take?tuple=<iri>` | the tuple as taken, JSON-LD |
+  | GET, POST | `/layer/{layer}/tuples` | the resource's own name: GET is `rd`, POST is `out`, POST with `X-HTTP-Method-Override: DELETE` is `take` |
+
+  **The layout is exact**: a path is the resource's IRI with `:` as `/` (`urn:layer:talk:entry:01m4…`
+  is `/layer/talk/entry/01m4…`, `urn:layers:me` is `/layers/me`), the mechanical mapping
+  ikigai-web uses, plus the three tuplespace verb names `rd`, `out` and `take` on
+  `urn:layer:{layer}:tuples`. Authentication is the one header `Authorization: Bearer <token>`
+  on every request. A long poll (`feed?wait=<seconds>`, at most 60) is HELD until an event
+  arrives or the wait runs out, and then answers `{"events": []}`; it never answers early with
+  nothing (a client whose own timeout is shorter than its `wait` should raise it). There is no
+  DELETE: a take is a POST that answers with what it took.
+
+  Query parameters are the resource's own arguments (`as=` picks another face it offers). A
+  JSON body with no `@context` is written under the layer's context, so a participant writes
+  in the terms it reads back. An error is `{"kind", "message", …}` with its status (`kind` is
+  the kernel's error kind): a take that lost a race, or a retried take whose answer was lost,
+  is `409 conflict`, and the taker reads its take back with `GET
+  /layer/{layer}/rd?state=taken&tuple=<iri>`.
+
 ## Mounting peers, and following a layer door
 
 `--mount <prefix>=<target>` (alias), `--override` (the same names, served remotely) and

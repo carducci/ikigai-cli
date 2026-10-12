@@ -1510,8 +1510,14 @@ ikigai-ledger = "0.11.0"
 # ⚠ …and 0.2.4 is the edge door's SECURITY floor (ledger #1326, #1327): 0.2.3 bounds JSON-LD nesting
 # before the parse (a 12 KB `say` nested 1,500 deep overflowed the stack and ABORTED the host), and
 # 0.2.4 refuses `rd match=` unless a layer's definition says `match = true`. devtools'
-# `services/edge/layers-door-check` refuses a binary that links anything older. `"0.2.4"` is `<0.3.0`.
-ikigai-layers = "0.2.4"
+# `services/edge/layers-door-check` refuses a binary that links anything older.
+# ⚠ …and 0.2.7 is the HTTPS front's floor (ledger #1371): every participant answer has a JSON face
+# DECLARED in its description (`as=application/ld+json` on entries/entry/graph/latest/receipt and on
+# the `tuples` read and take, `application/json` on the lists, `say` and `out`), and an `as=` a
+# resource does not offer is refused rather than answered in another face. The front forwards `as`
+# and defaults it to those faces, so a participant needs only an HTTP client and a JSON parser;
+# 0.2.6 answered a take in Turtle only. `"0.2.7"` is `<0.3.0`.
+ikigai-layers = "0.2.7"
 # ── Intra-workspace siblings: LOCKSTEP pins, not floors ───────────────────────
 # The seventeen members that take `version.workspace = true` are released TOGETHER, at one
 # version, always. So every sibling pin below states the CURRENT workspace version rather

@@ -125,6 +125,9 @@ ikigai-resolve = { workspace = true }
 serde_json = { workspace = true }
 # OS randomness for minting a client link token.
 getrandom = "0.2"
+# SHA-256 of a layer front's bearer token: `layer-tokens.json` stores hashes, never tokens
+# (`tokens.rs`). Already in the graph at 0.10 (ikigai-quic's fingerprints, and this crate's tests).
+sha2 = "0.10"
 # Ed25519 over standard PKCS8/SPKI keys — the decide-link token. Same crate and key formats
 # ikigai-sign uses, so a `urn:secret:generate type=ed25519` key loads in both.
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "pkcs8", "pem"] }

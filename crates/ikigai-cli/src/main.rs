@@ -15,6 +15,8 @@
 
 #[cfg(not(target_family = "wasm"))]
 mod clipboard;
+#[cfg(all(feature = "embedded", feature = "quic", feature = "web"))]
+mod front;
 #[cfg(feature = "quic")]
 mod quic;
 mod repl;
@@ -136,6 +138,21 @@ usage:
                                dropped in the workspace. OFF by default; the daemon is the worker
   ikigai cert generate         create the pinned QUIC certificates (--dir <d> for a dedicated set)
   ikigai cert add-client <n>   mint an extra client identity into clients/<n>.{crt,key}
+  ikigai serve <q> --layers-https <addr>
+                               a door hosting layers also serves participant verbs over HTTPS
+                               at <addr> (or `layers.https`, instance-scoped as
+                               <name>.layers.https, in the config home; off unless one names an
+                               address), with the door's own server certificate, for a
+                               participant that has only an HTTP client and a JSON parser.
+                               Same kernel, grants, principals and refusals as the QUIC door;
+                               needs the `web` feature beside `quic`
+  ikigai layers-token mint <participant|fingerprint> [--label <l>]
+                               mint a bearer token for the HTTPS front, bound to ONE enrolled
+                               clients.json entry (a participant IRI that names exactly one, or
+                               its fingerprint). Printed once; layer-tokens.json in the config
+                               home stores its hash, re-read on every request
+  ikigai layers-token list     the tokens: id, the client each is bound to, label, minted
+  ikigai layers-token revoke <id>  remove one; its next request is refused (401)
   ikigai -c '<command>' ...    run command(s) non-interactively, then exit
   ikigai -e '<sexpr>' ...       evaluate a Lisp s-expression (urn:lisp:eval), then exit
   ikigai --load <uri> [--cap <s>]  read a script resource and evaluate it as Lisp (--cap narrows first)
@@ -240,6 +257,9 @@ enum Mode {
         /// entries, tuples, receipts and feeds (ledger #1188). Layers are hosted when the
         /// config home has a `layers/` directory; see `ikigai_embedded::layers`.
         layers_state: Option<std::path::PathBuf>,
+        /// `--layers-https <addr>`: also serve the layers' participant verbs over HTTPS there
+        /// (ledger #1371). See `front.rs`.
+        layers_https: Option<String>,
     },
     /// Serve the capability-scoped manifold as an MCP (Model Context Protocol)
     /// server over stdio. `grants`/`scopes` union into the session capability —
@@ -272,6 +292,21 @@ enum Mode {
         name: String,
         cert_dir: Option<String>,
         force: bool,
+    },
+    /// `layers-token mint|list|revoke`: the bearer tokens of a layer door's HTTPS front (see
+    /// `ikigai_embedded::tokens`).
+    LayersToken(TokenCommand),
+}
+
+/// What `layers-token` was asked to do.
+enum TokenCommand {
+    Mint {
+        client: String,
+        label: Option<String>,
+    },
+    List,
+    Revoke {
+        id: String,
     },
 }
 
@@ -783,6 +818,57 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
     }
     let mut argv = args.into_iter().peekable();
 
+    if argv.peek().map(String::as_str) == Some("layers-token") {
+        argv.next();
+        let usage = "usage: `ikigai layers-token mint <participant|fingerprint> [--label <l>]` | \
+                     `ikigai layers-token list` | `ikigai layers-token revoke <id>`";
+        let command = match argv.next().as_deref() {
+            Some("mint") => {
+                let mut client = None;
+                let mut label = None;
+                while let Some(arg) = argv.next() {
+                    match arg.as_str() {
+                        "--label" => {
+                            label = Some(
+                                argv.next()
+                                    .ok_or_else(|| "--label needs a value".to_string())?,
+                            )
+                        }
+                        other if other.starts_with('-') => {
+                            return Err(format!(
+                                "unknown argument after `layers-token mint`: {other}"
+                            ))
+                        }
+                        _ if client.is_none() => client = Some(arg),
+                        other => {
+                            return Err(format!(
+                                "unexpected argument after `layers-token mint`: {other}"
+                            ))
+                        }
+                    }
+                }
+                TokenCommand::Mint {
+                    client: client.ok_or_else(|| usage.to_string())?,
+                    label,
+                }
+            }
+            Some("list") => match argv.next() {
+                None => TokenCommand::List,
+                Some(other) => {
+                    return Err(format!(
+                        "unexpected argument after `layers-token list`: {other}"
+                    ))
+                }
+            },
+            Some("revoke") => match (argv.next(), argv.next()) {
+                (Some(id), None) => TokenCommand::Revoke { id },
+                _ => return Err(usage.to_string()),
+            },
+            _ => return Err(usage.to_string()),
+        };
+        return Ok(Some(Mode::LayersToken(command)));
+    }
+
     if argv.peek().map(String::as_str) == Some("cert") {
         argv.next();
         return match argv.next().as_deref() {
@@ -864,7 +950,19 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
         let mut passkey_rp_id: Option<String> = None;
         let mut passkey_origin: Option<String> = None;
         let mut layers_state: Option<std::path::PathBuf> = None;
+        let mut layers_https: Option<String> = None;
         while let Some(arg) = argv.next() {
+            if arg == "--layers-https" {
+                let addr = argv.next().ok_or_else(|| {
+                    "--layers-https needs an address (host:port; port 0 takes a free one)"
+                        .to_string()
+                })?;
+                if layers_https.is_some() {
+                    return Err("--layers-https given twice; a door has one front".to_string());
+                }
+                layers_https = Some(addr);
+                continue;
+            }
             if arg == "--layers-state" {
                 let dir = argv
                     .next()
@@ -1083,6 +1181,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
             announce,
             mounts,
             layers_state,
+            layers_https,
         }));
     }
 
@@ -1363,6 +1462,7 @@ fn main() {
             cert_dir,
             force,
         } => cert_add_client(&name, cert_dir, force),
+        Mode::LayersToken(command) => layers_token(command),
         Mode::Serve {
             target,
             certs,
@@ -1377,15 +1477,18 @@ fn main() {
             max_body,
             push,
             layers_state,
+            layers_https,
         } => match (http, target.as_deref()) {
             // Layers are hosted by the QUIC door only: it is the door that names each
             // participant from its certificate, and a layer refuses a write that names nobody.
             // A state directory for a door that hosts nothing is a flag that does nothing.
             (http, target)
-                if layers_state.is_some() && (http.is_some() || !target.is_some_and(is_quic)) =>
+                if (layers_state.is_some() || layers_https.is_some())
+                    && (http.is_some() || !target.is_some_and(is_quic)) =>
             {
                 eprintln!(
-                    "ikigai: --layers-state applies to `serve quic://…`, the door that hosts layers"
+                    "ikigai: --layers-state and --layers-https apply to `serve quic://…`, the \
+                     door that hosts layers"
                 );
                 std::process::exit(2);
             }
@@ -1406,7 +1509,15 @@ fn main() {
             }
             (None, Some(t)) if is_quic(t) => {
                 refuse_arrangement_flag("a QUIC door (`serve quic://…`), a served posture,");
-                serve_quic(t, &certs, &caps, announce, mounts, layers_state)
+                serve_quic(
+                    t,
+                    &certs,
+                    &caps,
+                    announce,
+                    mounts,
+                    layers_state,
+                    layers_https,
+                )
             }
             (None, _) if !caps.is_empty() => {
                 eprintln!("ikigai: --cap sets a per-connection ceiling and needs a quic:// target");
@@ -2917,6 +3028,7 @@ fn serve_quic(
     announce: bool,
     mounts: Mounts,
     layers_state: Option<std::path::PathBuf>,
+    layers_https: Option<String>,
 ) -> ! {
     let caps = caps.to_vec();
     let result = (|| -> Result<(), String> {
@@ -2930,6 +3042,17 @@ fn serve_quic(
         // the door here rather than at its first write. `None` without `layers/`: the door is
         // built exactly as it always was.
         let layers = ikigai_embedded::layers::open(layers_state.as_deref())?;
+        // THE HTTPS FRONT (ledger #1371), when the flag or the config home names an address: a
+        // second face onto THIS door's kernel and authority, for participants that speak only
+        // HTTP. It fronts layers and nothing else, so it needs a door that hosts them.
+        let https = layers_https_addr(layers_https)?;
+        if let (Some(addr), None) = (&https, &layers) {
+            return Err(format!(
+                "the layers HTTPS front ({addr}) fronts layers, and this door hosts none: the \
+                 config home has no `{}/` directory",
+                ikigai_embedded::layers::DIR
+            ));
+        }
         // Flags are POSTURE and win wholesale when given; `--no-config-mounts` composes
         // none; otherwise the machine's own topology from the config home — the same rule as
         // every kernel-building mode.
@@ -3070,7 +3193,11 @@ fn serve_quic(
         // The enrolment is re-read per connection inside the minter (that is what makes
         // an edit a revocation), so the startup read is used only to CHOOSE the posture
         // and to report it.
-        let minter: ikigai_quic::Minter = if enrolment.is_some() {
+        // POSTURE 1's minter, as a builder: the QUIC door's logs each grant it mints (one line
+        // per connection), and the layers HTTPS front's is the SAME code without that line,
+        // because the front mints per REQUEST and a participant that long-polls would write a
+        // line every few seconds. Refusals are logged by both.
+        let enrolled_minter = |log_grants: bool| -> ikigai_quic::Minter {
             // `--cap` still bounds every grant; with no `--cap` the grant IS the authority.
             let ceiling = if caps.is_empty() {
                 ikigai_core::Capability::root()
@@ -3092,14 +3219,16 @@ fn serve_quic(
                             &ikigai_embedded::tenant::tenant_root(&root, &peer.segment_id),
                         );
                         let principal = principal_of(&peer.fingerprint, authority.principal);
-                        diagnose(format_args!(
-                            "ikigai: client {} → grant \"{grant}\" ({}) as {principal}",
-                            short_fingerprint(&peer.fingerprint),
-                            match capability.scopes() {
-                                None => "unrestricted".to_string(),
-                                Some(s) => format!("{} scope(s)", s.len()),
-                            }
-                        ));
+                        if log_grants {
+                            diagnose(format_args!(
+                                "ikigai: client {} → grant \"{grant}\" ({}) as {principal}",
+                                short_fingerprint(&peer.fingerprint),
+                                match capability.scopes() {
+                                    None => "unrestricted".to_string(),
+                                    Some(s) => format!("{} scope(s)", s.len()),
+                                }
+                            ));
+                        }
                         Some(ikigai_quic::Session {
                             capability,
                             file_segment: peer.segment_id.clone(),
@@ -3119,6 +3248,10 @@ fn serve_quic(
                     }
                 }
             })
+        };
+        let front_minter = enrolment.is_some().then(|| enrolled_minter(false));
+        let minter: ikigai_quic::Minter = if enrolment.is_some() {
+            enrolled_minter(true)
         } else if caps.is_empty() {
             let root = file_root.clone();
             std::sync::Arc::new(move |peer: &ikigai_quic::PeerIdentity| {
@@ -3247,6 +3380,12 @@ fn serve_quic(
                 hosted.source.as_str()
             );
         }
+        // The front binds before the banner too, and its line comes first, so the QUIC banner
+        // stays the last line a harness waits for and both addresses are bound when it prints.
+        let front = match &https {
+            Some(addr) => Some(bind_layers_front(addr, &identity)?),
+            None => None,
+        };
         // BIND BEFORE THE BANNER (the QUIC face of ledger #1223): the banner is the readiness
         // signal every harness and supervisor waits for, so it must name a socket that is
         // already bound — and the BOUND one, so `quic://127.0.0.1:0` announces the port the
@@ -3309,6 +3448,14 @@ fn serve_quic(
                             .to_string(),
                     );
                 }
+                if front.is_some() {
+                    reloads.push(
+                        "layer-tokens.json — re-read on EVERY request to the HTTPS front, so a \
+                         revoked token is refused on its next request; each token mints through \
+                         clients.json as the certificate it is bound to would."
+                            .to_string(),
+                    );
+                }
                 reloads
             },
         });
@@ -3357,7 +3504,24 @@ fn serve_quic(
         };
         // The transport wants the PEMs; the banner wanted the identities. Same list.
         let pems: Vec<String> = trusted.into_iter().map(|client| client.pem).collect();
-        ikigai_quic::serve_bounded_on(
+        // ONE kernel for both faces: a write through one must cut the threads the other's
+        // readers hang from (`ikigai_quic::serve_shared_on`).
+        let kernel = std::sync::Arc::new(kernel);
+        match (front, front_minter) {
+            (Some(front), Some(front_minter)) => {
+                spawn_layers_front(front, std::sync::Arc::clone(&kernel), front_minter)?
+            }
+            // Unreachable by the checks above (a layer door enrolls, and the front needs one),
+            // and refused rather than served if it ever were: a front with no per-identity
+            // minter would have no authority to give anyone.
+            (Some(_), None) => {
+                return Err(
+                    "the layers HTTPS front needs per-identity grants (clients.json)".into(),
+                )
+            }
+            (None, _) => {}
+        }
+        ikigai_quic::serve_shared_on(
             kernel,
             socket,
             &identity,
@@ -3374,6 +3538,198 @@ fn serve_quic(
             eprintln!("ikigai: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+/// The config-home key naming the layers HTTPS front's address, instance-scoped as
+/// `<instance>.layers.https`.
+#[cfg(all(feature = "embedded", feature = "quic"))]
+const LAYERS_HTTPS_KEY: &str = "layers.https";
+
+/// Where the layers HTTPS front binds: `--layers-https`, else `<instance>.layers.https`, else
+/// `layers.https` in the config home; `None` when nothing names one (the front is off). A bare
+/// port binds loopback, as `serve --http <port>` does.
+#[cfg(all(feature = "embedded", feature = "quic"))]
+fn layers_https_addr(flag: Option<String>) -> Result<Option<String>, String> {
+    let instance = ikigai_embedded::instance_name();
+    let named = flag
+        .or_else(|| ikigai_embedded::config::get(&format!("{instance}.{LAYERS_HTTPS_KEY}")))
+        .or_else(|| ikigai_embedded::config::get(LAYERS_HTTPS_KEY))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let Some(named) = named else {
+        return Ok(None);
+    };
+    if !cfg!(feature = "web") {
+        return Err(format!(
+            "the layers HTTPS front ({named}) needs the `web` feature beside `quic`: install \
+             with `--features quic,web`"
+        ));
+    }
+    Ok(Some(if named.parse::<u16>().is_ok() {
+        format!("127.0.0.1:{named}")
+    } else {
+        named
+    }))
+}
+
+/// The bound front, waiting for the kernel it will serve.
+#[cfg(all(feature = "embedded", feature = "quic", feature = "web"))]
+struct BoundFront {
+    listener: std::net::TcpListener,
+    tls: tokio_rustls::rustls::ServerConfig,
+}
+
+#[cfg(all(feature = "embedded", feature = "quic", not(feature = "web")))]
+struct BoundFront;
+
+/// Bind the front's socket and build its TLS (the QUIC door's own server certificate), and
+/// print its banner line: it names the BOUND address, so port 0 announces the port taken.
+#[cfg(all(feature = "embedded", feature = "quic", feature = "web"))]
+fn bind_layers_front(addr: &str, identity: &ikigai_quic::Identity) -> Result<BoundFront, String> {
+    let tls = ikigai_quic::https_server_tls(identity)
+        .map_err(|e| format!("the layers HTTPS front's TLS: {e}"))?;
+    let listener = std::net::TcpListener::bind(addr)
+        .map_err(|e| format!("the layers HTTPS front could not bind {addr}: {e}"))?;
+    let bound = listener
+        .local_addr()
+        .map_err(|e| format!("the layers HTTPS front's address: {e}"))?;
+    let tokens = ikigai_embedded::tokens::tokens_path()
+        .ok_or("the layers HTTPS front needs a config home to keep layer-tokens.json in")?;
+    // Read once here so a broken file stops the start, as a broken clients.json does; the
+    // front reads it again on every request.
+    let held = ikigai_embedded::tokens::load_from(&tokens)?;
+    eprintln!(
+        "ikigai: layers https on https://{bound}  (bearer tokens: {} bound in {}, re-read on \
+         every request; TLS with this door's server certificate)",
+        held.len(),
+        tokens.display()
+    );
+    Ok(BoundFront { listener, tls })
+}
+
+#[cfg(all(feature = "embedded", feature = "quic", not(feature = "web")))]
+fn bind_layers_front(addr: &str, _identity: &ikigai_quic::Identity) -> Result<BoundFront, String> {
+    Err(format!(
+        "the layers HTTPS front ({addr}) needs the `web` feature beside `quic`"
+    ))
+}
+
+/// Serve the front on a thread of its own, onto `kernel` (the QUIC door's) with `minter` (the
+/// QUIC door's). If it ever stops, the door says so and goes on serving QUIC.
+#[cfg(all(feature = "embedded", feature = "quic", feature = "web"))]
+fn spawn_layers_front(
+    bound: BoundFront,
+    kernel: std::sync::Arc<ikigai_core::Kernel>,
+    minter: ikigai_quic::Minter,
+) -> Result<(), String> {
+    let tokens = ikigai_embedded::tokens::tokens_path()
+        .ok_or("the layers HTTPS front needs a config home to keep layer-tokens.json in")?;
+    let front = front::Front {
+        kernel,
+        minter,
+        tokens,
+        edge: ikigai_web::EdgeConfig::default(),
+    };
+    std::thread::Builder::new()
+        .name("layers-https".to_string())
+        .spawn(move || {
+            if let Err(e) = front::serve(front, bound.listener, bound.tls) {
+                diagnose(format_args!("ikigai: layers https STOPPED: {e}"));
+            }
+        })
+        .map(drop)
+        .map_err(|e| format!("the layers HTTPS front's thread: {e}"))
+}
+
+#[cfg(all(feature = "embedded", feature = "quic", not(feature = "web")))]
+fn spawn_layers_front(
+    _bound: BoundFront,
+    _kernel: std::sync::Arc<ikigai_core::Kernel>,
+    _minter: ikigai_quic::Minter,
+) -> Result<(), String> {
+    Ok(())
+}
+
+/// `ikigai layers-token mint|list|revoke`: the bearer tokens of a layer door's HTTPS front,
+/// kept hashed in `layer-tokens.json` beside `clients.json` (`ikigai_embedded::tokens`).
+#[cfg(feature = "embedded")]
+fn layers_token(command: TokenCommand) -> ! {
+    use ikigai_embedded::tokens;
+    let result = (|| -> Result<(), String> {
+        let path = tokens::tokens_path()
+            .ok_or("no config home to keep layer-tokens.json in (set HOME or --config-home)")?;
+        let mut held = tokens::load_from(&path)?;
+        match command {
+            TokenCommand::Mint { client, label } => {
+                let enrolment = ikigai_embedded::clients::enrolment()?.ok_or_else(|| {
+                    format!(
+                        "no clients.json ({}): a token is bound to an ENROLLED participant, so \
+                         enroll it first (`ikigai-layers grants <config home>` writes \
+                         clients.json from enrollment.toml)",
+                        ikigai_embedded::clients::clients_path()
+                            .map_or_else(|| "unset".into(), |p| p.display().to_string())
+                    )
+                })?;
+                let key = tokens::resolve_client(&enrolment, &client)?;
+                let token = tokens::generate()?;
+                let created = tokens::now();
+                let label = label.unwrap_or_else(|| client.clone());
+                let binding = held.insert(&token, &key, &label, &created)?;
+                tokens::save_to(&path, &held)?;
+                // The token on stdout ALONE, so `$(ikigai layers-token mint …)` captures it;
+                // everything else on stderr.
+                println!("{token}");
+                eprintln!(
+                    "ikigai: minted token {} for {} (client {}), stored as its hash in {}. This \
+                     is the only time it is shown.",
+                    binding.id,
+                    enrolment.principal_for(&key).unwrap_or(label.as_str()),
+                    short_key(&key),
+                    path.display()
+                );
+            }
+            TokenCommand::List => {
+                for b in held.bindings() {
+                    println!("{}  {}  {}  {}", b.id, b.client, b.created, b.label);
+                }
+                if held.is_empty() {
+                    eprintln!("ikigai: no tokens in {}", path.display());
+                }
+            }
+            TokenCommand::Revoke { id } => {
+                let gone = held.revoke(&id)?;
+                tokens::save_to(&path, &held)?;
+                eprintln!(
+                    "ikigai: revoked token {} ({}); its next request is refused",
+                    gone.id, gone.label
+                );
+            }
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("ikigai: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(not(feature = "embedded"))]
+fn layers_token(_command: TokenCommand) -> ! {
+    eprintln!("ikigai: `layers-token` needs the `embedded` feature");
+    std::process::exit(1);
+}
+
+/// A clients.json key for a log line: a fingerprint's leading characters, anything else whole.
+#[cfg(feature = "embedded")]
+fn short_key(key: &str) -> &str {
+    if key.len() == 64 {
+        &key[..16]
+    } else {
+        key
     }
 }
 
@@ -3399,6 +3755,7 @@ fn serve_quic(
     _announce: bool,
     _mounts: Mounts,
     _layers_state: Option<std::path::PathBuf>,
+    _layers_https: Option<String>,
 ) -> ! {
     eprintln!("ikigai: `quic://` needs the `quic` feature");
     std::process::exit(1);
