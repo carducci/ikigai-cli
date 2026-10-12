@@ -50,7 +50,9 @@ spargebra = { version = "0.4", features = ["sep-0006"] }
 # evaluation runs under (the caller answered with a `Timeout` at the budget, the evaluation handed a
 # cancellation token, abandoned evaluations counted and capped), and `budget::check_query`, the
 # algebra bounds. Both exist only from 0.2.18.
-ikigai-store = "0.2.18"
+# ⚠ 0.2.19 (ledger #1333, #1354) is a SECURITY floor taken with the root's, so the two pins cannot resolve
+# apart off-tree: an update's triple terms are bounded. No signature changed; the API floor above is unchanged.
+ikigai-store = "0.2.19"
 
 [dev-dependencies]
 futures = { workspace = true }

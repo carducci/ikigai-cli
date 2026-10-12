@@ -56,10 +56,23 @@ per-connection `Session` from it:
 
 ## Two deadlines: patience for work, a bound for self-description
 
-`DEFAULT_IDLE_TIMEOUT` is **five minutes**, because what a connection's idle bound
-measures is SILENCE and a resolution is silent while it works — a 70B model loads ~40GB
-before its first token, and a bound that cannot tell *hung* from *busy* reports the
-wrong thing confidently.
+`DEFAULT_IDLE_TIMEOUT` is **five minutes**, because what it bounds is a call's SILENCE and
+a resolution is silent while it works — a 70B model loads ~40GB before its first token,
+and a bound that cannot tell *hung* from *busy* reports the wrong thing confidently. It is
+the default per-call deadline (`with_call_timeout`), and a server's idle timeout.
+
+**The client pings** (since cli 0.1.56, ledger #1359). Its connection runs under
+`LIVENESS_TIMEOUT` (**15s**) with a PING every `KEEP_ALIVE_INTERVAL` (**5s**) of quiet, so a
+peer that vanishes without closing (power, network) is found in seconds by both ends rather
+than at the five-minute bound, while a live peer working on a long call keeps the
+connection up and the call keeps its full deadline. QUIC negotiates the smaller of the two
+idle timeouts, so the client's bound governs the server too. The SERVER does not ping: a
+client older than 0.1.56 has no call deadline, and a pinging server whose kernel wedged
+would hold it for ever, so such a client keeps the idle bound it always had. And a door
+runs each resolution off its runtime worker (`block_in_place`), because a blocked worker
+froze the connection's driver and its acknowledgments with it; ⚠ so a client that pings,
+against a door older than 0.1.56, can lose a call silent for longer than 15s. Upgrade doors
+before their clients.
 
 Nothing is ever working during a **self-description**, so those calls run under
 `DEFAULT_DESCRIBE_TIMEOUT` (**30s**, `describe.timeout` in the config home) instead: a

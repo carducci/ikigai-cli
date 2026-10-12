@@ -379,7 +379,7 @@ gives its own mounts two thirds of it, so when a client asks a host about a peer
 gone silent, the host's deadline fires first and the answer names the peer, rather than the
 client's deadline blaming the host.
 
-**Call deadlines** (ikigai-cli 0.1.55+). Every other call to a mounted or `--connect`ed peer
+**Call deadlines** (ikigai-cli 0.1.56+). Every other call to a mounted or `--connect`ed peer
 runs under `call.timeout` (seconds, `0` for none), start to finish. Unset, it is the
 transport's own silence bound (`quic.timeout`, or the socket's five minutes), so nothing that
 used to succeed is cut; what it ends is a peer that accepts a call and never answers it while
@@ -388,6 +388,13 @@ canceled on the wire (QUIC: the stream is stopped; a socket: the connection is d
 the answer is a `timeout` naming the peer. As with describe, a process that serves a door
 gives its own mounts two thirds of a configured value. An embedding host passes its own,
 per mount (`with_call_timeout`) or per call (`issue_as_within`).
+
+**Dead peers in seconds** (ikigai-cli 0.1.56+). A QUIC client pings a quiet connection every
+5 s and declares its peer dead after 15 s of hearing nothing, so a mounted peer that loses
+power or its network mid-call is found in seconds instead of at `quic.timeout`. A live peer
+working on a long call answers the pings, so the call keeps its whole deadline. ⚠ Upgrade a
+door (`serve quic://…`) before its clients: an older door stops acknowledging while it works,
+and a newer client then gives up on a call silent for longer than 15 s.
 
 **MCP for a mounted peer.** `ikigai mcp` takes the same mount flags, and `--show <pattern>`
 (repeatable) narrows the tool LIST to what matches: a tool name, or, with a `:`, an IRI prefix
