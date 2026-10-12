@@ -24,6 +24,21 @@ stdio — no tokio): each `ik:Action` becomes a tool, the tool name reverses to 
 ikigai mcp --grant <name>        # serve under a named grant (the ceiling)
 ikigai mcp --scope urn:cap:…     # …or an ad-hoc scope union
 ikigai mcp                       # no grant → root (unrestricted; warns)
+ikigai mcp … --show urn:layer:   # list only the tools bound under an IRI prefix (repeatable)
+```
+
+`--show <pattern>` narrows the LIST, never the authority. A pattern is a tool name
+(`grep__source`), a bare endpoint id (`grep`, every verb), a trailing-`*` prefix
+(`repo-*`), or, with a `:` in it, an **IRI prefix** matched against where a tool is bound
+rather than its name. The same patterns go in a grant's `"show"` / `"hide"` lists in
+`grants.json` (the object form, `{"scopes": […], "show": […], "hide": […]}`), and `--show`
+unions with them. An IRI prefix lets an MCP entry for a mounted peer leave the local
+kernel's own tools out:
+
+```bash
+ikigai mcp --scope urn:cap:layer:read:talk \
+  --override urn:layer:,urn:layers:,urn:collab:=quic://door.example:4434 --cert-dir ~/certs/me \
+  --show urn:layer: --show urn:layers: --show urn:collab:
 ```
 
 Wire it into an MCP host, e.g. Claude Desktop's `claude_desktop_config.json`:

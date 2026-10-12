@@ -1394,12 +1394,16 @@ impl Engine {
         let iri = parse_target(target)?;
 
         // Only look up the argument contract if a leading word could be a named
-        // argument — a bare content write (the common case) skips it.
-        let declared = if split_first_word(tail).0.contains('=') {
-            declared_arguments(self.describe_struct(&iri).await.as_ref())
+        // argument — a bare content write (the common case) skips it — or a `delete`
+        // might take the batch's piped stdin, which only a Delete that DECLARES `content`
+        // does (see `delete_takes_content`).
+        let stdin_for_delete = verb == Verb::Delete && self.piped_input.borrow().is_some();
+        let description = if split_first_word(tail).0.contains('=') || stdin_for_delete {
+            self.describe_struct(&iri).await
         } else {
-            Vec::new()
+            None
         };
+        let declared = declared_arguments(description.as_ref());
 
         let mut request = Request::new(verb, iri.clone());
         let mut content_named = false;
@@ -1439,6 +1443,20 @@ impl Engine {
                     // An idle stdin: no content at all (see `set_piped_input_polled`).
                     None => return Ok(request),
                 },
+                None => Vec::new(),
+            }
+        } else if tail.is_empty() && stdin_for_delete && delete_takes_content(description.as_ref())
+        {
+            // ledger #1230: a batch's piped stdin is a content-less `delete`'s content too,
+            // when its contract declares `content` (the ledger's claim DELETE takes a release
+            // note there). Narrower than the sink rule on purpose: a delete with no use for a
+            // body never reads stdin, so `ikigai -c 'delete …'` on an inherited, idle pipe
+            // costs nothing (the ledger #1088 hazard). An idle stdin sends what a delete
+            // without one always sent.
+            let piped = self.piped_input.borrow_mut().take();
+            match piped {
+                Some(PipedInput::Ready(bytes)) => bytes,
+                Some(PipedInput::Deferred(read)) => read().unwrap_or_default(),
                 None => Vec::new(),
             }
         } else if verb == Verb::Sink {
@@ -2118,11 +2136,20 @@ pub(crate) fn route_value_name(
     description: Option<&Description>,
     named: &[&str],
 ) -> Result<String, String> {
-    let declared = declared_arguments(description);
     // No contract: assume the conventional `in`, as before.
     let Some(description) = description else {
         return Ok("in".to_string());
     };
+    // ★ The SOURCE action's by-value arguments only (ledger #1296). `declared_arguments`
+    // unions every verb's inputs, which is right for recognizing a `key=value` word and wrong
+    // here: a value reaching a `source` stage could land on a Sink- or Delete-only argument
+    // (`content`), or be called ambiguous because of one.
+    let mut declared: Vec<String> = Vec::new();
+    for input in source_inputs(description) {
+        if input.source == InputSource::Argument && !declared.contains(&input.name) {
+            declared.push(input.name);
+        }
+    }
     let remaining: Vec<&str> = declared
         .iter()
         .map(String::as_str)
@@ -2185,6 +2212,20 @@ fn source_inputs(description: &Description) -> Vec<ikigai_core::ArgSpec> {
         .find(|action| action.verb == Verb::Source)
         .map(|action| action.inputs)
         .unwrap_or_else(|| description.inputs.clone())
+}
+
+/// Whether a target's DELETE declares a `content` argument, which is what lets a `-c`
+/// batch's piped stdin reach a content-less `delete` (ledger #1230). Read through
+/// `action_specs()`, so a per-verb contract and the flat authoring form answer alike; no
+/// contract, or a contract with no Delete, is `false`.
+fn delete_takes_content(description: Option<&Description>) -> bool {
+    description.is_some_and(|description| {
+        description
+            .action_specs()
+            .into_iter()
+            .filter(|action| action.verb == Verb::Delete)
+            .any(|action| action.inputs.iter().any(|input| input.name == "content"))
+    })
 }
 
 /// The names of a target's declared by-value arguments, in declaration order.
@@ -3822,6 +3863,101 @@ mod tests {
         assert_eq!(run(&engine, "sink urn:echo"), "content:");
         // No piped input at all (a terminal) is unchanged: an empty body.
         assert_eq!(run(&engine, "sink urn:echo"), "content:");
+    }
+
+    /// Two DELETE endpoints: `urn:claim` declares `content` on its per-verb Delete (a release
+    /// note, as the ledger's claim does), `urn:plain` declares no body at all. Each answers
+    /// what `content` it received.
+    fn delete_probe_engine() -> Engine {
+        use ikigai_core::ActionSpec;
+        let probe = |id: &'static str| {
+            FnEndpoint::new(id, |inv: &Invocation<'_>| {
+                let body = match inv.request.args.get("content") {
+                    Some(_) => format!("content:{}", inv.inline_str("content").unwrap_or("?")),
+                    None => "no-content".to_string(),
+                };
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    body.into_bytes(),
+                ))
+            })
+        };
+        let claim = probe("claim").with_description(
+            Description::new("claim").action(
+                ActionSpec::new(Verb::Delete)
+                    .input(ArgSpec::new("item").summary("the item"))
+                    .input(ArgSpec::new("content").summary("a release note").optional()),
+            ),
+        );
+        let plain = probe("plain").with_description(
+            Description::new("plain")
+                .verb(Verb::Delete)
+                .input(ArgSpec::new("item").summary("the item")),
+        );
+        Engine::new(Kernel::with_meta_renderer(
+            Arc::new(
+                EndpointSpace::new()
+                    .bind(Exact::new("urn:claim"), claim)
+                    .bind(Exact::new("urn:plain"), plain),
+            ),
+            Arc::new(JsonRenderer),
+        ))
+    }
+
+    /// ledger #1230: `printf note | ikigai -c "delete urn:iki:ledger:claim item=N"` sent the
+    /// delete with NO note, because a batch's stdin reached only a content-less `sink`. A
+    /// content-less `delete` whose contract declares `content` takes it now; one that declares
+    /// no body never reads stdin (so an inherited idle pipe costs it nothing); an idle stdin
+    /// sends what a delete without one always sent; and a named or trailing body wins.
+    #[test]
+    fn a_batch_stdin_reaches_a_delete_that_declares_content() {
+        let engine = delete_probe_engine();
+        let run = |cmd: &str| match engine.eval(cmd) {
+            Action::Output(entry) => entry.result.unwrap(),
+            _ => panic!("expected Action::Output"),
+        };
+        engine.set_piped_input(b"released: done".to_vec());
+        assert_eq!(run("delete urn:claim item=7"), "content:released: done");
+        assert_eq!(
+            run("delete urn:claim item=7"),
+            "content:",
+            "stdin is one-shot"
+        );
+
+        let read = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = std::rc::Rc::clone(&read);
+        engine.set_piped_input_polled(move || {
+            seen.set(true);
+            Some(b"stdin".to_vec())
+        });
+        assert_eq!(run("delete urn:plain item=7"), "content:");
+        assert!(!read.get(), "a delete with no `content` never reads stdin");
+        // ...and the payload is still there for the delete that does take it.
+        assert_eq!(run("delete urn:claim item=7"), "content:stdin");
+
+        engine.set_piped_input_polled(|| None);
+        assert_eq!(
+            run("delete urn:claim item=7"),
+            "content:",
+            "idle: as before"
+        );
+
+        engine.set_piped_input(b"piped".to_vec());
+        assert_eq!(
+            run("delete urn:claim item=7 content=named"),
+            "content:named",
+            "a named body wins"
+        );
+        assert_eq!(
+            run("delete urn:claim item=7 trailing words"),
+            "content:trailing words",
+            "and so does a trailing one"
+        );
+        assert_eq!(
+            run("delete urn:claim item=7"),
+            "content:piped",
+            "neither consumed the stdin"
+        );
     }
 
     /// ledger #1069, Brian's NARROW rule, pinned both ways: a sink remainder that is ONE
@@ -5853,6 +5989,41 @@ mod tests {
         let binding = Description::new("echo").input(ArgSpec::new("message").binding());
         assert!(declared_arguments(Some(&binding)).is_empty());
         assert!(declared_arguments(None).is_empty());
+    }
+
+    /// ledger #1296: a by-value input reaching a `source` stage routes among the SOURCE
+    /// action's arguments only, never onto another verb's.
+    #[test]
+    fn a_source_value_routes_among_the_source_actions_arguments_only() {
+        use ikigai_core::{ActionSpec, Verb};
+        let iri = Iri::parse("urn:test:x").unwrap();
+        // (1) Source declares nothing, Sink declares `content`: the conventional `in`.
+        let sink_only = Description::new("x")
+            .action(ActionSpec::new(Verb::Source))
+            .action(ActionSpec::new(Verb::Sink).input(ArgSpec::new("content")));
+        assert_eq!(
+            route_value_name(&iri, Some(&sink_only), &[]),
+            Ok("in".to_string())
+        );
+        // (2) Source's one argument `q` is named; Sink's `content` is not a place to go.
+        let named = Description::new("x")
+            .action(ActionSpec::new(Verb::Source).input(ArgSpec::new("q")))
+            .action(ActionSpec::new(Verb::Sink).input(ArgSpec::new("content")));
+        let err = route_value_name(&iri, Some(&named), &["q"]).unwrap_err();
+        assert!(err.contains("already set by name"), "{err}");
+        // (3) Source's optional `limit` beside a Delete-only `match`: `limit`, not ambiguous.
+        let delete_beside = Description::new("x")
+            .action(ActionSpec::new(Verb::Source).input(ArgSpec::new("limit").optional()))
+            .action(ActionSpec::new(Verb::Delete).input(ArgSpec::new("match")));
+        assert_eq!(
+            route_value_name(&iri, Some(&delete_beside), &[]),
+            Ok("limit".to_string())
+        );
+        // The union still RECOGNIZES every verb's names as `key=value` words.
+        assert_eq!(
+            declared_arguments(Some(&delete_beside)),
+            vec!["limit", "match"]
+        );
     }
 
     #[test]

@@ -1018,6 +1018,9 @@ impl QuicResolver {
             .then_some(self.describe_timeout)
             .flatten();
         let replayable = replay_may_follow(&call);
+        // Named in a deadline's error: a host relaying it to its own caller must say WHICH
+        // peer was silent, or the message reads as being about the host (ledger #1288).
+        let addr = wire.addr;
         drive(self.runtime(), async move {
             match deadline {
                 None => wire.round_trip(request, replayable).await,
@@ -1036,7 +1039,10 @@ impl QuicResolver {
                                 io::ErrorKind::TimedOut,
                                 // `Debug` keeps the unit (`300ms`, `30s`); `as_secs()` would
                                 // report a sub-second bound as `0s`.
-                                format!("the peer did not describe itself within {deadline:?}"),
+                                format!(
+                                    "the peer at quic://{addr} did not describe itself within \
+                                     {deadline:?}"
+                                ),
                             ))
                         }
                     }
@@ -1256,10 +1262,19 @@ fn server_config_accepting(
 }
 
 /// A transport config carrying the idle timeout. Each side enforces its OWN, so both
-/// the server and the client builders apply it. Keep-alive stays deliberately absent:
-/// RFC 9000 restarts the idle timer on ack-eliciting SENDS too, so pinging would keep
-/// a dead peer's connection looking alive forever — patience bounded by `idle` beats
-/// liveness theater that never expires.
+/// the server and the client builders apply it.
+///
+/// Keep-alive stays absent, and the reason is NOT that a ping would keep a dead peer's
+/// connection alive: RFC 9000 section 10.1 restarts the idle timer on a send only for the
+/// FIRST ack-eliciting packet after a packet was received, so pings to a dead or stopped peer
+/// cannot hold its connection open past `idle` (an earlier version of this comment said
+/// they could, ledger #1288). What a keep-alive WOULD change is the other case: a peer whose
+/// QUIC stack still acknowledges while its kernel is wedged would keep the connection alive
+/// indefinitely, so a resolution stuck there would never time out, where today the idle
+/// timeout ends it. Pinging would let `idle` shrink (a dead peer found in seconds, a long
+/// silent resolution still alive because the peer's stack acks) at the price of that
+/// unbounded wedge, unless a per-call deadline comes with it. That is a design decision, not
+/// made here.
 fn transport(idle: std::time::Duration) -> io::Result<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(quinn::IdleTimeout::try_from(idle).map_err(other)?));
@@ -3074,6 +3089,10 @@ mod restart {
         assert!(
             timed_out.to_string().contains("did not describe itself"),
             "{timed_out}"
+        );
+        assert!(
+            timed_out.to_string().contains(&format!("quic://{addr}")),
+            "the deadline names the silent peer: {timed_out}"
         );
         let start = std::time::Instant::now();
         let entries = client.try_entries();

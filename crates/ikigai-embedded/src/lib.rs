@@ -849,8 +849,10 @@ fn base_space(nature: &'static str) -> EndpointSpace {
         .bind(Exact::new("urn:host:posture"), posture::host_posture())
 }
 
-/// The directory the local file module is jailed to: `$IKIGAI_FILES`, else
-/// `$HOME/.ikigai/workspace`. Created `0700` if missing (see `create_workspace`).
+/// The directory the local file module is jailed to: the host's `--files` flag (through
+/// [`set_file_root`]), else the config home's `<instance>.files` / `files`, else
+/// `$IKIGAI_FILES`, else `$HOME/.ikigai/workspace` (see [`file_root_from`]). Created `0700`
+/// if missing (see `create_workspace`).
 ///
 /// Deliberately a dedicated, ikigai-owned sandbox — *not* the user's home or
 /// documents — so the owner's root capability grants files only within this tree.
@@ -876,14 +878,72 @@ pub fn file_root() -> PathBuf {
     #[cfg(test)]
     let root = tests::thread_file_root();
     #[cfg(not(test))]
-    let root = std::env::var_os("IKIGAI_FILES")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-            home.join(".ikigai").join("workspace")
-        });
+    let root = {
+        let instance = instance_name();
+        let configured =
+            config::get(&format!("{instance}.{FILES_KEY}")).or_else(|| config::get(FILES_KEY));
+        file_root_from(
+            configured.as_deref(),
+            std::env::var_os("IKIGAI_FILES").as_deref(),
+            config::config_home().as_deref(),
+            std::env::var_os("HOME")
+                .as_deref()
+                .map(std::path::Path::new),
+        )
+    };
     create_workspace(&root);
     root
+}
+
+/// The config-home key naming the file root (`files = "<dir>"`, or `<instance>.files`).
+pub const FILES_KEY: &str = "files";
+
+/// [`file_root`]'s precedence below the `--files` flag (which arrives through
+/// [`set_file_root`]), with every input passed in so it is testable without the process
+/// environment (ledger #1285):
+///
+/// 1. `configured`: the config home's `<instance>.files`, else `files`. A relative path is
+///    resolved against the config home and a leading `~/` against `home`, as `layers.state`
+///    is.
+/// 2. `env`: `$IKIGAI_FILES`, the fallback it always was.
+/// 3. `<home>/.ikigai/workspace` (`./.ikigai/workspace` with no `home`).
+///
+/// ⚠ The config home is SHARED by every process on the machine, so an unscoped `files` line
+/// moves the root of every one of them (the daemon, a served door, the REPL); scope it to
+/// one instance as `<name>.files` unless that is what is meant.
+///
+/// ```
+/// use std::path::{Path, PathBuf};
+/// use ikigai_embedded::file_root_from;
+///
+/// let (cfg, home) = (Some(Path::new("/c/ikigai")), Some(Path::new("/h")));
+/// assert_eq!(file_root_from(Some("ws"), Some("/env".as_ref()), cfg, home), PathBuf::from("/c/ikigai/ws"));
+/// assert_eq!(file_root_from(Some("~/ws"), None, cfg, home), PathBuf::from("/h/ws"));
+/// assert_eq!(file_root_from(None, Some("/env".as_ref()), cfg, home), PathBuf::from("/env"));
+/// assert_eq!(file_root_from(None, None, cfg, home), PathBuf::from("/h/.ikigai/workspace"));
+/// ```
+pub fn file_root_from(
+    configured: Option<&str>,
+    env: Option<&std::ffi::OsStr>,
+    config_home: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+) -> PathBuf {
+    if let Some(value) = configured.map(str::trim).filter(|v| !v.is_empty()) {
+        let path = match (value.strip_prefix("~/"), home) {
+            (Some(rest), Some(home)) => home.join(rest),
+            _ => PathBuf::from(value),
+        };
+        return match config_home {
+            Some(base) if path.is_relative() => base.join(path),
+            _ => path,
+        };
+    }
+    if let Some(env) = env.filter(|v| !v.is_empty()) {
+        return PathBuf::from(env);
+    }
+    home.map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf)
+        .join(".ikigai")
+        .join("workspace")
 }
 
 /// Create the workspace directory PRIVATE (`0700`) if it does not exist yet, whatever the
@@ -918,9 +978,9 @@ fn create_workspace(root: &std::path::Path) {
 
 static FILE_ROOT_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
-/// Point [`file_root`] somewhere other than `$IKIGAI_FILES` / `~/.ikigai/workspace`.
-///
-/// The channel an **integration test** uses to stay hermetic. `cfg(test)` does not reach
+/// Point [`file_root`] somewhere other than what the config home, `$IKIGAI_FILES` or
+/// `~/.ikigai/workspace` would say: the host's `--files <dir>` flag (ledger #1285), and the
+/// channel an **integration test** uses to stay hermetic. `cfg(test)` does not reach
 /// them: a `tests/` binary links this crate compiled without it, so `calendar_server_kernel*`
 /// and `trusted_kernel_for` resolve the developer's real data home from a call that reads as
 /// ordinary setup — which is precisely how this class of bug hides. A typed setter rather
