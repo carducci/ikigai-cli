@@ -2111,13 +2111,10 @@ pub fn served_kernel_with_mounts(
 }
 
 /// [`served_kernel_with_mounts`], hosting a layer host when one is given (ledger #1188):
-/// [`layers::spaces`] (the layers, then the validator their admission composes) go IN FRONT
-/// of the served surface, and the kernel gets a clock, which a layer needs to stamp a write.
-/// With `None` this is exactly the kernel `served_kernel_with_mounts` always built: no layer,
-/// no validator, no clock.
-///
-/// The door checks the built kernel with [`layers::check_validator`] before it serves, so a
-/// layer that would admit nothing never reaches the wire.
+/// [`layers::spaces`] (the layer space, alone: admission validates inside the host, ledger
+/// #1295) goes IN FRONT of the served surface, and the kernel gets a clock, which a layer
+/// needs to stamp a write. With `None` this is exactly the kernel `served_kernel_with_mounts`
+/// always built: no layer, no clock.
 pub fn served_kernel_hosting(
     nature: &'static str,
     surface: ServedSurface,

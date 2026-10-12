@@ -1405,13 +1405,16 @@ ikigai-store = { version = "0.2.14", features = ["persistent"] }
 # a worker-sized authority (claim + comment + read, no close), which is ledger #1143's grant.
 ikigai-ledger = "0.8.0"
 # The layer host (`urn:layer:{layer}`, `urn:layers:*`, `urn:collab:{name}`), linked by `serve
-# quic://` when the config home has a `layers/` directory (ledger #1188). 0.2.0 is the first
-# release with BOTH access models the door hosts (the channel and the tuplespace); it is the
-# only line there is, and the one every test here ran against. ⚠ `"0.2.0"` is `<0.3.0`.
+# quic://` when the config home has a `layers/` directory (ledger #1188). 0.2.2 is a true FLOOR,
+# not a lock preference (ledger #1295): since 0.2.1 the host validates every write itself, and
+# the door binds the layer space ALONE, with no `urn:shacl:validate` beside it. Under 0.2.0
+# admission composed that endpoint, so this door would admit nothing. And `tests/layers_serve.rs`
+# asks `urn:layers:me`, which is 0.2.2's. 0.2.1 also holds `<state>/host.lock`, so a second host
+# over one state directory is refused. ⚠ `"0.2.2"` is `<0.3.0`.
 # ⚠ It depends on `ikigai-intray` FROM CRATES.IO (`"0.1.47"`, `<0.2.0`), and intray is a member
 # of THIS workspace: see the `[patch.crates-io]` at the end of this file, which is what keeps
 # one intray in the graph.
-ikigai-layers = "0.2.0"
+ikigai-layers = "0.2.2"
 # ── Intra-workspace siblings: LOCKSTEP pins, not floors ───────────────────────
 # The seventeen members that take `version.workspace = true` are released TOGETHER, at one
 # version, always. So every sibling pin below states the CURRENT workspace version rather

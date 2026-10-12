@@ -600,16 +600,80 @@ fn a_participants_manifold_lists_exactly_its_layers_actions() {
 
 /// Whether a catalog endpoint id is one a hosted layer brings: the layer actions
 /// (`layer-{layer}-{action}`), the host-wide reads (`layers-feed`, `layers-participants`,
-/// `collab`) and the validator admission composes (`shacl-validate`).
+/// `layers-me`) and the collaboration reads (`collab`, `collab-participants`). Not the
+/// validator: since ikigai-layers 0.2.1 admission validates inside the host, and the door
+/// binds no `shacl-validate` (ledger #1295).
 fn is_layer_endpoint(id: &str) -> bool {
-    id.starts_with("layer-")
-        || id.starts_with("layers-")
-        || id == "collab"
-        || id.starts_with("shacl-")
+    id.starts_with("layer-") || id.starts_with("layers-") || id.starts_with("collab")
 }
 
-/// With NO `layers/` directory the door is the door it always was: no layer, no validator, no
-/// banner line, the same surface, and the same manifold as a door whose config home differs
+/// Ledger #1295: a layer door offers NO participant a validator. Under ikigai-layers 0.2.0
+/// admission composed `urn:shacl:validate`, so the door bound it beside the layers, and since
+/// it declares no capability every participant's manifold listed it. Since 0.2.1 the host
+/// validates each write itself: the door binds the layer space alone, admission still works
+/// (a write is admitted), and `urn:layers:me` (0.2.2) tells each participant who the door
+/// minted it as.
+#[test]
+fn a_layer_door_offers_no_validator_and_tells_each_participant_who_it_is() {
+    let home = scratch("me");
+    let certs = certs(&home);
+    configure_layers(&home, &certs);
+    let (_door, target, _banner) = serve(&home, &certs, &[]);
+
+    for (who, principal) in [("alice", ALICE), ("bob", BOB)] {
+        let manifold = ok(
+            ask(
+                &home,
+                &certs,
+                who,
+                &target,
+                "source urn:kernel:actions",
+                None,
+            ),
+            &format!("{who}'s manifold"),
+        );
+        assert!(
+            manifold.contains("urn:layer:talk:say"),
+            "{who}'s manifold was read:\n{manifold}"
+        );
+        assert!(
+            !manifold.contains("urn:shacl:") && !manifold.contains("shacl-"),
+            "no validator is offered to {who}:\n{manifold}"
+        );
+
+        let me = ok(
+            ask(
+                &home,
+                &certs,
+                who,
+                &target,
+                "source urn:layers:me as=application/json",
+                None,
+            ),
+            &format!("{who}'s urn:layers:me"),
+        );
+        let me: serde_json::Value = serde_json::from_str(me.trim())
+            .unwrap_or_else(|e| panic!("{who}: urn:layers:me is JSON ({e}): {me}"));
+        assert_eq!(me["principal"], principal, "{who}: {me}");
+    }
+
+    // Admission still runs with no validator bound: a conforming message is admitted.
+    let said = first_line(
+        ask(
+            &home,
+            &certs,
+            "bob",
+            &target,
+            "sink urn:layer:talk:say",
+            Some(&message("validated in the host")),
+        ),
+        "bob says",
+    );
+    assert!(said.starts_with("urn:layer:talk:entry:"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// With NO `layers/` directory the door is the door it always was: no layer, no banner line, the same surface, and the same manifold as a door whose config home differs
 /// only by `layers/` — minus exactly the layer families.
 #[test]
 fn without_a_layers_directory_serve_is_unchanged() {
@@ -684,8 +748,12 @@ fn without_a_layers_directory_serve_is_unchanged() {
     assert!(
         added.contains(&&"layer-talk-say".to_string())
             && added.contains(&&"layer-tasks-tuples".to_string())
-            && added.contains(&&"shacl-validate".to_string()),
-        "hosting layers adds the layers and their validator: {added:?}"
+            && added.contains(&&"layers-me".to_string()),
+        "hosting layers adds the layers: {added:?}"
+    );
+    assert!(
+        !with.iter().any(|id| id.starts_with("shacl-")),
+        "and no validator (ledger #1295): {with:?}"
     );
     for id in &added {
         assert!(

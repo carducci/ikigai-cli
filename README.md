@@ -333,14 +333,17 @@ ikigai serve quic://0.0.0.0:4434 --name layers
   **A door that hosts layers refuses to start without a `clients.json`**, `--cap` or not: it
   would otherwise fall to the per-client-workspace posture, where no participant has a grant
   and every trusted certificate gets a private filesystem instead.
-- **Admission** composes `urn:shacl:validate`, bound beside the layers, on a kernel with a
-  clock. The door runs one validation through itself before it serves, and **refuses to
-  start** if that fails: a layer without its validator would admit nothing.
+- **Admission** is the layer host's own call (ikigai-layers 0.2.1+): it validates every write
+  against the layer's closed shapes itself, and a layer whose shapes cannot be compiled stops
+  the door at start. So the door binds the layer space alone, on a kernel with a clock, and
+  offers no participant a `urn:shacl:validate` (an endpoint that declares no capability).
+  `urn:layers:me` answers each participant who the door says it is.
 - **The state** (entries, tuples, receipts, feeds) lives in, first match wins:
   `--layers-state <dir>` on `serve`; `layers.state = "<dir>"` in `config.toml`
   (instance-scoped as `<name>.layers.state`; relative to the config home, `~/` to `$HOME`);
   else `~/.ikigai/layers/<name>` under the data home. No environment variable names it. One
-  door per state directory: a layer's feed is kept gapless by a lock inside that process.
+  door per state directory: the host holds `<state>/host.lock` while it lives, and a second
+  door over the same directory is refused with the holder's pid.
 - The banner names each hosted layer and its model, where the state is and which of the three
   channels chose it, and the surface gains `+ layers`. `--layers-state` on a door that hosts
   no layer (no `layers/`, or not a QUIC door) is refused rather than ignored.
