@@ -762,15 +762,8 @@ fn take_dir_flag(
         if value.is_empty() || value.starts_with('-') {
             return Err(format!("{flag} needs <dir>, and was given `{value}`"));
         }
-        let typed = match (value.strip_prefix("~/"), home) {
-            (Some(rest), Some(home)) => home.join(rest),
-            (Some(_), None) => {
-                return Err(format!(
-                    "{flag} `{value}` starts with `~/` and HOME is not set"
-                ))
-            }
-            (None, _) => std::path::PathBuf::from(&value),
-        };
+        // The workspace's one `~` rule, shared with every config-home key that names a path.
+        let typed = ikigai_resolve::expand_home(&value, home).map_err(|e| format!("{flag} {e}"))?;
         let absolute: std::path::PathBuf = if typed.is_absolute() {
             typed
         } else {
@@ -2152,13 +2145,21 @@ fn mounts_from_config_lines(
                 .next()
                 .ok_or_else(|| format!("mount `{line}`: expected <prefix>=<target>"))?;
             let (prefix, target) = mount_spec(&format!("mount `{line}`"), spec)?;
+            // A socket path and a certificate directory both take the workspace's one `~`
+            // rule (ledger #1379); a `quic://` or `peer:` target never begins with `~`, so it
+            // passes through unchanged.
+            let expand = |value: &str| {
+                ikigai_resolve::expand_home_str(value, Some(home))
+                    .map_err(|e| format!("mount `{line}`: {e}"))
+            };
+            let target = expand(target)?;
             let mut certs = Certs::default();
             if let Some(dir) = parts.next() {
-                certs.cert_dir = Some(shellexpand_home(dir, home));
+                certs.cert_dir = Some(expand(dir)?);
             }
             Ok(Mount {
                 prefix: prefix.to_string(),
-                target: target.to_string(),
+                target,
                 certs,
                 kind,
             })
@@ -2166,22 +2167,13 @@ fn mounts_from_config_lines(
         .collect()
 }
 
-/// `~/x` → `<home>/x`. A config file is hand-written, and `~` is what a person types.
-///
-/// The home is a parameter, not a `$HOME` read: the environment is process-global, and a
-/// test elsewhere in this binary redirects `HOME` to a scratch dir under its own lock. A
-/// helper that read it here would race that test — and did (`tilde_spelling_matches_the_
-/// expanded_socket` failed once on a branch that touched neither). [`home_dir`] is the one
-/// place the read happens.
-fn shellexpand_home(path: &str, home: &std::path::Path) -> String {
-    match path.strip_prefix("~/") {
-        Some(rest) => home.join(rest).display().to_string(),
-        None => path.to_string(),
-    }
-}
-
-/// `$HOME`, read once at the top of a call chain and passed down. An unset `HOME` expands
-/// `~/x` to a relative `x`, as it always has.
+/// `$HOME`, read once at the top of a call chain and passed down: the environment is
+/// process-global, and a test elsewhere in this binary redirects `HOME` to a scratch dir
+/// under its own lock, so a helper that read it deeper down would race that test (and did:
+/// `tilde_spelling_matches_the_expanded_socket` failed once on a branch that touched
+/// neither). An unset `HOME` is the EMPTY path, which [`ikigai_resolve::expand_home`] treats
+/// as no home: a leading `~` is then refused by name rather than expanded to a relative path,
+/// as it was before ledger #1379.
 #[cfg(feature = "embedded")]
 fn home_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
@@ -3922,8 +3914,11 @@ fn is_own_socket(target: &str, socket: &std::path::Path, home: &std::path::Path)
         return false;
     }
     let absolute = |p: std::path::PathBuf| std::path::absolute(&p).unwrap_or(p);
-    absolute(std::path::PathBuf::from(shellexpand_home(target, home)))
-        == absolute(socket.to_path_buf())
+    // A target the rule refuses (`~bob/x.sock`) is compared as written: it names no socket
+    // of this process either way.
+    let target = ikigai_resolve::expand_home(target, Some(home))
+        .unwrap_or_else(|_| std::path::PathBuf::from(target));
+    absolute(target) == absolute(socket.to_path_buf())
 }
 
 /// What `sockaddr_un`'s `sun_path` holds on this platform: 104 bytes on
@@ -4797,6 +4792,88 @@ mod mount_cert_tests {
         );
     }
 
+    /// ledger #1379: a config-home `mount` line's SOCKET takes the `~` its cert directory
+    /// always did, in every mode. It was dialed as the literal path `~/x.sock`.
+    #[test]
+    fn a_config_mount_lines_socket_expands_a_leading_tilde() {
+        for mode in ["alias", "mount", "override", "prefer"] {
+            let mounts = mounts_from_config_lines(
+                vec![format!("{mode} urn:x:=~/.ikigai/gonk.sock ~/certs")],
+                std::path::Path::new("/home/b"),
+            )
+            .expect("the line parses");
+            assert_eq!(mounts[0].target, "/home/b/.ikigai/gonk.sock", "{mode}");
+            assert_eq!(mounts[0].certs.cert_dir.as_deref(), Some("/home/b/certs"));
+        }
+        // A target that is not a path is never touched.
+        for target in ["quic://bug.local:4433", "peer:plasma", "/abs/x.sock"] {
+            let mounts = mounts_from_config_lines(
+                vec![format!("prefer urn:x:={target}")],
+                std::path::Path::new("/home/b"),
+            )
+            .expect("the line parses");
+            assert_eq!(mounts[0].target, target);
+        }
+    }
+
+    /// …and a `~` the rule cannot expand stops the start, naming the line, rather than
+    /// dialing (or opening) a path nobody meant. An unset `HOME` reaches the parser as the
+    /// empty path ([`home_dir`]).
+    #[test]
+    fn a_config_mount_lines_unexpandable_tilde_is_refused_by_line() {
+        let refused = |line: &str, home: &str| match mounts_from_config_lines(
+            vec![line.to_string()],
+            std::path::Path::new(home),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("`{line}` with home `{home}` should be refused"),
+        };
+        let err = refused("prefer urn:x:=~bob/x.sock", "/home/b");
+        assert!(err.contains("mount `prefer urn:x:=~bob/x.sock`"), "{err}");
+        assert!(err.contains("another user's home"), "{err}");
+        let err = refused("prefer urn:x:=~/x.sock", "");
+        assert!(err.contains("HOME is not set"), "{err}");
+        let err = refused("alias urn:x:=quic://bug.local:4433 ~/certs", "");
+        assert!(
+            err.contains("`~/certs`") && err.contains("HOME is not set"),
+            "{err}"
+        );
+    }
+
+    /// The end to end case the ledger item reported: a `~` socket in a config line DIALS the
+    /// expanded path. The home is a scratch directory, never `$HOME`.
+    #[test]
+    fn a_config_mount_lines_tilde_socket_dials_the_peer() {
+        use ikigai_core::{builtins, EndpointSpace, Exact, Kernel};
+        let home = std::env::temp_dir();
+        let name = format!("ikigai-tilde-{}.sock", std::process::id());
+        let path = home.join(&name);
+        let _ = std::fs::remove_file(&path);
+        let kernel = Kernel::new(std::sync::Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
+        ));
+        let served = path.clone();
+        std::thread::spawn(move || {
+            let _ = ikigai_ipc::serve(kernel, &served);
+        });
+        // Wait until the socket is CONNECTABLE, not merely present (see the test below).
+        for _ in 0..250 {
+            if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let mut mounts = mounts_from_config_lines(vec![format!("alias urn:test:=~/{name}")], &home)
+            .expect("the line parses");
+        let spec = resolve_one_mount(mounts.remove(0)).expect("the expanded socket dials");
+        let entries = spec.resolver.entries().expect("the peer lists its catalog");
+        assert!(
+            entries.iter().any(|e| e.endpoint == "toUpper"),
+            "the mount reached the peer at the expanded path: {entries:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The other half of prefer-mount catalog citizenship: `entries()` dials a
     /// peer that has never been used, so `list` shows a prefer-mounted
     /// namespace WITHOUT a prior resolution through it. (Before this, the
@@ -5239,6 +5316,21 @@ mod config_home_flag_tests {
             take(&["--config-home", "/work/here/cfg", "--config-home=cfg"]).0,
             Ok(Some(PathBuf::from("/work/here/cfg")))
         );
+    }
+
+    /// ledger #1379: the directory flags take the workspace's one `~` rule, the one every
+    /// config-home path key takes: a bare `~` is the home, another user's `~name` and a `~`
+    /// with no home are refused by name rather than resolved against the working directory.
+    #[test]
+    fn the_directory_flags_take_the_shared_tilde_rule() {
+        let (found, _) = take(&["--config-home", "~"]);
+        assert_eq!(found, Ok(Some(PathBuf::from("/home/b"))));
+        let err = take(&["--config-home", "~bob/cfg"]).0.unwrap_err();
+        assert!(err.starts_with("--config-home "), "{err}");
+        assert!(err.contains("another user's home"), "{err}");
+        let mut args = vec!["--files".to_string(), "~/ws".to_string()];
+        let err = take_files(&mut args, Some(Path::new("/work/here")), None).unwrap_err();
+        assert!(err.contains("HOME is not set"), "{err}");
     }
 
     fn take_files_from(args: &[&str]) -> (Result<Option<PathBuf>, String>, Vec<String>) {
