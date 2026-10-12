@@ -379,6 +379,16 @@ gives its own mounts two thirds of it, so when a client asks a host about a peer
 gone silent, the host's deadline fires first and the answer names the peer, rather than the
 client's deadline blaming the host.
 
+**Call deadlines** (ikigai-cli 0.1.55+). Every other call to a mounted or `--connect`ed peer
+runs under `call.timeout` (seconds, `0` for none), start to finish. Unset, it is the
+transport's own silence bound (`quic.timeout`, or the socket's five minutes), so nothing that
+used to succeed is cut; what it ends is a peer that accepts a call and never answers it while
+keeping the connection alive, or trickles its reply a byte at a time. On expiry the call is
+canceled on the wire (QUIC: the stream is stopped; a socket: the connection is dropped) and
+the answer is a `timeout` naming the peer. As with describe, a process that serves a door
+gives its own mounts two thirds of a configured value. An embedding host passes its own,
+per mount (`with_call_timeout`) or per call (`issue_as_within`).
+
 **MCP for a mounted peer.** `ikigai mcp` takes the same mount flags, and `--show <pattern>`
 (repeatable) narrows the tool LIST to what matches: a tool name, or, with a `:`, an IRI prefix
 the tool is bound under. `ikigai mcp --scope … --override urn:layer:,urn:layers:,urn:collab:=…

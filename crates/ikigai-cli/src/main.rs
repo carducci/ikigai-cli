@@ -2452,6 +2452,44 @@ fn inner_describe_deadline(outer: std::time::Duration) -> std::time::Duration {
     outer * 2 / 3
 }
 
+/// The deadline a mounted peer's every OTHER call runs under, start to finish:
+/// `call.timeout` (seconds) in the host config. `None` when the key is absent, which leaves
+/// each transport's own default (its standing silence bound: `quic.timeout` for QUIC, the
+/// socket timeout for IPC); `Some(None)` for `0`, which takes the bound off.
+///
+/// ★ Why it exists (ledger #1335): a peer that accepts a call and never answers it held the
+/// caller until the connection's idle timeout, or for ever if the peer kept the connection
+/// alive; an IPC peer trickling its reply was bounded by nothing. On expiry the transport
+/// cancels the call on the wire and answers a typed `Timeout` naming the peer.
+///
+/// One key for both transports, for `describe.timeout`'s reason. Config home, not an
+/// environment variable.
+///
+/// ★ **A process that SERVES a door gives its own mounts two thirds of a CONFIGURED value**
+/// ([`inner_describe_deadline`]'s ratio and reason, ledger #1288): with `call.timeout` read
+/// by host and client from one config home, the host's deadline fires first and its answer
+/// names the silent peer, rather than the client's blaming the host. The UNSET default is
+/// not shortened: there, every hop keeps the patience it always had, because an honest long
+/// resolution (a 70B model's first token) is silent for its whole length and two thirds of
+/// it would cut calls that used to succeed.
+#[cfg(feature = "embedded")]
+fn call_timeout() -> Option<Option<std::time::Duration>> {
+    let outer = match ikigai_embedded::config::get("call.timeout")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(0) => return Some(None),
+        Some(secs) => std::time::Duration::from_secs(secs),
+        None => return None,
+    };
+    Some(Some(
+        if SERVES_A_DOOR.load(std::sync::atomic::Ordering::SeqCst) {
+            inner_describe_deadline(outer)
+        } else {
+            outer
+        },
+    ))
+}
+
 /// The QUIC idle timeout: `quic.timeout` (seconds) in the host config, else the
 /// generous default. Like `ipc.timeout` (#259), what this bounds is SILENCE — and for
 /// a long resolution the silence is the work.
@@ -2497,9 +2535,12 @@ fn connect_mount_quic(
     let addr = quic::parse_addr(target)?;
     let identity = quic::client_identity(certs)?;
     let trusted = quic::trusted_server_cert(certs)?;
-    let resolver = ikigai_quic::connect_with(addr, &identity, &trusted, quic_idle_timeout())
+    let mut resolver = ikigai_quic::connect_with(addr, &identity, &trusted, quic_idle_timeout())
         .map_err(|e| format!("{flag}: connect {target}: {e}"))?
         .with_describe_timeout(describe_timeout(ikigai_quic::DEFAULT_DESCRIBE_TIMEOUT));
+    if let Some(bound) = call_timeout() {
+        resolver = resolver.with_call_timeout(bound);
+    }
     Ok(std::sync::Arc::new(resolver))
 }
 
@@ -2528,9 +2569,12 @@ fn connect_mount_ipc(
         ikigai_embedded::MountKind::Alias => ikigai_ipc::HelloMode::Alias,
         _ => ikigai_ipc::HelloMode::Verbatim,
     };
-    let resolver = ikigai_ipc::connect_as(std::path::Path::new(socket), mode)
+    let mut resolver = ikigai_ipc::connect_as(std::path::Path::new(socket), mode)
         .map_err(|e| format!("{flag}: connect {socket}: {e}"))?
         .with_describe_timeout(describe_timeout(ikigai_ipc::DEFAULT_DESCRIBE_TIMEOUT));
+    if let Some(bound) = call_timeout() {
+        resolver = resolver.with_call_timeout(bound);
+    }
     Ok(std::sync::Arc::new(resolver))
 }
 
@@ -3338,9 +3382,12 @@ fn connect_quic(target: &str, certs: &Certs) -> Result<Engine, String> {
     let addr = quic::parse_addr(target)?;
     let identity = quic::client_identity(certs)?;
     let trusted = quic::trusted_server_cert(certs)?;
-    let resolver = ikigai_quic::connect_with(addr, &identity, &trusted, quic_idle_timeout())
+    let mut resolver = ikigai_quic::connect_with(addr, &identity, &trusted, quic_idle_timeout())
         .map_err(|e| format!("connect {target}: {e}"))?
         .with_describe_timeout(describe_timeout(ikigai_quic::DEFAULT_DESCRIBE_TIMEOUT));
+    if let Some(bound) = call_timeout() {
+        resolver = resolver.with_call_timeout(bound);
+    }
     Ok(with_profiles(Engine::new(resolver)))
 }
 
@@ -3467,9 +3514,12 @@ fn connect_ipc(path: Option<String>) -> Result<Engine, String> {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .map(std::time::Duration::from_secs)
         .unwrap_or(ikigai_ipc::DEFAULT_TIMEOUT);
-    let resolver = ikigai_ipc::connect_with_timeout(&socket, Some(timeout))
+    let mut resolver = ikigai_ipc::connect_with_timeout(&socket, Some(timeout))
         .map_err(|e| format!("connect {}: {e}", socket.display()))?
         .with_describe_timeout(describe_timeout(ikigai_ipc::DEFAULT_DESCRIBE_TIMEOUT));
+    if let Some(bound) = call_timeout() {
+        resolver = resolver.with_call_timeout(bound);
+    }
     Ok(with_profiles(Engine::new(resolver)))
 }
 

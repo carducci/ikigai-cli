@@ -147,6 +147,7 @@ pub fn connect_with(
         path: path.to_path_buf(),
         timeout,
         describe_timeout: Some(DEFAULT_DESCRIBE_TIMEOUT),
+        call_timeout: timeout,
         mode,
         stream: Mutex::new(Some(stream)),
         tracer: Mutex::new(None),
@@ -262,6 +263,9 @@ pub struct IpcResolver {
     /// The shorter deadline a SELF-DESCRIPTION call runs under (see
     /// [`DEFAULT_DESCRIBE_TIMEOUT`]); `None` means describe like everything else.
     describe_timeout: Option<Duration>,
+    /// The deadline every other call runs under, start to finish (see
+    /// [`IpcResolver::with_call_timeout`]); `None` leaves only the standing I/O timeout.
+    call_timeout: Option<Duration>,
     /// The hello mode every (re)dial declares — a redialed alias mount must
     /// re-present itself as one.
     mode: HelloMode,
@@ -311,46 +315,182 @@ fn is_describe(call: &Call) -> bool {
     }
 }
 
-/// Installs a read deadline on a stream for the life of the guard and restores the
-/// connection's standing one on drop — so a describe's short bound cannot leak onto the
-/// next resolution, which shares the connection.
+/// A deadline over a WHOLE exchange: every read, every write and any redial of one call
+/// (ledger [#1335](http://localhost:1060/l/default/item/1335)).
 ///
-/// Restoring on DROP rather than after the exchange is deliberate: the exchange returns
-/// early on every error path, and a bound left installed by an error would silently
-/// shorten every later call on that connection.
-struct ReadDeadline<'a> {
+/// ★ Why a socket timeout alone was not one. `SO_RCVTIMEO` bounds ONE read, so it bounds
+/// silence and nothing else: a peer that trickles its reply a byte at a time, each inside the
+/// timeout, held the caller for as long as it liked (a 100 KB frame at a byte per 300 ms is
+/// eight hours). Here each read and write is armed with the smaller of the connection's
+/// standing timeout and the time LEFT, so the sum is bounded too.
+struct Deadline {
+    /// When the exchange must be over.
+    until: std::time::Instant,
+    /// The bound it was given, for the error.
+    bound: Duration,
+    /// Whether the call was a self-description, for the error's wording.
+    describing: bool,
+    /// Whether the last arming was cut short by THIS deadline rather than the standing
+    /// timeout, so a timeout that fires a hair early still reads as this deadline's miss.
+    capped: std::cell::Cell<bool>,
+}
+
+/// Elapsed time, for the deadline. Native-only: this crate is `#![cfg(unix)]`, so it is
+/// never built for `wasm32-unknown-unknown`, where `Instant::now` panics.
+#[allow(clippy::disallowed_methods)]
+fn now() -> std::time::Instant {
+    std::time::Instant::now()
+}
+
+impl Deadline {
+    fn new(bound: Duration, describing: bool) -> Self {
+        Deadline {
+            until: now() + bound,
+            bound,
+            describing,
+            capped: std::cell::Cell::new(false),
+        }
+    }
+
+    /// The timeout the next blocking operation runs under: the smaller of `standing` and the
+    /// time left. A deadline already passed is a `TimedOut` here, before any syscall.
+    fn arm(&self, standing: Option<Duration>) -> io::Result<Duration> {
+        let left = self.until.saturating_duration_since(now());
+        if left.is_zero() {
+            self.capped.set(true);
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        let capped = standing.is_none_or(|standing| left < standing);
+        self.capped.set(capped);
+        Ok(if capped {
+            left
+        } else {
+            standing.unwrap_or(left)
+        })
+    }
+
+    /// Whether `error` is THIS deadline's miss (and not the standing timeout's).
+    fn missed_by(&self, error: &io::Error) -> bool {
+        missed_a_deadline(error) && (self.capped.get() || now() >= self.until)
+    }
+
+    /// The error a miss surfaces as: a `TimedOut` carrying [`Missed`], which [`wire_error`]
+    /// turns into a [`Timeout`](Error::Timeout) naming the peer and the bound.
+    fn missed(&self, peer: &Path) -> io::Error {
+        // `Debug` keeps the unit (`300ms`, `30s`); `as_secs()` reports `300ms` as `0s`.
+        let (peer, bound) = (peer.display(), self.bound);
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            Missed(if self.describing {
+                format!("the peer at {peer} did not describe itself within {bound:?}")
+            } else {
+                format!(
+                    "the peer at {peer} did not answer within {bound:?}; the call was canceled \
+                     (its connection is dropped)"
+                )
+            }),
+        )
+    }
+}
+
+/// The payload of a missed [`Deadline`], so [`wire_error`] can tell it from the standing
+/// timeout's anonymous one.
+#[derive(Debug)]
+struct Missed(String);
+
+impl std::fmt::Display for Missed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Missed {}
+
+/// One exchange's view of a stream: each read and write armed by the [`Deadline`] if there
+/// is one, and the stream's standing timeouts put back on drop, so a deadline's arming
+/// cannot leak onto the next call, which shares the connection. Restoring on DROP is
+/// deliberate: the exchange returns early on every error path.
+struct Bounded<'a> {
     stream: &'a UnixStream,
-    restore: Option<Duration>,
+    standing: Option<Duration>,
+    deadline: Option<&'a Deadline>,
 }
 
-impl<'a> ReadDeadline<'a> {
-    /// Apply `deadline` to `stream`, remembering `restore` for the drop. Returns `None`
-    /// (installing nothing) when there is no deadline to apply, so the ordinary path pays
-    /// no syscall at all.
-    fn apply(
-        stream: &'a UnixStream,
-        deadline: Option<Duration>,
-        restore: Option<Duration>,
-    ) -> Option<Self> {
-        let deadline = deadline?;
-        stream.set_read_timeout(Some(deadline)).ok()?;
-        Some(ReadDeadline { stream, restore })
+impl Bounded<'_> {
+    /// Arm the next read with what is left of the deadline.
+    ///
+    /// ⚠ A failed `setsockopt` is IGNORED, not returned: macOS answers it with `EINVAL` on a
+    /// socket whose peer has already closed, and returning that would hide the death the
+    /// read itself is about to report (`UnexpectedEof`, `BrokenPipe`), which is what decides
+    /// the redial and the replay. The read then runs under the previous arming, and a dead
+    /// socket answers at once.
+    fn arm_read(&self) -> io::Result<()> {
+        if let Some(deadline) = self.deadline {
+            let _ = self
+                .stream
+                .set_read_timeout(Some(deadline.arm(self.standing)?));
+        }
+        Ok(())
+    }
+
+    /// Arm the next write with what is left of the deadline (see [`Bounded::arm_read`]).
+    fn arm_write(&self) -> io::Result<()> {
+        if let Some(deadline) = self.deadline {
+            let _ = self
+                .stream
+                .set_write_timeout(Some(deadline.arm(self.standing)?));
+        }
+        Ok(())
     }
 }
 
-impl Drop for ReadDeadline<'_> {
+impl io::Read for Bounded<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.arm_read()?;
+        let mut stream = self.stream;
+        stream.read(buf)
+    }
+}
+
+impl io::Write for Bounded<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.arm_write()?;
+        let mut stream = self.stream;
+        stream.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let mut stream = self.stream;
+        stream.flush()
+    }
+}
+
+impl Drop for Bounded<'_> {
     fn drop(&mut self) {
-        let _ = self.stream.set_read_timeout(self.restore);
+        if self.deadline.is_some() {
+            let _ = self.stream.set_read_timeout(self.standing);
+            let _ = self.stream.set_write_timeout(self.standing);
+        }
     }
 }
 
-/// One request/reply exchange on an established stream.
-fn exchange(mut stream: &UnixStream, call: &Call) -> Result<Reply, ExchangeFailed> {
-    write_message(&mut stream, call).map_err(|error| ExchangeFailed {
+/// One request/reply exchange on an established stream, under `deadline` if there is one.
+fn exchange(
+    stream: &UnixStream,
+    call: &Call,
+    standing: Option<Duration>,
+    deadline: Option<&Deadline>,
+) -> Result<Reply, ExchangeFailed> {
+    let mut io = Bounded {
+        stream,
+        standing,
+        deadline,
+    };
+    write_message(&mut io, call).map_err(|error| ExchangeFailed {
         phase: Phase::Write,
         error,
     })?;
-    read_message(&mut stream).map_err(|error| ExchangeFailed {
+    read_message(&mut io).map_err(|error| ExchangeFailed {
         phase: Phase::Read,
         error,
     })
@@ -452,6 +592,118 @@ impl IpcResolver {
         self
     }
 
+    /// Set the deadline every call that is NOT a self-description runs under, from the first
+    /// byte written to the last byte read, a redial and replay included (builder). `None`
+    /// leaves only the standing I/O timeout, which bounds each read and write alone. A plain
+    /// [`connect_with`] starts it at that same standing timeout.
+    ///
+    /// ★ Why this exists (ledger [#1335](http://localhost:1060/l/default/item/1335)): the
+    /// standing timeout bounds SILENCE, one read at a time, so a peer that accepted a call and
+    /// then trickled its reply held the caller for as long as it liked, and a caller could not
+    /// ask for less than the connection's patience for one call. On expiry the connection is
+    /// DROPPED, which is how a request is canceled on a socket with no stream of its own
+    /// (the peer's write of the abandoned reply fails), the next call redials, and the caller
+    /// gets a typed [`Timeout`](Error::Timeout) naming the peer and the deadline. No thread
+    /// is involved: the bound is armed on the socket for each read and write.
+    ///
+    /// ★ **Why the default is the standing timeout** ([`DEFAULT_TIMEOUT`], `ipc.timeout`).
+    /// The server writes nothing until a resolution finishes, so against an honest peer the
+    /// silence before a reply already WAS the whole call, and that was already bounded by the
+    /// standing timeout. Starting the deadline there removes the unbounded case and changes
+    /// nothing that used to succeed; an operator who raised `ipc.timeout` for long model
+    /// calls keeps them. A caller that knows its calls are short sets a short one here, or
+    /// per call with [`issue_as_within`](Self::issue_as_within).
+    pub fn with_call_timeout(mut self, call_timeout: Option<Duration>) -> Self {
+        self.call_timeout = call_timeout;
+        self
+    }
+
+    /// The per-call deadline ([`with_call_timeout`](Self::with_call_timeout)).
+    pub fn call_timeout(&self) -> Option<Duration> {
+        self.call_timeout
+    }
+
+    /// [`Resolver::issue_as`], under `deadline` for THIS call instead of the resolver's
+    /// standing one ([`with_call_timeout`](Self::with_call_timeout), or the describe deadline
+    /// for a `Meta` request). What a host with its own idea of how long one call may take
+    /// passes, without a resolver per deadline.
+    ///
+    /// # Errors
+    ///
+    /// As [`Resolver::issue_as`]; a missed deadline is [`Error::Timeout`], naming the peer
+    /// and the deadline.
+    pub fn issue_as_within(
+        &self,
+        request: Request,
+        capability: &Capability,
+        deadline: Duration,
+    ) -> Result<(Representation, CacheStatus), Error> {
+        self.issue_as_under(request, capability, Some(deadline))
+    }
+
+    /// [`Resolver::issue_as`] under `explicit` if given, else the standing deadline.
+    fn issue_as_under(
+        &self,
+        request: Request,
+        capability: &Capability,
+        explicit: Option<Duration>,
+    ) -> Result<(Representation, CacheStatus), Error> {
+        // When a tracer is installed (the `trace` command), ask the server to record
+        // the resolution and ship its spans back, then forward them to the tracer —
+        // so the tree shows the *remote* kernel's execution. `parent_span` is None:
+        // the whole session runs remotely, so the remote root is the trace root.
+        let tracer = self.tracer.lock().expect("tracer lock").clone();
+        let call = if tracer.is_some() {
+            Call::IssueTraced(
+                request,
+                capability.clone(),
+                TraceContext {
+                    trace_id: 1,
+                    parent_span: None,
+                },
+            )
+        } else {
+            Call::IssueAs(request, capability.clone())
+        };
+        match self.round_trip_within(call, explicit).map_err(wire_error)? {
+            Reply::Resolved(representation, status) => Ok((representation, status)),
+            Reply::ResolvedTraced(representation, status, events) => {
+                if let Some(tracer) = &tracer {
+                    for event in events {
+                        tracer.record(event);
+                    }
+                }
+                Ok((representation, status))
+            }
+            // v7: the taxonomy crosses intact — a remote Denied IS a Denied here.
+            Reply::ErrorTyped(wire_error) => Err(wire_error.into()),
+            // The flat string form is still decodable though a v7 server never sends it.
+            Reply::Error(message) => Err(Error::Endpoint(
+                message
+                    .strip_prefix("endpoint error: ")
+                    .map(str::to_string)
+                    .unwrap_or(message),
+            )),
+            other => Err(Error::Endpoint(format!(
+                "unexpected reply to IssueAs: {other:?}"
+            ))),
+        }
+    }
+
+    /// Dial afresh (the full handshake) inside `deadline`, then put the connection's standing
+    /// timeouts back: a hello cut short by the deadline must not shorten later calls.
+    fn redial(&self, deadline: Option<&Deadline>) -> io::Result<UnixStream> {
+        let Some(deadline) = deadline else {
+            return handshake(&self.path, self.timeout, self.mode);
+        };
+        let stream = handshake(&self.path, Some(deadline.arm(self.timeout)?), self.mode)?;
+        // Ignored for the reason in `Bounded::arm_read`: a peer that hung up right after the
+        // hello makes these fail, and the exchange is about to say so properly.
+        let _ = stream.set_read_timeout(self.timeout);
+        let _ = stream.set_write_timeout(self.timeout);
+        Ok(stream)
+    }
+
     /// Send a call and read its reply, healing a dead connection on use.
     ///
     /// A broken established connection is dropped and redialed (full
@@ -461,22 +713,42 @@ impl IpcResolver {
     /// the NEXT call redials, and this one surfaces its error (a typed transient
     /// via [`wire_error`]) for the caller to retry.
     fn round_trip(&self, call: Call) -> io::Result<Reply> {
+        self.round_trip_within(call, None)
+    }
+
+    /// [`round_trip`](Self::round_trip) under `explicit` if given, else the deadline its kind
+    /// of call runs under: the describe deadline for a self-description, the call deadline
+    /// otherwise. A miss of THAT deadline is reported as one ([`Deadline::missed`]), naming
+    /// the peer; the standing timeout's own miss keeps its anonymous form.
+    fn round_trip_within(&self, call: Call, explicit: Option<Duration>) -> io::Result<Reply> {
+        let describing = is_describe(&call);
+        let deadline = explicit
+            .or(if describing {
+                self.describe_timeout
+            } else {
+                self.call_timeout
+            })
+            .map(|bound| Deadline::new(bound, describing));
+        self.round_trip_under(&call, deadline.as_ref())
+            .map_err(|error| match &deadline {
+                Some(deadline) if deadline.missed_by(&error) => deadline.missed(&self.path),
+                _ => error,
+            })
+    }
+
+    fn round_trip_under(&self, call: &Call, deadline: Option<&Deadline>) -> io::Result<Reply> {
         let mut guard = self.stream.lock().expect("ipc stream lock");
         let dialed_this_call = guard.is_none();
         if guard.is_none() {
             // A previous call found the connection dead: heal on use.
-            *guard = Some(handshake(&self.path, self.timeout, self.mode)?);
+            *guard = Some(self.redial(deadline)?);
         }
-        // A self-description runs under the SHORT deadline; everything else keeps the
-        // connection's standing one. The guard restores it however this call leaves, and
-        // is scoped so the stream borrow ends before the dead-connection path clears it.
-        let deadline = is_describe(&call)
-            .then_some(self.describe_timeout)
-            .flatten();
+        // The deadline arms every read and write of this exchange; the connection's standing
+        // timeouts come back however the exchange leaves (`Bounded`'s drop). Scoped so the
+        // stream borrow ends before the dead-connection path clears it.
         let failed = {
             let stream = guard.as_ref().expect("stream just ensured");
-            let _bound = ReadDeadline::apply(stream, deadline, self.timeout);
-            match exchange(stream, &call) {
+            match exchange(stream, call, self.timeout, deadline) {
                 Ok(reply) => return Ok(reply),
                 Err(failed) => failed,
             }
@@ -507,16 +779,13 @@ impl IpcResolver {
         // The established connection is dead. Drop it FIRST, unconditionally,
         // so the next call redials even when this one must not replay.
         *guard = None;
-        if dialed_this_call || !replay_may_follow(&failed.phase, &call) {
+        if dialed_this_call || !replay_may_follow(&failed.phase, call) {
             return Err(failed.error);
         }
-        // One redial + one replay; a second failure surfaces as-is. The replay is bounded
-        // exactly as the first attempt was — a redial must not quietly restore patience.
-        let fresh = handshake(&self.path, self.timeout, self.mode)?;
-        let second_attempt = {
-            let _bound = ReadDeadline::apply(&fresh, deadline, self.timeout);
-            exchange(&fresh, &call)
-        };
+        // One redial + one replay; a second failure surfaces as-is. Both run inside what is
+        // LEFT of the same deadline: a redial must not quietly restore patience.
+        let fresh = self.redial(deadline)?;
+        let second_attempt = exchange(&fresh, call, self.timeout, deadline);
         match second_attempt {
             Ok(reply) => {
                 *guard = Some(fresh);
@@ -544,6 +813,10 @@ impl IpcResolver {
 /// ("failed to fill whole buffer") would hide the one retryable failure a
 /// non-replayable Sink needs its caller to see.
 fn wire_error(e: io::Error) -> Error {
+    // A missed per-call or describe deadline names the peer and the bound it missed.
+    if let Some(missed) = e.get_ref().and_then(|inner| inner.downcast_ref::<Missed>()) {
+        return Error::Timeout(missed.0.clone());
+    }
     match e.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => Error::Timeout(
             "no response from the kernel server (it may be hung or gone)".to_string(),
@@ -588,46 +861,7 @@ impl Resolver for IpcResolver {
         request: Request,
         capability: &Capability,
     ) -> Result<(Representation, CacheStatus), Error> {
-        // When a tracer is installed (the `trace` command), ask the server to record
-        // the resolution and ship its spans back, then forward them to the tracer —
-        // so the tree shows the *remote* kernel's execution. `parent_span` is None:
-        // the whole session runs remotely, so the remote root is the trace root.
-        let tracer = self.tracer.lock().expect("tracer lock").clone();
-        let call = if tracer.is_some() {
-            Call::IssueTraced(
-                request,
-                capability.clone(),
-                TraceContext {
-                    trace_id: 1,
-                    parent_span: None,
-                },
-            )
-        } else {
-            Call::IssueAs(request, capability.clone())
-        };
-        match self.round_trip(call).map_err(wire_error)? {
-            Reply::Resolved(representation, status) => Ok((representation, status)),
-            Reply::ResolvedTraced(representation, status, events) => {
-                if let Some(tracer) = &tracer {
-                    for event in events {
-                        tracer.record(event);
-                    }
-                }
-                Ok((representation, status))
-            }
-            // v7: the taxonomy crosses intact — a remote Denied IS a Denied here.
-            Reply::ErrorTyped(wire_error) => Err(wire_error.into()),
-            // The flat string form is still decodable though a v7 server never sends it.
-            Reply::Error(message) => Err(Error::Endpoint(
-                message
-                    .strip_prefix("endpoint error: ")
-                    .map(str::to_string)
-                    .unwrap_or(message),
-            )),
-            other => Err(Error::Endpoint(format!(
-                "unexpected reply to IssueAs: {other:?}"
-            ))),
-        }
+        self.issue_as_under(request, capability, None)
     }
 
     fn set_tracer(&self, tracer: Arc<dyn Tracer>) {
@@ -2433,5 +2667,245 @@ mod tests {
             server.join().unwrap();
             let _ = std::fs::remove_file(&path);
         }
+    }
+}
+
+/// ledger #1335: a peer that ACCEPTS a call and never answers it (or answers a byte at a
+/// time) must cost the caller its deadline and no more, and the call must be canceled.
+#[cfg(test)]
+mod call_deadline {
+    use super::*;
+    use ikigai_core::{Iri, Verb};
+    use std::io::{Read as _, Write as _};
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    /// Far above every deadline under test: a test that passes proves the CALL deadline
+    /// fired, not the connection's standing timeout.
+    const STANDING: Duration = Duration::from_secs(30);
+
+    fn socket(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("ik-cd-{}-{name}.sock", std::process::id()))
+    }
+
+    /// How a scratch peer behaves once it has read a call.
+    #[derive(Clone, Copy)]
+    enum Peer {
+        /// Says nothing at all.
+        Silent,
+        /// Starts a 100 KB reply and sends one byte of it every `0`: each inside any
+        /// standing timeout, the whole never.
+        Trickle(Duration),
+        /// Answers `slow` after `0`.
+        Slow(Duration),
+    }
+
+    /// A peer that accepts any number of connections, says hello, and treats each call as
+    /// `behavior` says. When a client hangs up on a call it never finished answering, the
+    /// peer reports it: that is the call canceled.
+    fn peer(path: &Path, behavior: Peer) -> mpsc::Receiver<()> {
+        let _ = std::fs::remove_file(path);
+        let listener = UnixListener::bind(path).unwrap();
+        let (hung_up, canceled) = mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok((stream, _)) = listener.accept() {
+                let hung_up = hung_up.clone();
+                std::thread::spawn(move || {
+                    let mut s = &stream;
+                    let _ = read_frame(&mut s); // the client's hello
+                    let _ = write_hello(
+                        &mut s,
+                        &Hello {
+                            version: PROTOCOL_VERSION,
+                            mode: HelloMode::Verbatim,
+                        },
+                    );
+                    while read_frame(&mut s).is_ok() {
+                        match behavior {
+                            Peer::Silent => {
+                                // Wait for the client to give up: its hang-up ends the read.
+                                let mut rest = Vec::new();
+                                let _ = s.read_to_end(&mut rest);
+                                let _ = hung_up.send(());
+                                return;
+                            }
+                            Peer::Trickle(every) => {
+                                let _ = s.write_all(&100_000u32.to_be_bytes());
+                                loop {
+                                    std::thread::sleep(every);
+                                    if s.write_all(&[0]).is_err() {
+                                        let _ = hung_up.send(());
+                                        return;
+                                    }
+                                }
+                            }
+                            Peer::Slow(delay) => {
+                                std::thread::sleep(delay);
+                                let reply = Reply::Resolved(
+                                    Representation::new(
+                                        ikigai_core::ReprType::new("text/plain"),
+                                        "slow",
+                                    ),
+                                    CacheStatus::Uncacheable,
+                                );
+                                if write_message(&mut s, &reply).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        canceled
+    }
+
+    fn source() -> Request {
+        Request::new(Verb::Source, Iri::parse("urn:test:slow").unwrap())
+    }
+
+    /// The call returns on the CALLER's thread within the deadline: no thread is spawned
+    /// for it, so none can be left behind.
+    #[test]
+    // Unix-only, never wasm; elapsed time is the measurement.
+    #[allow(clippy::disallowed_methods)]
+    fn a_peer_that_never_answers_costs_the_call_deadline_and_the_call_is_canceled() {
+        let path = socket("silent");
+        let canceled = peer(&path, Peer::Silent);
+        let client = connect_with_timeout(&path, Some(STANDING))
+            .unwrap()
+            .with_call_timeout(Some(Duration::from_millis(300)));
+
+        let start = Instant::now();
+        let error = client
+            .issue(source())
+            .expect_err("a peer that never answers is an ERROR, not a wait");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(300) && elapsed < Duration::from_secs(2),
+            "bounded by the call deadline, not the {STANDING:?} standing timeout: {elapsed:?}"
+        );
+        assert!(matches!(error, Error::Timeout(_)), "{error:?}");
+        assert!(error.is_transient(), "{error:?}");
+        let said = error.to_string();
+        assert!(
+            said.contains(&path.display().to_string()) && said.contains("within 300ms"),
+            "the deadline names the peer and the bound: {said}"
+        );
+        // Canceled: the connection the call rode is dropped, and the peer sees the hang-up.
+        assert_eq!(canceled.recv_timeout(Duration::from_secs(5)), Ok(()));
+        assert!(
+            client.stream.lock().unwrap().is_none(),
+            "the spent connection is not kept"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The case a socket timeout alone never bounded: every byte arrives inside the
+    /// standing timeout, so before the deadline this call ran for as long as the peer liked.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn a_peer_that_trickles_its_reply_is_bounded_by_the_whole_call() {
+        let path = socket("trickle");
+        let canceled = peer(&path, Peer::Trickle(Duration::from_millis(50)));
+        let client = connect_with_timeout(&path, Some(Duration::from_secs(1)))
+            .unwrap()
+            .with_call_timeout(Some(Duration::from_millis(600)));
+
+        let start = Instant::now();
+        let error = client
+            .issue(source())
+            .expect_err("a reply that never completes is an ERROR");
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(error.to_string().contains("within 600ms"), "{error}");
+        assert_eq!(canceled.recv_timeout(Duration::from_secs(5)), Ok(()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A deadline passed for ONE call, on a resolver with no standing call deadline.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn a_deadline_passed_for_one_call_bounds_that_call() {
+        let path = socket("percall");
+        let _canceled = peer(&path, Peer::Silent);
+        let client = connect_with_timeout(&path, Some(STANDING))
+            .unwrap()
+            .with_call_timeout(None);
+        assert_eq!(client.call_timeout(), None);
+
+        let start = Instant::now();
+        let error = client
+            .issue_as_within(source(), &Capability::root(), Duration::from_millis(300))
+            .expect_err("bounded by the deadline this call was given");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(error.to_string().contains("within 300ms"), "{error}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The bound costs an honest peer nothing, and leaves no trace on the connection: a
+    /// call answered inside its deadline is answered, and the connection's standing timeouts
+    /// are back afterwards, so the next call is not cut short by what is left of this one.
+    #[test]
+    fn a_slow_peer_that_answers_inside_the_deadline_still_succeeds() {
+        let path = socket("slow");
+        let _canceled = peer(&path, Peer::Slow(Duration::from_millis(200)));
+        let client = connect_with_timeout(&path, Some(STANDING))
+            .unwrap()
+            .with_call_timeout(Some(Duration::from_secs(5)));
+        for _ in 0..2 {
+            let (answer, _) = client
+                .issue(source())
+                .expect("answered inside the deadline");
+            assert_eq!(answer.bytes, b"slow");
+        }
+        let (answer, _) = client
+            .issue_as_within(source(), &Capability::root(), Duration::from_secs(5))
+            .expect("and per call");
+        assert_eq!(answer.bytes, b"slow");
+        let guard = client.stream.lock().unwrap();
+        let stream = guard.as_ref().expect("the connection is kept");
+        assert_eq!(stream.read_timeout().unwrap(), Some(STANDING));
+        assert_eq!(stream.write_timeout().unwrap(), Some(STANDING));
+        drop(guard);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A self-description that misses ITS deadline says so, naming the peer.
+    #[test]
+    fn a_missed_describe_deadline_names_the_peer() {
+        let path = socket("describe");
+        let _canceled = peer(&path, Peer::Silent);
+        let client = connect_with_timeout(&path, Some(STANDING))
+            .unwrap()
+            .with_describe_timeout(Some(Duration::from_millis(200)));
+        let error = Resolver::try_entries(&client).expect_err("a silent peer");
+        assert!(matches!(error, Error::Timeout(_)), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("did not describe itself within 200ms")
+                && error.to_string().contains(&path.display().to_string()),
+            "{error}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The default follows the standing timeout, so an operator who raised `ipc.timeout`
+    /// for long calls keeps them.
+    #[test]
+    fn the_default_call_deadline_is_the_standing_timeout() {
+        let path = socket("default");
+        let _canceled = peer(&path, Peer::Silent);
+        let client = connect_with_timeout(&path, Some(STANDING)).unwrap();
+        assert_eq!(client.call_timeout(), Some(STANDING));
+        let _ = std::fs::remove_file(&path);
     }
 }

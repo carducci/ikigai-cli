@@ -116,6 +116,16 @@ members = ["crates/*"]
 #   is a Parse error rather than the end of the session. `ikigai_mcp::server::{handle_line,
 #   serve_io}` are new; ⚠ Behavior: `server::handle` now answers what it used to drop, and a
 #   message without `"jsonrpc":"2.0"` is refused where it used to be served.
+# - A MOUNTED PEER THAT NEVER ANSWERS COSTS A DEADLINE (PR #470, ledger #1335). `QuicResolver` and
+#   `IpcResolver` run every non-describe call under a per-call deadline, start to finish:
+#   `with_call_timeout` per resolver, `issue_as_within` per call, `ikigai_quic::CANCELED` (all
+#   new, additive). On expiry the call is canceled (QUIC: STOP_SENDING/RESET_STREAM; IPC: the
+#   connection dropped) and the answer is a `Timeout` naming the peer. Before, a QUIC peer that kept
+#   its connection alive held the caller for ever, and an IPC peer trickling its reply was
+#   unbounded. ⚠ Behavior: the default is the transport's standing silence bound (the idle
+#   timeout, the socket timeout), now over the WHOLE call; `call.timeout` in the config home
+#   overrides (a serving host's mounts take two thirds of it). IPC's describe deadline likewise
+#   bounds the whole exchange, and both name the peer.
 #
 # 0.1.54 was A REQUEST-DERIVED FILE NAME IS ONE ENTRY ON EVERY PLATFORM.
 # ⚠ Stacked on 0.1.53, which was merged and preflighted READY but NOT on crates.io: publishing

@@ -263,6 +263,12 @@ pub const DEFAULT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// at any hop).
 pub const DEFAULT_DESCRIBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The QUIC application error code a client sends when it gives up on a call: `STOP_SENDING`
+/// on the reply half, and `RESET_STREAM` on the request half if that was still being written.
+/// Ordinary QUIC frames, so a peer of any version understands them: canceling is not a wire
+/// change (ledger [#1335](http://localhost:1060/l/default/item/1335)).
+pub const CANCELED: u32 = 0x1335;
+
 pub fn serve(
     kernel: Kernel,
     addr: SocketAddr,
@@ -747,6 +753,9 @@ pub fn connect(
 }
 
 /// [`connect`] with an explicit idle timeout (see [`DEFAULT_IDLE_TIMEOUT`]).
+///
+/// The resolver's per-call deadline ([`QuicResolver::with_call_timeout`]) starts at the same
+/// value as `idle`: see that method for why.
 pub fn connect_with(
     addr: SocketAddr,
     identity: &Identity,
@@ -782,6 +791,7 @@ pub fn connect_with(
         }),
         tracer: Mutex::new(None),
         describe_timeout: Some(DEFAULT_DESCRIBE_TIMEOUT),
+        call_timeout: Some(idle),
     })
 }
 
@@ -850,6 +860,9 @@ pub struct QuicResolver {
     /// The deadline a SELF-DESCRIPTION call runs under (see [`DEFAULT_DESCRIBE_TIMEOUT`]);
     /// `None` leaves it on the connection's idle timeout like everything else.
     describe_timeout: Option<std::time::Duration>,
+    /// The deadline every OTHER call runs under, start to finish (see
+    /// [`with_call_timeout`](Self::with_call_timeout)); `None` leaves it unbounded.
+    call_timeout: Option<std::time::Duration>,
 }
 
 /// Everything a round trip touches, shared with the spawned task.
@@ -914,13 +927,26 @@ impl Wire {
         let connection = { self.connection().clone() };
         // The peer runs a call only once it reads the stream to its end, so until
         // `finish` succeeds nothing can have run: a failure here is `Unsent`.
-        let (mut send, mut recv) = connection.open_bi().await.map_err(Attempt::unsent)?;
-        send.write_all(request).await.map_err(Attempt::unsent)?;
-        send.finish().map_err(Attempt::unsent)?;
-        let bytes = recv
+        let (send, recv) = connection.open_bi().await.map_err(Attempt::unsent)?;
+        let mut stream = InFlight {
+            send,
+            recv,
+            sent: false,
+            answered: false,
+        };
+        stream
+            .send
+            .write_all(request)
+            .await
+            .map_err(Attempt::unsent)?;
+        stream.send.finish().map_err(Attempt::unsent)?;
+        stream.sent = true;
+        let bytes = stream
+            .recv
             .read_to_end(MAX_MESSAGE)
             .await
             .map_err(|e| Attempt::Sent(other(e)))?;
+        stream.answered = true;
         decode(&bytes).map_err(Attempt::Sent)
     }
 
@@ -963,6 +989,39 @@ impl Attempt {
     }
 }
 
+/// One call's stream, CANCELED on the wire if it is dropped before its reply was read.
+///
+/// ★ This is how a deadline ends a call rather than merely stops waiting for it (ledger
+/// [#1335](http://localhost:1060/l/default/item/1335)). A deadline drops the round trip's
+/// future, and with it this value: the reply half is STOPPED (the peer's write of a reply
+/// nobody will read fails at once instead of filling a buffer), and a request half still
+/// being written is RESET. quinn's own `Drop` would do the first, but would FINISH a
+/// half-written request, handing the peer a truncated call to decode: canceling says so
+/// explicitly, under [`CANCELED`]. Both frames are plain QUIC, so no peer needs to know a
+/// deadline exists.
+struct InFlight {
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    /// The request was written whole and finished, so there is nothing to reset.
+    sent: bool,
+    /// The reply was read to its end, so there is nothing to stop.
+    answered: bool,
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if self.answered {
+            return;
+        }
+        let code = quinn::VarInt::from_u32(CANCELED);
+        if !self.sent {
+            // `ClosedStream` means it is already finished or reset: nothing left to cancel.
+            let _ = self.send.reset(code);
+        }
+        let _ = self.recv.stop(code);
+    }
+}
+
 /// Whether `call` may be sent again after a failure that may have reached the peer: the
 /// enumeration, the cache probe, and the read verbs. A Sink or Delete may not — the same
 /// line `ikigai_ipc` draws in its `replay_may_follow`.
@@ -1001,6 +1060,57 @@ impl QuicResolver {
         self
     }
 
+    /// Set the deadline every call that is NOT a self-description runs under, from the first
+    /// byte to the last, the reconnect-and-retry included (builder). `None` takes the bound
+    /// off. [`connect_with`] starts it at the connection's idle timeout.
+    ///
+    /// ★ Why this exists (ledger [#1335](http://localhost:1060/l/default/item/1335)): before
+    /// it, a resolution's only ceiling was the idle timeout, and the idle timer restarts on
+    /// ANY packet. A peer that accepts the call and never answers it, but keeps its QUIC stack
+    /// talking (a keep-alive does it), held the caller for ever; one that went silent cost
+    /// twice the idle timeout, because a read is replayed once on a fresh connection. On
+    /// expiry the call's stream is canceled on the wire ([`CANCELED`]: the reply half
+    /// stopped, a half-written request reset), the connection is marked stale so the next
+    /// call redials rather than queueing behind the abandoned one, and the caller gets a
+    /// typed [`Timeout`](Error::Timeout) naming the peer and the deadline. Nothing is left
+    /// running: the round trip is a future on this resolver's runtime, and the deadline drops
+    /// it.
+    ///
+    /// ★ **Why the default is the idle timeout.** The server says nothing until a resolution
+    /// finishes and nothing pings (no keep-alive is configured), so a silent resolution could not
+    /// outlive the idle timeout against an honest peer. Starting the deadline there removes
+    /// the unbounded cases and changes nothing that used to succeed; and an operator who
+    /// raised `quic.timeout` for long model calls keeps them, because the deadline follows.
+    /// A caller that knows its calls are short (a mirror pass over a layer host) sets a short
+    /// one here, or per call with [`issue_as_within`](Self::issue_as_within).
+    pub fn with_call_timeout(mut self, call_timeout: Option<std::time::Duration>) -> Self {
+        self.call_timeout = call_timeout;
+        self
+    }
+
+    /// The per-call deadline ([`with_call_timeout`](Self::with_call_timeout)).
+    pub fn call_timeout(&self) -> Option<std::time::Duration> {
+        self.call_timeout
+    }
+
+    /// [`Resolver::issue_as`], under `deadline` for THIS call instead of the resolver's
+    /// standing one ([`with_call_timeout`](Self::with_call_timeout), or the describe deadline
+    /// for a `Meta` request). What a host with its own idea of how long one call may take
+    /// passes, without a resolver per deadline.
+    ///
+    /// # Errors
+    ///
+    /// As [`Resolver::issue_as`]; a missed deadline is [`Error::Timeout`], naming the peer
+    /// and the deadline.
+    pub fn issue_as_within(
+        &self,
+        request: Request,
+        capability: &Capability,
+        deadline: std::time::Duration,
+    ) -> Result<(Representation, CacheStatus), Error> {
+        self.issue_as_under(request, capability, Some(deadline))
+    }
+
     /// The resolver's runtime. See [`runtime`](Self::runtime) for why it is an `Option`.
     fn runtime(&self) -> &Runtime {
         self.runtime
@@ -1009,14 +1119,27 @@ impl QuicResolver {
     }
 
     fn round_trip(&self, call: Call) -> io::Result<Reply> {
+        self.round_trip_within(call, None)
+    }
+
+    /// One round trip under `explicit` if given, else the deadline its kind of call runs
+    /// under: the describe deadline for a self-description, the call deadline otherwise.
+    fn round_trip_within(
+        &self,
+        call: Call,
+        explicit: Option<std::time::Duration>,
+    ) -> io::Result<Reply> {
         let request = encode(&call)?;
         let wire = Arc::clone(&self.wire);
-        // A self-description is bounded; a resolution is not (the idle timeout is its
-        // only ceiling, and for a long resolution the silence IS the work). `deadline`
-        // is computed here, outside the future, because `call` does not cross the spawn.
-        let deadline = is_describe(&call)
-            .then_some(self.describe_timeout)
-            .flatten();
+        // A self-description runs under the short describe deadline, a resolution under the
+        // patient call deadline (for a long resolution the silence IS the work). Both are
+        // computed here, outside the future, because `call` does not cross the spawn.
+        let describing = is_describe(&call);
+        let deadline = explicit.or(if describing {
+            self.describe_timeout
+        } else {
+            self.call_timeout
+        });
         let replayable = replay_may_follow(&call);
         // Named in a deadline's error: a host relaying it to its own caller must say WHICH
         // peer was silent, or the message reads as being about the host (ledger #1288).
@@ -1032,23 +1155,76 @@ impl QuicResolver {
                     {
                         Ok(reply) => reply,
                         Err(_) => {
-                            // The connection answered nothing for a whole describe deadline:
-                            // the next call redials rather than trusting it (ledger #1092).
+                            // Dropping the round trip canceled its stream (`InFlight`). The
+                            // connection answered nothing for a whole deadline: the next call
+                            // redials rather than trusting it (ledger #1092), and so does not
+                            // queue behind the abandoned call on a door that serves one
+                            // connection's calls in order.
                             wire.stale.store(true, std::sync::atomic::Ordering::SeqCst);
-                            Err(io::Error::new(
-                                io::ErrorKind::TimedOut,
-                                // `Debug` keeps the unit (`300ms`, `30s`); `as_secs()` would
-                                // report a sub-second bound as `0s`.
+                            // `Debug` keeps the unit (`300ms`, `30s`); `as_secs()` would
+                            // report a sub-second bound as `0s`.
+                            let message = if describing {
                                 format!(
                                     "the peer at quic://{addr} did not describe itself within \
                                      {deadline:?}"
-                                ),
-                            ))
+                                )
+                            } else {
+                                format!(
+                                    "the peer at quic://{addr} did not answer within \
+                                     {deadline:?}; the call was canceled"
+                                )
+                            };
+                            Err(io::Error::new(io::ErrorKind::TimedOut, message))
                         }
                     }
                 }
             }
         })?
+    }
+
+    /// [`Resolver::issue_as`] under `explicit` if given, else the standing deadline.
+    fn issue_as_under(
+        &self,
+        request: Request,
+        capability: &Capability,
+        explicit: Option<std::time::Duration>,
+    ) -> Result<(Representation, CacheStatus), Error> {
+        let tracer = self.tracer().clone();
+        let call = if tracer.is_some() {
+            Call::IssueTraced(
+                request,
+                capability.clone(),
+                TraceContext {
+                    trace_id: 1,
+                    parent_span: None,
+                },
+            )
+        } else {
+            Call::IssueAs(request, capability.clone())
+        };
+        match self.round_trip_within(call, explicit).map_err(quic_error)? {
+            Reply::Resolved(representation, status) => Ok((representation, status)),
+            Reply::ResolvedTraced(representation, status, events) => {
+                if let Some(tracer) = &tracer {
+                    for event in events {
+                        tracer.record(event);
+                    }
+                }
+                Ok((representation, status))
+            }
+            // The server already rendered its error to a string; don't re-prefix an
+            // already-"endpoint error: …" message into a doubled one across the wire.
+            Reply::ErrorTyped(wire_error) => Err(wire_error.into()),
+            Reply::Error(message) => Err(Error::Endpoint(
+                message
+                    .strip_prefix("endpoint error: ")
+                    .map(str::to_string)
+                    .unwrap_or(message),
+            )),
+            other => Err(Error::Endpoint(format!(
+                "unexpected reply to IssueAs: {other:?}"
+            ))),
+        }
     }
 
     /// The tracer lock, taken through the poison — same reasoning as
@@ -1140,42 +1316,7 @@ impl Resolver for QuicResolver {
         request: Request,
         capability: &Capability,
     ) -> Result<(Representation, CacheStatus), Error> {
-        let tracer = self.tracer().clone();
-        let call = if tracer.is_some() {
-            Call::IssueTraced(
-                request,
-                capability.clone(),
-                TraceContext {
-                    trace_id: 1,
-                    parent_span: None,
-                },
-            )
-        } else {
-            Call::IssueAs(request, capability.clone())
-        };
-        match self.round_trip(call).map_err(quic_error)? {
-            Reply::Resolved(representation, status) => Ok((representation, status)),
-            Reply::ResolvedTraced(representation, status, events) => {
-                if let Some(tracer) = &tracer {
-                    for event in events {
-                        tracer.record(event);
-                    }
-                }
-                Ok((representation, status))
-            }
-            // The server already rendered its error to a string; don't re-prefix an
-            // already-"endpoint error: …" message into a doubled one across the wire.
-            Reply::ErrorTyped(wire_error) => Err(wire_error.into()),
-            Reply::Error(message) => Err(Error::Endpoint(
-                message
-                    .strip_prefix("endpoint error: ")
-                    .map(str::to_string)
-                    .unwrap_or(message),
-            )),
-            other => Err(Error::Endpoint(format!(
-                "unexpected reply to IssueAs: {other:?}"
-            ))),
-        }
+        self.issue_as_under(request, capability, None)
     }
 
     fn set_tracer(&self, tracer: Arc<dyn Tracer>) {
@@ -3102,5 +3243,271 @@ mod restart {
             elapsed < std::time::Duration::from_secs(2),
             "redialled, not another deadline: {elapsed:?}"
         );
+    }
+}
+
+/// ledger #1335: a peer that ACCEPTS a call and never answers it must cost the caller its
+/// deadline and no more, cancel the call on the wire, and leave nothing running.
+#[cfg(test)]
+mod call_deadline {
+    use super::*;
+    use ikigai_core::{EndpointSpace, Exact, FnEndpoint, Invocation, ReprType, Verb};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// Far above every deadline under test, on both sides: a test that passes proves the
+    /// CALL deadline fired, not the connection's.
+    const IDLE: Duration = Duration::from_secs(60);
+
+    /// A hostile peer: it accepts every connection and every call, reads the call whole, and
+    /// never answers, while its QUIC stack PINGS so the connection never idles out. That is
+    /// the case no idle timeout can end. Each call's stream reports what the client did to
+    /// it: the application code of the `STOP_SENDING` that canceled it.
+    fn hostile_peer() -> (SocketAddr, Identity, String, mpsc::Receiver<Option<u64>>) {
+        let server_id = generate();
+        let client_id = generate();
+        let mut config =
+            server_config(&server_id, std::slice::from_ref(&client_id.cert_pem), IDLE).unwrap();
+        let mut keep_alive = transport(IDLE).unwrap();
+        keep_alive.keep_alive_interval(Some(Duration::from_millis(100)));
+        config.transport_config(Arc::new(keep_alive));
+        let rt = Runtime::new().unwrap();
+        let endpoint = rt
+            .block_on(async { quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()) })
+            .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let (stops, stopped) = mpsc::channel();
+        std::thread::spawn(move || {
+            rt.block_on(async move {
+                while let Some(incoming) = endpoint.accept().await {
+                    let Ok(connection) = incoming.await else {
+                        continue;
+                    };
+                    let stops = stops.clone();
+                    tokio::spawn(async move {
+                        while let Ok((send, mut recv)) = connection.accept_bi().await {
+                            let stops = stops.clone();
+                            tokio::spawn(async move {
+                                let _ = recv.read_to_end(MAX_MESSAGE).await;
+                                let code = send.stopped().await.ok().flatten();
+                                let _ = stops.send(code.map(|c| c.into_inner()));
+                            });
+                        }
+                    });
+                }
+            });
+        });
+        (addr, client_id, server_id.cert_pem, stopped)
+    }
+
+    /// A peer that answers `urn:test:slow` after `delay`, served on its own runtime.
+    fn slow_peer(delay: Duration) -> (SocketAddr, Identity, String) {
+        let server_id = generate();
+        let client_id = generate();
+        let config =
+            server_config(&server_id, std::slice::from_ref(&client_id.cert_pem), IDLE).unwrap();
+        let rt = Runtime::new().unwrap();
+        let endpoint = rt
+            .block_on(async { quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()) })
+            .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let slow = FnEndpoint::new("slow", move |_: &Invocation<'_>| {
+            std::thread::sleep(delay);
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"slow".to_vec(),
+            ))
+        });
+        let kernel = Arc::new(Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:slow"), slow),
+        )));
+        std::thread::spawn(move || {
+            rt.block_on(async move {
+                while let Some(incoming) = endpoint.accept().await {
+                    let kernel = Arc::clone(&kernel);
+                    tokio::spawn(async move {
+                        if let Ok(connection) = incoming.await {
+                            let session = Session {
+                                capability: Capability::root(),
+                                file_segment: String::new(),
+                                principal: None,
+                            };
+                            serve_connection(&kernel, connection, &session).await;
+                        }
+                    });
+                }
+            });
+        });
+        (addr, client_id, server_id.cert_pem)
+    }
+
+    fn source(iri: &str) -> Request {
+        Request::new(Verb::Source, Iri::parse(iri).unwrap())
+    }
+
+    /// Tasks alive on the resolver's own runtime: its endpoint and connection drivers, plus
+    /// any round trip still running.
+    fn alive(client: &QuicResolver) -> usize {
+        client.runtime().metrics().num_alive_tasks()
+    }
+
+    /// Wait (boundedly) for the resolver's runtime to settle back to `baseline` tasks: a
+    /// finished task is reaped asynchronously, so one look straight after the call can race.
+    // Native-only (QUIC is not built for wasm): a bounded wait in wall-clock time.
+    #[allow(clippy::disallowed_methods)]
+    fn settles_to(client: &QuicResolver, baseline: usize) -> bool {
+        let until = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < until {
+            if alive(client) <= baseline {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    // Native-only (QUIC is not built for wasm), and elapsed time is the measurement: it is
+    // the only way to tell a bound that fired from a hang that was lucky.
+    #[allow(clippy::disallowed_methods)]
+    fn a_peer_that_never_answers_costs_the_call_deadline_and_the_call_is_canceled() {
+        let (addr, client_id, server_pem, stopped) = hostile_peer();
+        let deadline = Duration::from_millis(500);
+        let client = connect_with(addr, &client_id, &server_pem, IDLE)
+            .unwrap()
+            .with_call_timeout(Some(deadline));
+        let baseline = alive(&client);
+
+        let start = Instant::now();
+        let error = client
+            .issue(source("urn:test:anything"))
+            .expect_err("a peer that never answers is an ERROR, not a wait");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= deadline && elapsed < deadline + Duration::from_secs(2),
+            "bounded by the call deadline, not the {IDLE:?} idle timeout: {elapsed:?}"
+        );
+        assert!(matches!(error, Error::Timeout(_)), "{error:?}");
+        assert!(error.is_transient(), "{error:?}");
+        let said = error.to_string();
+        assert!(
+            said.contains(&format!("quic://{addr}")) && said.contains("within 500ms"),
+            "the deadline names the peer and the bound: {said}"
+        );
+        // ★ Canceled ON THE WIRE, not merely abandoned: the peer's stream was stopped with
+        // this transport's code, so its reply (were it ever written) fails at once.
+        assert_eq!(
+            stopped.recv_timeout(Duration::from_secs(5)),
+            Ok(Some(u64::from(CANCELED))),
+            "the peer saw the call canceled"
+        );
+        // And nothing is left running on the resolver's runtime.
+        assert!(
+            settles_to(&client, baseline),
+            "a round trip outlived its deadline: {} tasks alive, {baseline} before",
+            alive(&client)
+        );
+
+        // The next call is bounded the same way (it redials the stale connection first,
+        // and does not spend two deadlines).
+        let start = Instant::now();
+        let again = client.issue(source("urn:test:anything"));
+        assert!(matches!(again, Err(Error::Timeout(_))), "{again:?}");
+        assert!(
+            start.elapsed() < deadline + Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    /// The same peer, a resolver with NO standing call deadline, and a deadline passed for
+    /// one call: what a host that knows how long ITS calls should take uses.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn a_deadline_passed_for_one_call_bounds_that_call() {
+        let (addr, client_id, server_pem, stopped) = hostile_peer();
+        let client = connect_with(addr, &client_id, &server_pem, IDLE)
+            .unwrap()
+            .with_call_timeout(None);
+        assert_eq!(client.call_timeout(), None);
+
+        let start = Instant::now();
+        let error = client
+            .issue_as_within(
+                source("urn:test:anything"),
+                &Capability::root(),
+                Duration::from_millis(300),
+            )
+            .expect_err("bounded by the deadline this call was given");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(matches!(error, Error::Timeout(_)), "{error:?}");
+        assert!(error.to_string().contains("within 300ms"), "{error}");
+        assert_eq!(
+            stopped.recv_timeout(Duration::from_secs(5)),
+            Ok(Some(u64::from(CANCELED)))
+        );
+    }
+
+    /// From inside a caller's runtime the round trip runs as a task on the resolver's own
+    /// runtime (`drive`), which is the path where a missed deadline could leak a task.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn a_missed_deadline_from_inside_a_runtime_leaves_no_task_behind() {
+        let (addr, client_id, server_pem, _stopped) = hostile_peer();
+        let client = Arc::new(
+            connect_with(addr, &client_id, &server_pem, IDLE)
+                .unwrap()
+                .with_call_timeout(Some(Duration::from_millis(300))),
+        );
+        let baseline = alive(&client);
+        let caller = Runtime::new().unwrap();
+        let inside = Arc::clone(&client);
+        let error = caller
+            .block_on(async move { inside.issue(source("urn:test:anything")) })
+            .expect_err("bounded from a runtime thread too");
+        assert!(matches!(error, Error::Timeout(_)), "{error:?}");
+        assert!(
+            settles_to(&client, baseline),
+            "the spawned round trip outlived its deadline: {} tasks alive, {baseline} before",
+            alive(&client)
+        );
+    }
+
+    /// The bound costs an honest peer nothing: a call answered inside its deadline is a
+    /// call answered, on the same resolver, and the next one too.
+    #[test]
+    fn a_slow_peer_that_answers_inside_the_deadline_still_succeeds() {
+        let (addr, client_id, server_pem) = slow_peer(Duration::from_millis(300));
+        let client = connect_with(addr, &client_id, &server_pem, IDLE)
+            .unwrap()
+            .with_call_timeout(Some(Duration::from_secs(5)));
+        for _ in 0..2 {
+            let (answer, _) = client
+                .issue(source("urn:test:slow"))
+                .expect("answered inside the deadline");
+            assert_eq!(answer.bytes, b"slow");
+        }
+        let (answer, _) = client
+            .issue_as_within(
+                source("urn:test:slow"),
+                &Capability::root(),
+                Duration::from_secs(5),
+            )
+            .expect("and per call");
+        assert_eq!(answer.bytes, b"slow");
+    }
+
+    /// The default follows the connection's idle timeout, so an operator who raised
+    /// `quic.timeout` for long calls keeps them.
+    #[test]
+    fn the_default_call_deadline_is_the_idle_timeout() {
+        let (addr, client_id, server_pem) = slow_peer(Duration::ZERO);
+        let client = connect_with(addr, &client_id, &server_pem, IDLE).unwrap();
+        assert_eq!(client.call_timeout(), Some(IDLE));
     }
 }
