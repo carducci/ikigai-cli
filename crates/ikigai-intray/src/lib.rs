@@ -22,7 +22,9 @@
 //! The one part of SPARQL a template may NOT use is `SERVICE`: a match is a question about a
 //! tuple's own graph and never leaves the host (see `parse_match`). And a template is bounded
 //! like every other door that parses caller SPARQL: refused over 1 MiB or nested past 64
-//! levels, and parsed and evaluated on a stack sized for its text (see `with_template`).
+//! levels or past the store's algebra bounds, and parsed and evaluated on a stack sized for
+//! its text within a TIME budget, the caller answered with a `Timeout` at it (see
+//! `with_template`).
 //!
 //! The space is *physical and inspectable* — tuples are files under a jailed root, moving
 //! through an **inbox → outbox → error** state machine. The [`SpaceReactor`] makes a space
@@ -39,11 +41,12 @@ use ikigai_core::{
     ActionSpec, ArgRef, Capability, Description, Endpoint, EndpointSpace, Error, Invocation, Iri,
     ReprType, Representation, Request, Result, UriTemplate, Verb,
 };
+use ikigai_store::budget::{check_query, EvaluationBudget};
 use ikigai_store::limits;
 use ikigai_store::service::{self, refuse_service_with};
 use notify::{RecursiveMode, Watcher};
 use oxigraph::io::{RdfFormat, RdfParser};
-use oxigraph::sparql::QueryResults;
+use oxigraph::sparql::{CancellationToken, QueryResults};
 use oxigraph::store::Store;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -89,11 +92,28 @@ pub const PROCESSING_DIR: &str = ".processing";
 const LEASE_FILE: &str = ".reactor.lock";
 
 /// Mount the tuplespace at `urn:space:{name}`, backed by a directory under `root`
-/// (`<root>/<name>/inbox/`). A host links this into its kernel.
+/// (`<root>/<name>/inbox/`). A host links this into its kernel. Every `match=` runs within
+/// [`EvaluationBudget::default`] (the store's 5 s base, 120 s ceiling); see
+/// [`space_with_budget`] to set another.
 pub fn space(root: PathBuf) -> EndpointSpace {
+    space_with_budget(root, EvaluationBudget::default())
+}
+
+/// [`space`], with every `match=` evaluation run within `budget` (ledger #1327).
+///
+/// The budget a request gets is chosen as `ikigai-store`'s doors choose theirs: the budget's
+/// base, raised by a `urn:cap:store:budget:<ms>` grant the caller's capability holds, the
+/// ceiling for root. Past it the caller is answered with a typed `Timeout`; an evaluation that
+/// cannot be stopped at once is counted, and while [`TimeBudget::max_overdue`] are still
+/// running a new `match=` is refused at once as `Unavailable`. Every space this mount serves
+/// shares the one budget (and so the one overdue count): that is what caps the cores a reader
+/// can pin, so pass the SAME budget (or a clone) to every mount over one host.
+///
+/// [`TimeBudget::max_overdue`]: ikigai_store::budget::TimeBudget::max_overdue
+pub fn space_with_budget(root: PathBuf, budget: EvaluationBudget) -> EndpointSpace {
     EndpointSpace::new().bind(
         UriTemplate::parse(SPACE_TEMPLATE).expect("SPACE_TEMPLATE is a valid template"),
-        SpaceEndpoint::new(root),
+        SpaceEndpoint::new(root).with_evaluation_budget(budget),
     )
 }
 
@@ -112,11 +132,24 @@ fn is_tuple_id(id: &str) -> bool {
 /// a `<blake3>.tuple` file in it.
 pub struct SpaceEndpoint {
     root: PathBuf,
+    /// The time budget every `match=` runs within, shared by every space under this root (and
+    /// by every clone of it), so its overdue cap bounds the whole mount (ledger #1327).
+    budget: EvaluationBudget,
 }
 
 impl SpaceEndpoint {
+    /// A tuplespace under `root`, its `match=` evaluations within [`EvaluationBudget::default`].
     pub fn new(root: PathBuf) -> Self {
-        SpaceEndpoint { root }
+        SpaceEndpoint {
+            root,
+            budget: EvaluationBudget::default(),
+        }
+    }
+
+    /// Run every `match=` within `budget` instead (see [`space_with_budget`]).
+    pub fn with_evaluation_budget(mut self, budget: EvaluationBudget) -> Self {
+        self.budget = budget;
+        self
     }
 
     /// The inbox directory of a named space. The name is a single segment (validated).
@@ -387,7 +420,8 @@ fn take_id<'a>(inv: &'a Invocation<'_>) -> Result<Option<&'a str>> {
 }
 
 /// Bound a `match=` template, then parse it and run `work` with it — every evaluation
-/// included — on a thread whose stack is sized for its text (ledger #963).
+/// included — on a thread whose stack is sized for its text (ledger #963), within a TIME
+/// budget (ledger #1327).
 ///
 /// oxigraph's SPARQL parser and evaluator are RECURSIVE, and running out of stack is not an
 /// error a caller gets back: Rust aborts the whole process. Through cli 0.1.43 a template of
@@ -396,17 +430,50 @@ fn take_id<'a>(inv: &'a Invocation<'_>) -> Result<Option<&'a str>> {
 /// `ikigai-embedded` mounts it unwrapped, so the bound lives HERE, where every host gets it.
 /// The two layers are `ikigai-store`'s, the same ones its own SPARQL doors and `urn:sparql:*`
 /// use: [`limits::check_sparql`] refuses text over 1 MiB or nested deeper than 64 as a typed
-/// `InvalidArgument` on `match` before anything is parsed, and [`limits::on_sparql_stack`]
-/// gives the parse, the `SERVICE` walk and every per-tuple evaluation a stack of 16 MiB plus
-/// 512 bytes per byte of template. ⚠ Like the store's, the second layer is a RELEASE-build
-/// guarantee, and neither bounds TIME (see `ikigai_store::limits`).
-fn with_template<T, F>(query: &str, work: F) -> Result<T>
+/// `InvalidArgument` on `match` before anything is parsed, and the parse, the `SERVICE` walk
+/// and every per-tuple evaluation run on a stack of 16 MiB plus 512 bytes per byte of
+/// template. ⚠ Like the store's, the stack layer is a RELEASE-build guarantee.
+///
+/// ★ **Time** (ledger #1327). Size and nesting do not bound time: a 340-byte ASK of 7
+/// unconstrained triple patterns under one FILTER over all their variables is a cross product
+/// of |tuple|^7 rows, and held a thread for 9 s on ONE 7-triple tuple (debug), about 10x a
+/// pattern, for every pending tuple. So `work` runs inside [`EvaluationBudget::run`], which
+/// replaces `on_sparql_stack` and sizes the same stack:
+///
+/// - the caller is answered at the budget with a typed `Timeout` naming it, never a partial
+///   list, and the async thread it was waiting on is free again;
+/// - `work` gets the evaluation's [`CancellationToken`], hands it to every evaluation
+///   ([`tuple_matches`]) and checks it between tuples, so an abandoned scan stops at the next
+///   tuple and an evaluation at its next dataset access;
+/// - what cannot be stopped (a cross product over rows already in memory) is counted, and a
+///   new match is refused as `Unavailable` while too many are, so readers cannot pin every core;
+/// - and [`parse_match`] applies the store's ALGEBRA bounds ([`check_query`]), so a join wide
+///   enough to make oxigraph's PLANNER the cost (which no token reaches) is refused first.
+///
+/// `work` may outlive this call (an overdue evaluation runs on after its caller is answered),
+/// so it owns what it uses and must not make an EFFECT the caller could be told did not
+/// happen: a take decides which tuple matches in here and claims it outside.
+fn with_template<T, F>(
+    budget: &EvaluationBudget,
+    cap: &Capability,
+    query: &str,
+    work: F,
+) -> Result<T>
 where
-    T: Send,
-    F: FnOnce(&spargebra::Query) -> Result<T> + Send,
+    T: Send + 'static,
+    F: FnOnce(&spargebra::Query, &CancellationToken) -> Result<T> + Send + 'static,
 {
     limits::check_sparql(query, "match")?;
-    limits::on_sparql_stack(query, || work(&parse_match(query)?))
+    let text = query.to_string();
+    budget.run(query, cap, None, move |token| {
+        work(&parse_match(&text)?, token)
+    })
+}
+
+/// What a scan answers when its token fired between two tuples. Its caller was already
+/// answered with the budget's own `Timeout`, so nobody reads this; it only ends the scan.
+fn canceled() -> Error {
+    Error::Timeout("match: canceled at its time budget".to_string())
 }
 
 /// Parse a `match=` argument into the template every tuple is tested against. Call it only
@@ -415,6 +482,9 @@ where
 /// Refused with a typed `InvalidArgument` (on `match`), before any tuple is read:
 /// - a SPARQL syntax error;
 /// - anything but an **ASK** (so a mistaken SELECT fails loudly rather than matching nothing);
+/// - an algebra past the store's bounds ([`check_query`]: too many operands in one join, or
+///   too many nodes in all), whose cost is in oxigraph's planner, before any token is checked
+///   (ledger #1327);
 /// - a **`SERVICE`** clause ANYWHERE in the query (audit round 5, ledger #877).
 ///
 /// ★ Why `SERVICE` is refused rather than merely not evaluated: a match is a question about ONE
@@ -448,6 +518,7 @@ fn parse_match(query: &str) -> Result<spargebra::Query> {
             "an associative match must be an ASK query".to_string(),
         ));
     }
+    check_query(&parsed, "match")?;
     refuse_service_with(&parsed, "match", Some(MATCH_REMEDY))?;
     Ok(parsed)
 }
@@ -458,8 +529,14 @@ const MATCH_REMEDY: &str = "A match is evaluated against one tuple's graph and n
      this host: put the data it needs in the tuple.";
 
 /// Does a tuple's graph satisfy the template (from [`parse_match`])? The tuple is parsed as
-/// Turtle into the default graph; a tuple that isn't valid RDF simply never matches.
-fn tuple_matches(template: &spargebra::Query, bytes: &[u8]) -> Result<bool> {
+/// Turtle into the default graph; a tuple that isn't valid RDF simply never matches. `token`
+/// is the evaluation's, from [`with_template`]: oxigraph stops at its next dataset access once
+/// it fires.
+fn tuple_matches(
+    template: &spargebra::Query,
+    bytes: &[u8],
+    token: &CancellationToken,
+) -> Result<bool> {
     let store = Store::new().map_err(|e| Error::Endpoint(format!("match: store init: {e}")))?;
     if store
         .load_from_slice(RdfParser::from_format(RdfFormat::Turtle), bytes)
@@ -472,6 +549,7 @@ fn tuple_matches(template: &spargebra::Query, bytes: &[u8]) -> Result<bool> {
     // when it is off, so the outcome does not depend on the build's feature set. [`parse_match`]
     // already refuses a template with a `SERVICE`; this is the floor under it.
     match service::evaluator()
+        .with_cancellation_token(token.clone())
         .for_query(template.clone())
         .on_store(&store)
         .execute()
@@ -625,19 +703,30 @@ impl Endpoint for SpaceEndpoint {
                         bytes,
                     ))
                 } else if let Some(query) = opt_str(inv, "match")? {
-                    // Associative rd: the ids of tuples whose graph satisfies the ASK.
-                    let hits = with_template(query, |template| {
-                        let mut hits = Vec::new();
-                        for id in Self::list_ids(&dir) {
-                            if let Ok(bytes) = std::fs::read(dir.join(format!("{id}.tuple"))) {
-                                // A file that is not the tuple its name says never matches.
-                                if hashes_to(&bytes, &id) && tuple_matches(template, &bytes)? {
-                                    hits.push(id);
+                    // Associative rd: the ids of tuples whose graph satisfies the ASK, the
+                    // whole scan within the time budget (ledger #1327).
+                    let hits = with_template(
+                        &self.budget,
+                        inv.capability,
+                        query,
+                        move |template, token| {
+                            let mut hits = Vec::new();
+                            for id in Self::list_ids(&dir) {
+                                if token.is_cancelled() {
+                                    return Err(canceled());
+                                }
+                                if let Ok(bytes) = std::fs::read(dir.join(format!("{id}.tuple"))) {
+                                    // A file that is not the tuple its name says never matches.
+                                    if hashes_to(&bytes, &id)
+                                        && tuple_matches(template, &bytes, token)?
+                                    {
+                                        hits.push(id);
+                                    }
                                 }
                             }
-                        }
-                        Ok(hits)
-                    })?;
+                            Ok(hits)
+                        },
+                    )?;
                     Ok(Representation::new(
                         ReprType::new("text/plain").with_param("charset", "utf-8"),
                         hits.join("\n").into_bytes(),
@@ -676,31 +765,60 @@ impl Endpoint for SpaceEndpoint {
                 // Otherwise take the first tuple matching the template (or any). We scan
                 // deterministically and claim the first that both matches and we win the
                 // race for; a lost claim just moves to the next candidate.
-                let take_first = |matcher: Option<&spargebra::Query>| {
+                let taken = |bytes| {
+                    Ok(Representation::new(
+                        ReprType::new("application/octet-stream"),
+                        bytes,
+                    ))
+                };
+                let Some(query) = opt_str(inv, "match")? else {
                     for id in Self::list_ids(&inbox) {
-                        if let Some(template) = matcher {
-                            match std::fs::read(inbox.join(format!("{id}.tuple"))) {
-                                Ok(bytes) if !tuple_matches(template, &bytes)? => continue,
-                                Ok(_) => {}
-                                Err(_) => continue, // vanished between listing and read
-                            }
-                        }
                         // Lost the race, or a file that is not its tuple (now in `error/`): next.
                         if let Claim::Taken(bytes) = self.claim(name, &id)? {
-                            return Ok(Representation::new(
-                                ReprType::new("application/octet-stream"),
-                                bytes,
-                            ));
+                            return taken(bytes);
                         }
                     }
-                    Err(Error::NotFound(match matcher {
-                        Some(_) => format!("no matching tuple to take in space `{name}`"),
-                        None => format!("space `{name}` is empty"),
-                    }))
+                    return Err(Error::NotFound(format!("space `{name}` is empty")));
                 };
-                match opt_str(inv, "match")? {
-                    Some(query) => with_template(query, |template| take_first(Some(template))),
-                    None => take_first(None),
+                // By template (ledger #1327): WHICH tuple matches is decided within the time
+                // budget, and the claim, an effect, is made here once the budget has answered,
+                // so a take whose caller was told it timed out never consumed a tuple (an
+                // overdue scan runs on, but only reads). A claim lost to a rival resumes the
+                // scan after that tuple under a fresh budget; each loss is a tuple another
+                // taker consumed, so the reruns are bounded by the snapshot.
+                let ids = Arc::new(Self::list_ids(&inbox));
+                let mut from = 0;
+                loop {
+                    let (scan, dir) = (Arc::clone(&ids), inbox.clone());
+                    let found = with_template(
+                        &self.budget,
+                        inv.capability,
+                        query,
+                        move |template, token| {
+                            for (i, id) in scan.iter().enumerate().skip(from) {
+                                if token.is_cancelled() {
+                                    return Err(canceled());
+                                }
+                                // A tuple that vanished between listing and read is no match.
+                                if let Ok(bytes) = std::fs::read(dir.join(format!("{id}.tuple"))) {
+                                    if tuple_matches(template, &bytes, token)? {
+                                        return Ok(Some(i));
+                                    }
+                                }
+                            }
+                            Ok(None)
+                        },
+                    )?;
+                    let Some(i) = found else {
+                        return Err(Error::NotFound(format!(
+                            "no matching tuple to take in space `{name}`"
+                        )));
+                    };
+                    // Lost the race, or a file that is not its tuple (now in `error/`): next.
+                    if let Claim::Taken(bytes) = self.claim(name, &ids[i])? {
+                        return taken(bytes);
+                    }
+                    from = i + 1;
                 }
             }
             v => Err(Error::Endpoint(format!(
@@ -2141,7 +2259,11 @@ mod tests {
                 "ASK {{ ?s ?p ?o . SERVICE <http://127.0.0.1:{port}/sparql> {{ ?x ?y ?o }} }}"
             ))
             .unwrap();
-        let r = tuple_matches(&template, b"<urn:a> <urn:b> \"c\" .");
+        let r = tuple_matches(
+            &template,
+            b"<urn:a> <urn:b> \"c\" .",
+            &CancellationToken::new(),
+        );
         std::thread::sleep(std::time::Duration::from_millis(200));
         stop.store(true, Ordering::SeqCst);
         server.join().unwrap();
