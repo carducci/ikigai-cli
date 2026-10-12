@@ -67,7 +67,7 @@ peer that vanishes without closing (power, network) is found in seconds by both 
 than at the five-minute bound, while a live peer working on a long call keeps the
 connection up and the call keeps its full deadline. QUIC negotiates the smaller of the two
 idle timeouts, so the client's bound governs the server too. The SERVER does not ping: a
-client older than 0.1.56 has no call deadline, and a pinging server whose kernel wedged
+client older than 0.1.55 has no call deadline, and a pinging server whose kernel wedged
 would hold it for ever, so such a client keeps the idle bound it always had. And a door
 runs each resolution off its runtime worker (`block_in_place`), because a blocked worker
 froze the connection's driver and its acknowledgments with it; ⚠ so a client that pings,
