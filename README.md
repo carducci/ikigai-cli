@@ -340,7 +340,7 @@ ikigai serve quic://0.0.0.0:4434 --name layers
   `urn:layers:me` answers each participant who the door says it is.
 - **The state** (entries, tuples, receipts, feeds) lives in, first match wins:
   `--layers-state <dir>` on `serve`; `layers.state = "<dir>"` in `config.toml`
-  (instance-scoped as `<name>.layers.state`; relative to the config home, `~/` to `$HOME`);
+  (instance-scoped as `<name>.layers.state`; relative to the config home, a leading `~` to `$HOME`);
   else `~/.ikigai/layers/<name>` under the data home. No environment variable names it. One
   door per state directory: the host holds `<state>/host.lock` while it lives, and a second
   door over the same directory is refused with the holder's pid.
@@ -416,6 +416,16 @@ they FOLLOW, so two peers never share a certificate set. The config home's `moun
 (`mount = "override urn:x:=quic://host:4433 ~/certs/x"`) say the same thing for the whole
 machine.
 
+**A leading `~` in a config-home path** (ikigai-cli 0.1.58+). Every config-home value that
+names a path expands a leading `~` to the current user's home by one rule: a `mount` line's
+socket and certificate directory (`mount = "prefer urn:x:=~/.ikigai/x.sock"`), `files`,
+`layers.state`, `arrangement`, `browse.root` and `browse.store`, and the `--config-home` and
+`--files` flags. Only `~` and `~/…` are expanded. Another user's `~name/…`, and any `~` while
+`HOME` is unset, stop the start with a message naming the key, rather than becoming a literal
+path. Before 0.1.58 a `mount` line's socket was dialed as the literal `~/x.sock`. ⚠ A
+`--mount`/`--override`/`--prefer` FLAG's target is not expanded, and no shell expands a `~`
+that follows `=`, so write that path out in full on the command line.
+
 **One flag, several prefixes, one connection** (ikigai-cli 0.1.53+). A prefix may be a
 comma-separated list: every prefix in it is served through ONE connection with ONE
 certificate set. A layer door's names live under three prefixes (`urn:layers:` does not
@@ -468,7 +478,7 @@ The local file module (`urn:file:*`) is jailed to one directory, first match win
 1. `--files <dir>`, in any mode that builds a kernel (relative to the working directory;
    refused beside `--connect`, which builds none);
 2. `files = "<dir>"` in `config.toml`, instance-scoped as `<name>.files` (relative to the
-   config home, `~/` to `$HOME`). ⚠ The config home is shared by every process on the
+   config home, a leading `~` to `$HOME`). ⚠ The config home is shared by every process on the
    machine, so an unscoped `files` line moves the daemon's, every door's and the REPL's root;
 3. `$IKIGAI_FILES`, kept as a fallback;
 4. `~/.ikigai/workspace`.

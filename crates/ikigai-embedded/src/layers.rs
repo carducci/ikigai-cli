@@ -140,10 +140,10 @@ pub fn state_dir_from(
         return Ok((dir.to_path_buf(), StateSource::Flag));
     }
     if let Some(value) = configured.map(str::trim).filter(|v| !v.is_empty()) {
-        let path = match (value.strip_prefix("~/"), home) {
-            (Some(rest), Some(home)) => home.join(rest),
-            _ => PathBuf::from(value),
-        };
+        // The workspace's one `~` rule (ledger #1379): a `~` it cannot expand is refused
+        // here, by key, rather than resolved against the config home as a directory named `~`.
+        let path = ikigai_resolve::expand_home(value, home)
+            .map_err(|e| format!("`{STATE_KEY}` in the config home: {e}"))?;
         let path = match config_home {
             Some(base) if path.is_relative() => base.join(path),
             _ => path,
@@ -270,6 +270,30 @@ mod tests {
         );
         let err = state_dir_from(None, None, Some(config), None, "layers").unwrap_err();
         assert!(err.contains(STATE_FLAG) && err.contains(STATE_KEY), "{err}");
+    }
+
+    /// ledger #1379: the state key takes the workspace's one `~` rule. A bare `~` is the
+    /// home; another user's `~name` and a `~` with no home are refused naming the key,
+    /// where before they became a directory named `~…` under the config home.
+    #[test]
+    fn the_state_key_takes_the_shared_tilde_rule() {
+        let home = Path::new("/home/b");
+        let config = Path::new("/home/b/.config/ikigai");
+        assert_eq!(
+            state_dir_from(None, Some("~"), Some(config), Some(home), "layers"),
+            Ok((home.to_path_buf(), StateSource::Config))
+        );
+        let err =
+            state_dir_from(None, Some("~bob/s"), Some(config), Some(home), "layers").unwrap_err();
+        assert!(
+            err.contains(STATE_KEY) && err.contains("another user's home"),
+            "{err}"
+        );
+        let err = state_dir_from(None, Some("~/s"), Some(config), None, "layers").unwrap_err();
+        assert!(
+            err.contains(STATE_KEY) && err.contains("HOME is not set"),
+            "{err}"
+        );
     }
 
     #[test]

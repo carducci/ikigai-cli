@@ -25,7 +25,9 @@ jobs:
   # This job is where that premise is observed rather than cited: the resolve crate's
   # file-name tests, including the `cfg(windows)` one, on a Windows runner. Scoped to that
   # one crate's lib tests on purpose: nothing else here is built on Windows yet (that is the
-  # Windows track), and ikigai-resolve needs only ikigai-core, so this stays cheap.
+  # Windows track), and ikigai-resolve needs only ikigai-core, so this stays cheap. The
+  # `home` filter adds the shared `~` rule's tests (ledger #1379), whose `~\x` case differs
+  # by platform.
   # ⚠ Inline cargo beside the shared caller: ci-drift reads this repo as `caller+inline`.
   windows-file-names:
     name: file-name rule (Windows)
@@ -34,4 +36,4 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked -p ikigai-resolve --lib file_name
+      - run: cargo test --locked -p ikigai-resolve --lib -- file_name home

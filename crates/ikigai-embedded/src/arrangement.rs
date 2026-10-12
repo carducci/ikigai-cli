@@ -151,7 +151,7 @@ pub fn arm() -> std::result::Result<Option<&'static Declared>, String> {
     if let Some(declared) = ACTIVE.get() {
         return Ok(Some(declared));
     }
-    let Some((path, source)) = named() else {
+    let Some((path, source)) = named()? else {
         return Ok(None);
     };
     let turtle = read_declaration(&path).map_err(|e| {
@@ -171,27 +171,38 @@ pub fn arm() -> std::result::Result<Option<&'static Declared>, String> {
 }
 
 /// The declaration's path and the channel that named it: the flag, else the config home.
-fn named() -> Option<(PathBuf, ArrangementSource)> {
+/// `Err` when the config home names one by a path the `~` rule refuses.
+fn named() -> std::result::Result<Option<(PathBuf, ArrangementSource)>, String> {
     if let Some(path) = FLAG_PATH.get() {
-        return Some((path.clone(), ArrangementSource::Flag));
+        return Ok(Some((path.clone(), ArrangementSource::Flag)));
     }
-    let value = crate::config::get(&format!("{}.{CONFIG_KEY}", crate::instance_name()))
-        .or_else(|| crate::config::get(CONFIG_KEY))?;
-    Some((config_relative(&value), ArrangementSource::Config))
+    let Some(value) = crate::config::get(&format!("{}.{CONFIG_KEY}", crate::instance_name()))
+        .or_else(|| crate::config::get(CONFIG_KEY))
+    else {
+        return Ok(None);
+    };
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let path = config_relative(
+        &value,
+        home.as_deref(),
+        crate::config::config_home().as_deref(),
+    )?;
+    Ok(Some((path, ArrangementSource::Config)))
 }
 
-/// A config-home path value: `~/` against `$HOME`, a relative path against the config home.
-fn config_relative(value: &str) -> PathBuf {
-    if let Some(rest) = value.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    let path = PathBuf::from(value);
-    match crate::config::config_home() {
-        Some(home) if path.is_relative() => home.join(path),
+/// A config-home path value: a leading `~` against `home` by the workspace's one rule
+/// ([`ikigai_resolve::expand_home`], ledger #1379), a relative path against the config home.
+fn config_relative(
+    value: &str,
+    home: Option<&Path>,
+    config_home: Option<&Path>,
+) -> std::result::Result<PathBuf, String> {
+    let path = ikigai_resolve::expand_home(value, home)
+        .map_err(|e| format!("`{CONFIG_KEY}` in the config home: {e}"))?;
+    Ok(match config_home {
+        Some(base) if path.is_relative() => base.join(path),
         _ => path,
-    }
+    })
 }
 
 /// **Read a declaration THROUGH a kernel, as `text/turtle`.** A bootstrap kernel binds the
@@ -591,6 +602,29 @@ pub(crate) fn dump_space(dump: Dump) -> EndpointSpace {
 mod tests {
     use super::*;
     use ikigai_core::FnEndpoint;
+
+    /// ledger #1379: the `arrangement` key takes the workspace's one `~` rule, and a `~` it
+    /// cannot expand stops the start naming the key. Before, an unset HOME turned `~/a.ttl`
+    /// into `<config home>/~/a.ttl`.
+    #[test]
+    fn the_arrangement_key_takes_the_shared_tilde_rule() {
+        let (home, cfg) = (Path::new("/home/b"), Path::new("/home/b/.config/ikigai"));
+        assert_eq!(
+            config_relative("~/a.ttl", Some(home), Some(cfg)),
+            Ok(home.join("a.ttl"))
+        );
+        assert_eq!(
+            config_relative("a.ttl", Some(home), Some(cfg)),
+            Ok(cfg.join("a.ttl"))
+        );
+        for (value, home, why) in [
+            ("~bob/a.ttl", Some(home), "another user's home"),
+            ("~/a.ttl", None, "HOME is not set"),
+        ] {
+            let err = config_relative(value, home, Some(cfg)).unwrap_err();
+            assert!(err.contains(CONFIG_KEY) && err.contains(why), "{err}");
+        }
+    }
 
     fn endpoint(name: &'static str) -> Arc<dyn Endpoint> {
         Arc::new(FnEndpoint::new(name, move |_| {

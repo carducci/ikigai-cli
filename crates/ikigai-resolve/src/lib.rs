@@ -30,6 +30,11 @@ use serde::{Deserialize, Serialize};
 mod file_name;
 pub use file_name::is_plain_file_name;
 
+// The one rule for a leading `~` in a path a person typed (ledger #1379), here for the same
+// reason: the config-home readers in embedded and the binary's flags both reach it.
+mod home;
+pub use home::{expand_home, expand_home_str};
+
 /// How a resolution was served by the representation cache.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum CacheStatus {

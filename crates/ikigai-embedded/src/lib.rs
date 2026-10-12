@@ -891,6 +891,10 @@ pub fn file_root() -> PathBuf {
                 .as_deref()
                 .map(std::path::Path::new),
         )
+        // The config home's other refusals stop the process the same way (`browse.root`,
+        // `store`): a file root nobody meant is worse than no start, and the kernel build
+        // reaches this before any request does.
+        .unwrap_or_else(|e| panic!("ikigai: {e} — fix the config"))
     };
     create_workspace(&root);
     root
@@ -904,8 +908,9 @@ pub const FILES_KEY: &str = "files";
 /// environment (ledger #1285):
 ///
 /// 1. `configured`: the config home's `<instance>.files`, else `files`. A relative path is
-///    resolved against the config home and a leading `~/` against `home`, as `layers.state`
-///    is.
+///    resolved against the config home and a leading `~` against `home`, as `layers.state`
+///    is, by the workspace's one rule ([`ikigai_resolve::expand_home`], ledger #1379): a `~`
+///    it cannot expand (`~bob/ws`, or any `~` with no `home`) is an `Err` naming the key.
 /// 2. `env`: `$IKIGAI_FILES`, the fallback it always was.
 /// 3. `<home>/.ikigai/workspace` (`./.ikigai/workspace` with no `home`).
 ///
@@ -918,33 +923,35 @@ pub const FILES_KEY: &str = "files";
 /// use ikigai_embedded::file_root_from;
 ///
 /// let (cfg, home) = (Some(Path::new("/c/ikigai")), Some(Path::new("/h")));
-/// assert_eq!(file_root_from(Some("ws"), Some("/env".as_ref()), cfg, home), PathBuf::from("/c/ikigai/ws"));
-/// assert_eq!(file_root_from(Some("~/ws"), None, cfg, home), PathBuf::from("/h/ws"));
-/// assert_eq!(file_root_from(None, Some("/env".as_ref()), cfg, home), PathBuf::from("/env"));
-/// assert_eq!(file_root_from(None, None, cfg, home), PathBuf::from("/h/.ikigai/workspace"));
+/// assert_eq!(file_root_from(Some("ws"), Some("/env".as_ref()), cfg, home), Ok(PathBuf::from("/c/ikigai/ws")));
+/// assert_eq!(file_root_from(Some("~/ws"), None, cfg, home), Ok(PathBuf::from("/h/ws")));
+/// assert_eq!(file_root_from(Some("~"), None, cfg, home), Ok(PathBuf::from("/h")));
+/// assert!(file_root_from(Some("~bob/ws"), None, cfg, home).is_err());
+/// assert!(file_root_from(Some("~/ws"), None, cfg, None).is_err());
+/// assert_eq!(file_root_from(None, Some("/env".as_ref()), cfg, home), Ok(PathBuf::from("/env")));
+/// assert_eq!(file_root_from(None, None, cfg, home), Ok(PathBuf::from("/h/.ikigai/workspace")));
 /// ```
 pub fn file_root_from(
     configured: Option<&str>,
     env: Option<&std::ffi::OsStr>,
     config_home: Option<&std::path::Path>,
     home: Option<&std::path::Path>,
-) -> PathBuf {
+) -> std::result::Result<PathBuf, String> {
     if let Some(value) = configured.map(str::trim).filter(|v| !v.is_empty()) {
-        let path = match (value.strip_prefix("~/"), home) {
-            (Some(rest), Some(home)) => home.join(rest),
-            _ => PathBuf::from(value),
-        };
-        return match config_home {
+        let path = ikigai_resolve::expand_home(value, home)
+            .map_err(|e| format!("`{FILES_KEY}` in the config home: {e}"))?;
+        return Ok(match config_home {
             Some(base) if path.is_relative() => base.join(path),
             _ => path,
-        };
+        });
     }
     if let Some(env) = env.filter(|v| !v.is_empty()) {
-        return PathBuf::from(env);
+        return Ok(PathBuf::from(env));
     }
-    home.map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf)
+    Ok(home
+        .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf)
         .join(".ikigai")
-        .join("workspace")
+        .join("workspace"))
 }
 
 /// Create the workspace directory PRIVATE (`0700`) if it does not exist yet, whatever the
@@ -1032,12 +1039,10 @@ fn calendar_config_path() -> Option<PathBuf> {
 fn org_config() -> Option<(PathBuf, Vec<String>)> {
     let path = calendar_config_path()?;
     let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
-    let dir = v["org_dir"].as_str()?;
-    let dir = if let Some(rest) = dir.strip_prefix("~/") {
-        Path::new(&std::env::var("HOME").ok()?).join(rest)
-    } else {
-        PathBuf::from(dir)
-    };
+    // The workspace's one `~` rule (ledger #1379). A `~` it cannot expand gives no org
+    // config, the failure this function already had for an unset HOME.
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let dir = ikigai_resolve::expand_home(v["org_dir"].as_str()?, home.as_deref()).ok()?;
     let files = v["org_files"]
         .as_array()?
         .iter()

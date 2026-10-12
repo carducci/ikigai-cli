@@ -107,7 +107,7 @@ pub(crate) fn setup() -> Option<Browse> {
     }
 
     let store_path = scoped("browse.store")
-        .map(|p| expand_home(&p))
+        .map(|p| expand_home("browse.store", &p))
         .unwrap_or_else(|| {
             let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
             home.join(".ikigai").join("browse-store")
@@ -191,7 +191,7 @@ fn roots() -> Vec<(String, PathBuf)> {
     )
     .into_iter()
     .map(|line| {
-        let dir = expand_home(&line);
+        let dir = expand_home("browse.root", &line);
         assert!(
             dir.is_dir(),
             "ikigai: browse.root `{line}` is not a directory — fix the config \
@@ -270,19 +270,57 @@ fn ceiling(key: &str) -> Option<u32> {
     })
 }
 
-/// `~/`-expansion for config paths, matching the org-config convention.
-fn expand_home(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    PathBuf::from(path)
+/// A browse path setting (`key`) with a leading `~` expanded by the workspace's one rule
+/// ([`ikigai_resolve::expand_home`], ledger #1379). A `~` it cannot expand stops the start, as
+/// every other broken browse setting here does: before, it became a path under the working
+/// directory, which for `browse.store` is an archive nobody meant to open.
+fn expand_home(key: &str, path: &str) -> PathBuf {
+    expand_home_in(
+        key,
+        path,
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+    )
+    .unwrap_or_else(|e| panic!("ikigai: {e} — fix the config"))
+}
+
+/// [`expand_home`] with the home passed in, so the rule is testable without `$HOME`.
+fn expand_home_in(
+    key: &str,
+    path: &str,
+    home: Option<&std::path::Path>,
+) -> Result<PathBuf, String> {
+    ikigai_resolve::expand_home(path, home).map_err(|e| format!("`{key}` in the config home: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{provider_iri, root_lines};
+    use super::{expand_home_in, provider_iri, root_lines};
+    use std::path::PathBuf;
+
+    /// ledger #1379: `browse.root` and `browse.store` take the workspace's one `~` rule, and a
+    /// `~` it cannot expand is refused naming the key.
+    #[test]
+    fn browse_paths_take_the_shared_tilde_rule() {
+        let home = Some(std::path::Path::new("/home/b"));
+        assert_eq!(
+            expand_home_in("browse.root", "~/git", home),
+            Ok(PathBuf::from("/home/b/git"))
+        );
+        assert_eq!(
+            expand_home_in("browse.root", "/srv/git", home),
+            Ok(PathBuf::from("/srv/git"))
+        );
+        let err = expand_home_in("browse.store", "~bob/store", home).unwrap_err();
+        assert!(
+            err.contains("`browse.store`") && err.contains("another user's home"),
+            "{err}"
+        );
+        let err = expand_home_in("browse.root", "~/git", None).unwrap_err();
+        assert!(
+            err.contains("`browse.root`") && err.contains("HOME is not set"),
+            "{err}"
+        );
+    }
 
     /// The three spellings a `browse.file_model` line can take: a backend id,
     /// the facade, and a full IRI.
