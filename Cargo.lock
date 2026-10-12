@@ -2992,7 +2992,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-cli"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "async-trait",
  "crossterm",
@@ -3079,7 +3079,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-discovery"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "if-addrs",
  "mdns-sd",
@@ -3087,7 +3087,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-email"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "async-trait",
  "futures",
@@ -3097,7 +3097,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-embedded"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3174,7 +3174,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-engine"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "chrono",
  "futures",
@@ -3225,7 +3225,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-intake"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "async-trait",
  "chrono-tz",
@@ -3236,7 +3236,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-intray"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3253,7 +3253,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-ipc"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "ikigai-core",
  "ikigai-resolve",
@@ -3339,7 +3339,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-mcp"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "futures",
  "ikigai-core",
@@ -3374,7 +3374,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-p2p"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "futures",
  "ikigai-core",
@@ -3387,7 +3387,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-passkey"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "p256",
  "serde_json",
@@ -3412,7 +3412,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-quic"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "ikigai-core",
  "ikigai-resolve",
@@ -3453,7 +3453,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-resolve"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "async-trait",
  "futures",
@@ -3475,7 +3475,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-scheduler"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "futures",
  "ikigai-core",
@@ -3637,7 +3637,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-tz"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -3648,7 +3648,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-view"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3670,7 +3670,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-web"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "blake3",
  "chrono",
@@ -3683,7 +3683,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-wire"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "ikigai-core",
  "ikigai-resolve",

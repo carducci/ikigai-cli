@@ -379,7 +379,7 @@ gives its own mounts two thirds of it, so when a client asks a host about a peer
 gone silent, the host's deadline fires first and the answer names the peer, rather than the
 client's deadline blaming the host.
 
-**Call deadlines** (ikigai-cli 0.1.56+). Every other call to a mounted or `--connect`ed peer
+**Call deadlines** (ikigai-cli 0.1.55+). Every other call to a mounted or `--connect`ed peer
 runs under `call.timeout` (seconds, `0` for none), start to finish. Unset, it is the
 transport's own silence bound (`quic.timeout`, or the socket's five minutes), so nothing that
 used to succeed is cut; what it ends is a peer that accepts a call and never answers it while

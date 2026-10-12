@@ -1472,7 +1472,7 @@ fn server_config_accepting(
 /// Keep-alive is safe only for a caller that bounds its own calls, because a peer whose QUIC
 /// stack still answers while its kernel is wedged keeps a pinged connection alive for ever,
 /// and then only a per-call deadline ends the call. The client has that deadline
-/// ([`QuicResolver::with_call_timeout`], cli 0.1.56). A client older than it has none, and a
+/// ([`QuicResolver::with_call_timeout`], cli 0.1.55). A client older than it has none, and a
 /// server that pinged would hand that client the unbounded wedge; not pinging leaves it the
 /// idle bound it always had (`keep_alive::an_older_client_without_pings_keeps_its_idle_bound`).
 /// A new client pings for both ends: the server hears the pings and the client hears the
@@ -3856,7 +3856,7 @@ mod keep_alive {
     }
 
     /// ★ The SERVER does not ping, so a client older than keep-alive (no pings and, before
-    /// cli 0.1.56, no call deadline either) sees exactly the idle bound it always had. If the
+    /// cli 0.1.55, no call deadline either) sees exactly the idle bound it always had. If the
     /// server pinged, a server whose kernel wedged while its QUIC stack answered would hold
     /// such a client for ever: the unbounded wedge `transport` warned of, for the one client
     /// with no deadline to end it. Simulated with a client built on the plain idle-only
