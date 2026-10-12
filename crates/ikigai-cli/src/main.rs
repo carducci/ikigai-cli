@@ -53,9 +53,9 @@ usage:
   ikigai serve <q> --announce  also advertise this kernel on the local network (mDNS), so clients
                                can mount it by name; `source urn:peer:list` shows who is out there
   ikigai serve <q>             hosts LAYERS (ikigai-layers: urn:layer:*, urn:layers:*, urn:collab:*)
-                               when the config home has a layers/ directory, beside urn:shacl:validate
-                               (admission; the door refuses to start if it cannot validate) on a
-                               kernel with a clock. Participants are clients.json/grants.json as
+                               when the config home has a layers/ directory, on a kernel with a
+                               clock; the host validates each write itself, so no validator is
+                               bound. Participants are clients.json/grants.json as
                                `ikigai-layers grants <config home>` writes them. State lives in
                                --layers-state <dir>, else `layers.state` (instance-scoped as
                                <name>.layers.state; relative to the config home) in config.toml,
@@ -3166,12 +3166,6 @@ fn serve_quic(
             resolved,
             layers.as_ref().map(|hosted| &hosted.host),
         );
-        // A layer admits a write only when `urn:shacl:validate` says it conforms, so a door
-        // whose validator does not resolve would serve layers that admit nothing: refuse to
-        // start instead, saying why.
-        if layers.is_some() {
-            ikigai_embedded::layers::check_validator(&kernel)?;
-        }
         let signed_door = ikigai_embedded::code_signers_configured();
         let mut faces = vec![if surface.personal {
             "calendar-only"

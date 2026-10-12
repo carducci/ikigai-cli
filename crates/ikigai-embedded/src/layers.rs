@@ -3,8 +3,8 @@
 //! **The switch is a directory.** When the config home holds `layers/`, `serve quic://` opens
 //! an [`ikigai_layers::Host`] over the config home (the layer definitions under `layers/`,
 //! `participants.ttl`, `collabs/*.toml`) and a STATE directory, and binds
-//! [`ikigai_layers::space`] beside [`ikigai_shacl::space`] on a kernel with a clock. Without
-//! `layers/` nothing here runs, and the served kernel is built exactly as before.
+//! [`ikigai_layers::space`], alone, on a kernel with a clock. Without `layers/` nothing here
+//! runs, and the served kernel is built exactly as before.
 //!
 //! **Where the state lives** — config home for the setting, data home for the bytes, and no
 //! environment variable names either (the store's rule, `store.rs`):
@@ -16,15 +16,19 @@
 //! 3. `<data home>/layers/<instance>`, i.e. `~/.ikigai/layers/<instance>`
 //!    ([`StateSource::Default`]).
 //!
-//! The default is per INSTANCE because a layer host is one process per state directory (the
-//! lock that keeps a feed gapless is in-process): two doors with different `--name`s reading
-//! one config home must not write one state directory.
+//! The default is per INSTANCE because a layer host is one host per state directory, and the
+//! host enforces it: [`ikigai_layers::Host::open`] holds `<state>/host.lock` exclusively while
+//! the host lives and refuses a second host over the same directory, in this process or
+//! another, naming the holder's pid. So two doors with different `--name`s reading one config
+//! home get two directories, and anything that reopens a host (a test, a reload) drops the old
+//! one first. The operating system releases the lock when the holder exits, however it exits.
 //!
-//! **Admission fails closed, so the host refuses to start without a validator.** `say` and
-//! `out` admit an entry only when `urn:shacl:validate` answers `conforms: true`; a host whose
-//! validator does not resolve would serve layers that admit nothing. [`check_validator`] runs
-//! one validation through the built kernel, the way admission will, and the door refuses to
-//! start when it fails.
+//! **Admission is the host's own call, so the door binds no validator** (ledger #1295,
+//! ikigai-layers 0.2.1). The host links ikigai-shacl and validates every `say` and `out`
+//! itself; a layer whose shapes the validator cannot compile stops the host at [`open`]. Until
+//! 0.2.1 admission composed `urn:shacl:validate`, so this door bound it beside the layers, and
+//! that endpoint declares no capability: every participant was offered a validator. It is not
+//! bound here any more, and `tests/layers_serve.rs` holds every participant's manifold to that.
 //!
 //! **Who writes is the door's business.** Participants are the config home's `clients.json` /
 //! `grants.json`, as `ikigai-layers grants <config home>` generates them: each certificate's
@@ -35,9 +39,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ikigai_core::{
-    ArgRef, Capability, EndpointSpace, Iri, Kernel, Request, Space, SystemClock, Verb,
-};
+use ikigai_core::{EndpointSpace, Iri, Space, SystemClock};
 
 /// The directory under the config home whose presence switches the layer host on.
 pub const DIR: &str = "layers";
@@ -53,9 +55,6 @@ pub const STATE_FLAG: &str = "--layers-state";
 /// The name the served root gives the layer space: the space answers what its host was
 /// handed, so it claims no name of its own and the host names it (core's `SPACE-NAME` rule).
 pub const SPACE: &str = "urn:ikigai:space:served:layers";
-
-/// The validator admission composes.
-pub const VALIDATE: &str = ikigai_layers::endpoints::VALIDATE;
 
 /// Which channel named the state directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,15 +200,12 @@ pub fn open(flag: Option<&Path>) -> Result<Option<Hosted>, String> {
     }))
 }
 
-/// The spaces a hosting kernel binds, in order: the layers, then the validator their
-/// admission composes.
+/// The spaces a hosting kernel binds: the layer space, alone. Admission validates inside the
+/// host, so no validator is bound beside it (see the module docs).
 pub fn spaces(host: &Arc<ikigai_layers::Host>) -> Vec<Arc<dyn Space>> {
     let layers: EndpointSpace = ikigai_layers::space(host)
         .named(Iri::parse(SPACE).expect("the layer space's name is an IRI"));
-    vec![
-        Arc::new(layers) as Arc<dyn Space>,
-        Arc::new(ikigai_shacl::space()) as Arc<dyn Space>,
-    ]
+    vec![Arc::new(layers) as Arc<dyn Space>]
 }
 
 /// The clock a hosting kernel carries: every entry, tuple and receipt is stamped with the
@@ -218,53 +214,9 @@ pub fn clock() -> Arc<dyn ikigai_core::Clock> {
     Arc::new(SystemClock)
 }
 
-/// Prove the built kernel can admit: one validation through it, issued the way admission
-/// issues it (inline shapes and data, a JSON report, an EMPTY capability), must answer
-/// `conforms: true`. Anything else — the validator unresolved, refused, or answering
-/// something that is not a report — is the reason the door refuses to start.
-pub fn check_validator(kernel: &Kernel) -> Result<(), String> {
-    const SHAPES: &str = "@prefix sh: <http://www.w3.org/ns/shacl#> .\n\
-        <urn:ikigai:layers:probe:shape> a sh:NodeShape ;\n  \
-        sh:targetClass <urn:ikigai:layers:probe:Thing> .\n";
-    const DATA: &str = "<urn:ikigai:layers:probe:thing> a <urn:ikigai:layers:probe:Thing> .\n";
-    let refuse = |why: String| {
-        format!(
-            "layers are configured, but admission cannot run on this kernel: {why}. Every \
-             write to a layer composes {VALIDATE}, and a layer without it admits nothing, so \
-             this door does not start"
-        )
-    };
-    let request = Request::new(Verb::Source, Iri::parse(VALIDATE).expect("a constant IRI"))
-        .with_arg("data", ArgRef::Inline(DATA.as_bytes().to_vec()))
-        .with_arg("shapes", ArgRef::Inline(SHAPES.as_bytes().to_vec()))
-        .with_arg("as", ArgRef::Inline(b"application/json".to_vec()));
-    let (report, _) = ikigai_resolve::Resolver::issue_as(
-        kernel,
-        request,
-        &Capability::scoped(Vec::<String>::new()),
-    )
-    .map_err(|e| refuse(format!("{VALIDATE} failed ({e})")))?;
-    let report: serde_json::Value = serde_json::from_slice(&report.bytes).map_err(|e| {
-        refuse(format!(
-            "{VALIDATE} answered something that is not a report ({e})"
-        ))
-    })?;
-    match report.get("conforms").and_then(serde_json::Value::as_bool) {
-        Some(true) => Ok(()),
-        other => Err(refuse(format!(
-            "{VALIDATE} judged a conforming probe {}",
-            match other {
-                Some(false) => "NOT conforming".to_string(),
-                _ => "without a `conforms`".to_string(),
-            }
-        ))),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ikigai_core::Fallback;
 
     #[test]
     fn the_flag_wins_then_the_config_home_then_the_data_home() {
@@ -336,20 +288,5 @@ mod tests {
         std::fs::create_dir(dir.join(DIR)).unwrap();
         assert_eq!(configured_in(&dir), Some(dir.join(DIR)));
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The refusal the door turns on: a kernel without the validator cannot admit, and the
-    /// check names what is missing; with it bound, the probe conforms.
-    #[test]
-    fn a_kernel_without_the_validator_fails_the_check_and_one_with_it_passes() {
-        let bare = Kernel::new(Arc::new(EndpointSpace::new()));
-        let err = check_validator(&bare).unwrap_err();
-        assert!(err.contains(VALIDATE), "names the validator: {err}");
-        assert!(err.contains("does not start"), "says what follows: {err}");
-
-        let with: Kernel = Kernel::new(Arc::new(Fallback::new(vec![
-            Arc::new(ikigai_shacl::space()) as Arc<dyn Space>,
-        ])));
-        check_validator(&with).expect("the real validator admits the probe");
     }
 }
