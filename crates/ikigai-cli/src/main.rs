@@ -31,6 +31,10 @@ ikigai — resource-resolution REPL
 usage:
   ikigai                       start the interactive REPL (full-screen on a terminal)
   ikigai --plain               force the line REPL (also used automatically when piped)
+  ikigai --quiet               the line REPL with no greeting (no version banner, no topology
+                               lines on stderr) and, when stdin is not a terminal, no prompt:
+                               a piped session prints its answers and nothing else, so it
+                               replays cleanly. Implies --plain; a -c batch is already quiet
   ikigai --demo                mount the interactive runbook (urn:runbook:*); off by default
   ikigai --connect [<target>]  attach the REPL to a kernel server (a Unix path, or quic://host:port)
   ikigai --mount <pfx>=<tgt>   compose a remote kernel at prefix <pfx> (<tgt> = Unix path or quic://host:port)
@@ -275,6 +279,9 @@ enum Mode {
 #[derive(Default, Clone)]
 struct ReplArgs {
     plain: bool,
+    /// `--quiet` (ledger #1310): the line REPL without its greeting, and without a prompt
+    /// when stdin is not a terminal. Implies `plain`.
+    quiet: bool,
     /// Mount the interactive runbook (`urn:runbook:*`); off by default so the CLI is
     /// a tool, not a demo. Only meaningful for the embedded (non-`--connect`) kernel.
     demo: bool,
@@ -1172,6 +1179,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
         match arg.as_str() {
             "-h" | "--help" => return Ok(None),
             "--plain" => repl.plain = true,
+            "--quiet" => repl.quiet = true,
             "--demo" => repl.demo = true,
             "--daemon" => daemon = true,
             "--name" => {
@@ -1429,7 +1437,7 @@ fn main() {
                         std::process::exit(1);
                     },
                 );
-            run_repl(engine, args.plain, &args.commands, &topology);
+            run_repl(engine, args.plain, args.quiet, &args.commands, &topology);
         }
     }
 }
@@ -2543,7 +2551,7 @@ fn connect_mount_ipc(
 /// the one-shot caller already chose its mounts on the command line or in the config home
 /// it is reading. The human sitting at a prompt did not.
 #[cfg(feature = "embedded")]
-fn run_repl(engine: Engine, plain: bool, commands: &[String], topology: &[String]) {
+fn run_repl(engine: Engine, plain: bool, quiet: bool, commands: &[String], topology: &[String]) {
     // A picture answer is NAMED to a person at a terminal and written whole anywhere else
     // (ledger #983), so `ikigai -c 'source urn:diagram:kernel' > kernel.svg` keeps working.
     #[cfg(not(target_family = "wasm"))]
@@ -2575,7 +2583,16 @@ fn run_repl(engine: Engine, plain: bool, commands: &[String], topology: &[String
                 // and the read waited on it for good. So the reader waits [`STDIN_GRACE`] for
                 // the FIRST byte (or EOF); a stdin silent that long is idle, and the sink goes
                 // without `content` rather than with an empty one.
-                engine.set_piped_input_polled(|| read_stdin_unless_idle(STDIN_GRACE));
+                //
+                // And the probe (ledger #1305): a `source` or `delete` fetches its target's
+                // contract only to learn whether stdin should fill an argument, so a stdin
+                // already at its end with nothing (`/dev/null`, as a harness or an agent's
+                // shell hands it, or a closed empty pipe) is told apart WITHOUT reading it,
+                // and no contract is fetched, or cached, for its sake.
+                engine.set_piped_input_probed(
+                    || read_stdin_unless_idle(STDIN_GRACE),
+                    stdin_ended_empty,
+                );
             }
         }
         std::process::exit(repl::run_commands(engine, commands));
@@ -2583,7 +2600,7 @@ fn run_repl(engine: Engine, plain: bool, commands: &[String], topology: &[String
     #[cfg(not(target_family = "wasm"))]
     {
         use std::io::IsTerminal;
-        if !plain && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        if !plain && !quiet && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
             // The keybinding scheme is read before entering the alternate screen
             // so an unsupported-value notice is visible.
             if let Err(e) = tui::run(engine, ikigai_engine::config::keybindings(), topology) {
@@ -2592,10 +2609,10 @@ fn run_repl(engine: Engine, plain: bool, commands: &[String], topology: &[String
             }
             return;
         }
-        repl::run(engine, topology);
+        repl::run(engine, topology, quiet);
     }
     #[cfg(target_family = "wasm")]
-    repl::run(engine, topology);
+    repl::run(engine, topology, quiet);
 }
 
 /// How long a content-less `sink` waits for stdin's FIRST byte (or its end) before calling
@@ -2639,6 +2656,70 @@ fn read_stdin_unless_idle(grace: std::time::Duration) -> Option<Vec<u8>> {
             None
         }
     }
+}
+
+/// Whether stdin is ALREADY at its end having offered nothing, answered without reading a
+/// byte (ledger #1305): `/dev/null`, a regular file read to its end, a pipe or socket whose
+/// writer closed with nothing left in it. `false` whenever that cannot be known: bytes are
+/// waiting, a producer has not written yet, or the descriptor is of a kind this does not
+/// recognize. A `false` costs only the contract fetch the batch made before the probe
+/// existed, so every doubt resolves that way.
+///
+/// Why not read: a stage that turns out not to need stdin must leave it unread (a `-c` inside
+/// a `while read` loop shares the loop's input), and an inherited pipe nobody writes would
+/// cost the idle grace (ledger #1088) on every bare `source`.
+#[cfg(all(feature = "embedded", unix))]
+fn stdin_ended_empty() -> bool {
+    use std::io::Seek;
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let stdin = std::io::stdin();
+    // A duplicate of descriptor 0 to ask questions of: it shares the open file (and so the
+    // offset), and dropping it closes only the duplicate.
+    let Ok(fd) = stdin.as_fd().try_clone_to_owned() else {
+        return false;
+    };
+    let mut file = std::fs::File::from(fd);
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    let kind = meta.file_type();
+    if kind.is_file() {
+        // Asking the offset does not move it.
+        return file.stream_position().is_ok_and(|at| at >= meta.len());
+    }
+    if kind.is_char_device() {
+        return std::fs::metadata("/dev/null").is_ok_and(|null| null.rdev() == meta.rdev());
+    }
+    if kind.is_fifo() || kind.is_socket() {
+        use std::os::fd::AsRawFd;
+        let raw = file.as_raw_fd();
+        let mut poll = libc::pollfd {
+            fd: raw,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid `pollfd` for a descriptor this function owns, a count of 1, and a
+        // zero timeout: `poll` only writes `revents`, and returns at once.
+        let ready = unsafe { libc::poll(&mut poll, 1, 0) };
+        if ready != 1 || poll.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+            return false; // nothing yet: a slow producer, or an idle pipe. Not known empty.
+        }
+        // Readable. Readable with nothing to read is the end; asked AFTER `poll`, so a byte
+        // that arrives in between is counted rather than missed.
+        let mut waiting: libc::c_int = 0;
+        // SAFETY: `FIONREAD` writes one `c_int` through the pointer, which points at one.
+        let asked = unsafe { libc::ioctl(raw, libc::FIONREAD, &mut waiting) };
+        return asked == 0 && waiting == 0;
+    }
+    false
+}
+
+/// No probe off Unix: a stdin is never known empty, so the batch fetches as it always did.
+#[cfg(all(feature = "embedded", not(unix), not(target_family = "wasm")))]
+fn stdin_ended_empty() -> bool {
+    false
 }
 
 // --- `cert generate` --------------------------------------------------------

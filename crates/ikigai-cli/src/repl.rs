@@ -1,6 +1,7 @@
 //! Plain line REPL — one request per line, no full-screen UI.
 //!
-//! Used when stdout is not a terminal (piping, scripts, CI) or with `--plain`.
+//! Used when stdout is not a terminal (piping, scripts, CI) or with `--plain`. `--quiet` is
+//! this REPL without its greeting, and without a prompt when stdin is not a terminal.
 
 use std::io::{self, Write};
 
@@ -58,23 +59,36 @@ pub fn run_commands(engine: Engine, commands: &[String]) -> i32 {
 /// the version line, because a session that is silently resolving `urn:iki:ledger:` through
 /// another machine should say so before the first answer, not after a confusing one. Every
 /// serving door printed a mount line and this face printed none (ledger #418).
-pub fn run(engine: Engine, topology: &[String]) {
-    println!(
-        "ikigai {} — REPL. Type `help`, or `quit` to exit.",
-        env!("CARGO_PKG_VERSION")
-    );
-    for line in topology {
-        eprintln!("ikigai: {line}");
+///
+/// `quiet` (`--quiet`, ledger #1310) drops that greeting — the banner and the topology
+/// lines — and prompts only a person: when stdin is not a terminal there is no prompt at
+/// all, so what a piped session prints is its answers (and their `[cache]` notes), in order,
+/// and nothing a replay has to strip.
+pub fn run(engine: Engine, topology: &[String], quiet: bool) {
+    let prompting = !quiet || stdin_is_a_terminal();
+    if !quiet {
+        println!(
+            "ikigai {} — REPL. Type `help`, or `quit` to exit.",
+            env!("CARGO_PKG_VERSION")
+        );
+        for line in topology {
+            eprintln!("ikigai: {line}");
+        }
     }
     let stdin = io::stdin();
     let mut line = String::new();
     loop {
-        print!("ikigai> ");
-        io::stdout().flush().ok();
+        if prompting {
+            print!("ikigai> ");
+            io::stdout().flush().ok();
+        }
         line.clear();
         if stdin.read_line(&mut line).unwrap_or(0) == 0 {
-            println!();
-            break; // EOF (Ctrl-D)
+            // End the prompt's line, which EOF (Ctrl-D) left open. No prompt, no line.
+            if prompting {
+                println!();
+            }
+            break;
         }
         match engine.eval(&line) {
             Action::Quit => break,
@@ -112,5 +126,19 @@ pub fn run(engine: Engine, topology: &[String]) {
 fn report_fan_out(engine: &Engine) {
     if let Some(fan_out) = engine.last_fan_out() {
         eprintln!("[{fan_out}]");
+    }
+}
+
+/// Whether a person could be typing: stdin is a terminal. Off wasm only; a wasm build has no
+/// such question to ask, and prompts as it always did.
+fn stdin_is_a_terminal() -> bool {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        use std::io::IsTerminal;
+        io::stdin().is_terminal()
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        true
     }
 }

@@ -3008,6 +3008,7 @@ dependencies = [
  "ikigai-resolve",
  "ikigai-web",
  "ikigai-wire",
+ "libc",
  "ratatui",
  "serde_json",
  "serde_yaml",

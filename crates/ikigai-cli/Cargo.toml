@@ -80,6 +80,12 @@ serde_yaml = { version = "0.9", optional = true }
 ratatui = "0.30.1"
 crossterm = "0.29.0"
 
+# `poll` and `FIONREAD` on stdin, so a `-c` batch can tell a stdin that is already at its end
+# with nothing (a closed empty pipe) from one with bytes waiting, WITHOUT reading it (ledger
+# #1305; see `stdin_ended_empty` in main.rs).
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 # `block_on` for the one assertion the adapter cannot make: issuing the step's request at
 # the KERNEL, under the session's own capability, to see the TYPED `Denied` — the engine's
