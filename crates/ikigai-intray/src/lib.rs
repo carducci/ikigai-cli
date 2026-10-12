@@ -97,6 +97,17 @@ pub fn space(root: PathBuf) -> EndpointSpace {
     )
 }
 
+/// Whether `id` can be a tuple id: it is joined as `<id>.tuple` (and `.err`, `.out`) under a
+/// stage directory, so it must keep that ONE plain entry on every platform
+/// ([`ikigai_resolve::is_plain_file_name`]; a drive prefix like `C:x` would REPLACE the
+/// directory on Windows, ledger #1307), and it has no `.` of its own, since a content hash
+/// never does. Whether it is the RIGHT hash is checked against the bytes, after the read.
+fn is_tuple_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.contains('.')
+        && ikigai_resolve::is_plain_file_name(&format!("{id}.tuple"))
+}
+
 /// A directory-backed tuplespace. Each named space is `<root>/<name>/inbox/`, and a tuple is
 /// a `<blake3>.tuple` file in it.
 pub struct SpaceEndpoint {
@@ -163,7 +174,7 @@ impl SpaceEndpoint {
     /// a taker that died between the rename and the read is requeued by
     /// [`requeue_stale_claims`](SpaceEndpoint::requeue_stale_claims).
     fn claim(&self, name: &str, id: &str) -> Result<Claim> {
-        if id.is_empty() || id.contains(['/', '\\', '.']) {
+        if !is_tuple_id(id) {
             return Err(Error::InvalidArgument {
                 name: "tuple".to_string(),
                 detail: "a tuple id is a content hash".to_string(),
@@ -478,11 +489,15 @@ impl Endpoint for SpaceEndpoint {
             .bindings
             .get("name")
             .ok_or_else(|| Error::MissingArgument("name".to_string()))?;
-        // The name is the space's identity — a single segment, never a path.
-        if name.is_empty() || name.contains(['/', '\\', ':', '.']) {
+        // The name is the space's identity — a single segment, never a path — by the
+        // workspace's one rule for a joined name, so a Windows device name (`CON`) or a
+        // trailing space is refused here too (ledger #1307), and no `.` at all.
+        if name.contains('.') || !ikigai_resolve::is_plain_file_name(name) {
             return Err(Error::InvalidArgument {
                 name: "name".to_string(),
-                detail: "a space name is a single segment (no `/ \\ : .`)".to_string(),
+                detail: "a space name is a single segment (no `/ \\ : .`, no trailing space, \
+                         not a Windows device name)"
+                    .to_string(),
             });
         }
         let inbox = self.inbox(name);
@@ -520,7 +535,7 @@ impl Endpoint for SpaceEndpoint {
                              as `{CAP_OUT}`"
                         )));
                     }
-                    if id.is_empty() || id.contains(['/', '\\', '.']) {
+                    if !is_tuple_id(id) {
                         return Err(Error::InvalidArgument {
                             name: "retry".to_string(),
                             detail: "a tuple id is a content hash".to_string(),
@@ -588,7 +603,7 @@ impl Endpoint for SpaceEndpoint {
                 // (default), or the reactor's `outbox` (handled) / `error` (dead-letter).
                 let dir = self.state_dir(name, opt_str(inv, "state")?.unwrap_or("inbox"))?;
                 if let Some(id) = opt_str(inv, "tuple")? {
-                    if id.is_empty() || id.contains(['/', '\\', '.']) {
+                    if !is_tuple_id(id) {
                         return Err(Error::InvalidArgument {
                             name: "tuple".to_string(),
                             detail: "a tuple id is a content hash".to_string(),
@@ -2948,6 +2963,42 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("jobs", 2), ("passive", 1)]
         );
+    }
+
+    /// Ledger #1307: a tuple id is joined as `<id>.tuple` under a stage directory, and on
+    /// Windows `dir.join("C:x.tuple")` REPLACES `dir`, so a drive-prefixed id would read
+    /// (`rd`), move into the space (`retry=`) or take (`delete`) a file outside it. Refused
+    /// as an invalid id on every platform, by each of the three verbs that take one, before
+    /// any path is built; a Windows device name (`CON`) likewise.
+    #[test]
+    fn a_tuple_id_that_would_escape_on_windows_is_refused_by_every_verb() {
+        let root = reactive_root("space-drive-id", "jobs", "urn:test:handler");
+        let k = Kernel::new(Arc::new(space(root)));
+        let cap = Capability::scoped(vec![
+            CAP_OUT.to_string(),
+            CAP_READ.to_string(),
+            CAP_TAKE.to_string(),
+            CAP_RETRY.to_string(),
+        ]);
+        for id in ["C:x", "C:", "CON", "nul"] {
+            for (verb, arg) in [
+                (Verb::Source, "tuple"),
+                (Verb::Delete, "tuple"),
+                (Verb::Sink, "retry"),
+            ] {
+                let r = block_on(
+                    k.issue(
+                        Request::new(verb, iri("urn:space:jobs"))
+                            .with_arg(arg, ArgRef::Inline(id.as_bytes().to_vec())),
+                        &cap,
+                    ),
+                );
+                assert!(
+                    matches!(r, Err(Error::InvalidArgument { ref name, .. }) if name == arg),
+                    "{verb:?} {arg}={id} must be refused as an invalid id, got: {r:?}"
+                );
+            }
+        }
     }
 
     #[test]

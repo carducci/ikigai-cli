@@ -24,6 +24,12 @@ use ikigai_core::{
 };
 use serde::{Deserialize, Serialize};
 
+// The one rule for a request-derived name joined under a directory (ledger #1307). It
+// lives here because this is the one member every host-side crate of the workspace
+// (embedded, intray, cli) already depends on; it has nothing to do with resolution.
+mod file_name;
+pub use file_name::is_plain_file_name;
+
 /// How a resolution was served by the representation cache.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum CacheStatus {

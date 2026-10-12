@@ -135,7 +135,9 @@ pub fn peer_cert_dir(name: &str) -> Option<PathBuf> {
 /// directory, so a stranger's announcement was listed as trusted with `ik:pinnedHere true`
 /// (ledger #741). A name with a path separator (`/` or `\`), a NUL, or nothing at all
 /// names no directory; it is refused here, before any path is built, rather than
-/// normalized, because a normalized name would be a DIFFERENT peer's name.
+/// normalized, because a normalized name would be a DIFFERENT peer's name. So is a name
+/// Windows would rewrite (ledger #1307): `quic-plasma.` opens `quic-plasma` there, which is
+/// the same borrow by another spelling, and a `:` names a stream, not a directory.
 ///
 /// ```
 /// use std::path::{Path, PathBuf};
@@ -145,17 +147,19 @@ pub fn peer_cert_dir(name: &str) -> Option<PathBuf> {
 /// assert_eq!(peer_cert_dir_in(home, "plasma"), Some(PathBuf::from("/home/b/.config/ikigai/quic-plasma")));
 /// assert_eq!(peer_cert_dir_in(home, "plasma/../quic-bug"), None);
 /// assert_eq!(peer_cert_dir_in(home, ""), None);
+/// assert_eq!(peer_cert_dir_in(home, "plasma."), None);
 /// ```
 pub fn peer_cert_dir_in(home: &Path, name: &str) -> Option<PathBuf> {
     is_single_segment(name).then(|| home.join(format!("quic-{name}")))
 }
 
-/// Whether `name` stays ONE directory entry once prefixed with `quic-`. Separators of
-/// either platform are refused on every platform: a name that is one segment on macOS
-/// and three on Windows is not a name to build a path from. `.` and `..` need no case of
-/// their own, because the `quic-` prefix makes them ordinary entries.
+/// Whether `name` stays ONE directory entry once prefixed with `quic-`, by the workspace's
+/// one rule for a joined name ([`ikigai_resolve::is_plain_file_name`]): separators of either
+/// platform, a `:`, and a trailing `.` or space are refused on every platform, because a
+/// name that is one entry on macOS and a different one on Windows is not a name to build a
+/// path from. The rule is applied to the ENTRY (`quic-<name>`), which is what is joined.
 fn is_single_segment(name: &str) -> bool {
-    !name.is_empty() && !name.contains(['/', '\\', '\0'])
+    !name.is_empty() && ikigai_resolve::is_plain_file_name(&format!("quic-{name}"))
 }
 
 /// The value of `key` in the host config, or `None` if the file or the key is absent.
@@ -408,7 +412,7 @@ mod tests {
             Some(PathBuf::from("/c/ikigai/quic-plasma"))
         );
         // Names an announcement may legitimately carry are kept as they are.
-        for ok in ["bug-2", "plasma (2)", "..", ".", "plasma.local"] {
+        for ok in ["bug-2", "plasma (2)", "..bug", "plasma.local"] {
             let dir = peer_cert_dir_in(home, ok).unwrap_or_else(|| panic!("{ok:?} is one segment"));
             assert_eq!(
                 dir.parent(),
@@ -416,7 +420,21 @@ mod tests {
                 "{ok:?} stays directly under the home"
             );
         }
-        for bad in ["", "plasma/../quic-bug", "/etc", "a/b", "a\\b", "a\0b"] {
+        // `.`, `..` and `plasma.` end in a dot, which Windows strips: `quic-plasma.` would
+        // open `quic-plasma` there (ledger #1307), and `quic-..` would open `quic-`.
+        for bad in [
+            "",
+            "plasma/../quic-bug",
+            "/etc",
+            "a/b",
+            "a\\b",
+            "a\0b",
+            "C:x",
+            "plasma.",
+            "plasma ",
+            "..",
+            ".",
+        ] {
             assert_eq!(
                 peer_cert_dir_in(home, bad),
                 None,

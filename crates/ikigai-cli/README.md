@@ -25,13 +25,15 @@ It chooses a transport by how it attaches; `serve` runs a kernel server and
 
 | transport | feature | how |
 |-----------|---------|-----|
-| [embedded](https://crates.io/crates/ikigai-embedded) | `embedded` (default) | kernel runs in-process — native + wasm |
+| [embedded](https://crates.io/crates/ikigai-embedded) | `embedded` (default) | kernel runs in-process (native only) |
 | [ipc](https://crates.io/crates/ikigai-ipc) | `ipc` (default) | `ikigai serve` / `--connect` over a Unix socket (peercred-verified, same user) |
 | [quic](https://crates.io/crates/ikigai-quic) | `quic` (opt-in) | `ikigai serve quic://addr` / `--connect quic://host:port` over QUIC with mutually-pinned TLS |
 
 `quic` is opt-in (it pulls quinn/rustls/tokio); the default build is `embedded` +
-`ipc`. On wasm the binary builds with only `embedded` and falls back to the line
-REPL.
+`ipc`. None of the three builds for WebAssembly: `ikigai-embedded` pulls `socket2`
+through `mdns-sd` and `lettre`, which has no wasm32 target. The wasm face is
+[ikigai-engine](https://crates.io/crates/ikigai-engine) on its own (ikigai-web-demo runs
+a kernel in a browser through it), and CI's `wasm-lib` job checks exactly that crate.
 
 ## Architecture
 
