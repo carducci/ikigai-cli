@@ -37,3 +37,50 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked -p ikigai-resolve --lib -- file_name home
+  # The native Windows PROBE (ledger #1162): what breaks when the whole workspace is built and
+  # tested on Windows. It REPORTS and does not gate: both cargo steps carry
+  # `continue-on-error: true`, so a red step leaves the job (and the PR) green. Ledger #1162 is
+  # the item that turns this into a gate, once `docs/windows.md`'s map is worked down; until
+  # then a gate here would block every PR on day one. So that it is never a probe that
+  # silently passes (field guide 9c), the last step writes each cargo step's outcome to the job
+  # summary and raises a `::warning::` annotation for every one that failed.
+  # The build takes the binary's install features (`quic,web`) and `--keep-going`, so one
+  # failing crate does not hide the next one's errors; `--no-fail-fast` does the same for test.
+  # ⚠ Inline cargo beside the shared caller, like `windows-file-names` above.
+  windows-probe:
+    name: native build probe (Windows, non-gating)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-probe
+      - id: build
+        name: cargo build -p ikigai-cli --features quic,web
+        continue-on-error: true
+        run: cargo build -p ikigai-cli --locked --features quic,web --keep-going
+      - id: test
+        name: cargo test --workspace
+        continue-on-error: true
+        run: cargo test --workspace --locked --no-fail-fast
+      - name: report the probe's outcome
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Windows probe (ledger #1162, non-gating)"
+            echo ""
+            echo "| step | outcome |"
+            echo "| --- | --- |"
+            echo "| build -p ikigai-cli --features quic,web | ${{ steps.build.outcome }} |"
+            echo "| test --workspace | ${{ steps.test.outcome }} |"
+            echo ""
+            echo "The breakage map is docs/windows.md."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.build.outcome }}" != "success" ]; then
+            echo "::warning title=Windows probe::cargo build -p ikigai-cli --features quic,web failed on Windows (non-gating; ledger #1162, docs/windows.md)"
+          fi
+          if [ "${{ steps.test.outcome }}" != "success" ]; then
+            echo "::warning title=Windows probe::cargo test --workspace failed on Windows (non-gating; ledger #1162, docs/windows.md)"
+          fi
