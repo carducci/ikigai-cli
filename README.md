@@ -16,6 +16,7 @@ This repository carries the transport dependencies, keeping
 ```bash
 cargo run --bin ikigai          # full-screen TUI on a terminal
 cargo run --bin ikigai -- --plain   # line REPL (also used automatically when piped)
+cargo run --bin ikigai -- --quiet   # line REPL with no greeting, and no prompt on a piped stdin
 cargo run --bin ikigai -- -c 'source urn:iki:fn:toUpper hello'   # run and exit (one-shot)
 cargo run --bin ikigai -- --daemon  # headless kernel: timers + watchers, no REPL
 ```
@@ -23,6 +24,19 @@ cargo run --bin ikigai -- --daemon  # headless kernel: timers + watchers, no REP
 `-c '<command>'` runs a command non-interactively and exits — repeat it to run
 several in order (`-c '…' -c '…'`). Output goes to stdout, errors to stderr, and
 the exit code is non-zero if any command failed, so it composes in a shell.
+
+A `-c` batch is not quite a REPL session: its non-terminal stdin can feed the first
+command that needs a value (a content-less `sink`, or a `source` left with one required
+argument), so a bare `source` asks for its target's contract when stdin may hold that value.
+A stdin already at its end with nothing (`/dev/null`, a closed empty pipe) holds none, and
+no contract is fetched for it. To replay what a person types, feed the lines to
+`ikigai --quiet` on its stdin instead: it is the line REPL without the version banner and
+the topology lines, and with no prompt when stdin is not a terminal, so its output is the
+answers (and their `[cache]` notes on stderr) in order:
+
+```bash
+printf 'source urn:iki:fn:toUpper hi\nsource urn:kernel:cache\n' | ikigai --quiet
+```
 
 By default you attach to an **in-process** kernel. You can also attach to a kernel
 running in **another process** over IPC — same REPL, same commands:

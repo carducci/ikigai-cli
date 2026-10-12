@@ -280,7 +280,34 @@ enum PipedInput {
     Ready(Vec<u8>),
     /// `None` from the reader means stdin offered NOTHING (an idle descriptor): the sink is
     /// then sent with no `content` at all, never with an empty one.
-    Deferred(Box<dyn FnOnce() -> Option<Vec<u8>>>),
+    ///
+    /// The second field, when present, answers WITHOUT reading whether stdin is already at
+    /// its end having offered nothing (`/dev/null`, a closed empty pipe, a file read to its
+    /// end). See [`Engine::set_piped_input_probed`].
+    Deferred(
+        Box<dyn FnOnce() -> Option<Vec<u8>>>,
+        Option<Box<dyn Fn() -> bool>>,
+    ),
+}
+
+impl PipedInput {
+    /// Whether this stdin may still offer a value: not KNOWN to be empty. A reader with no
+    /// probe cannot be asked, so it may (ledger #1305).
+    fn may_offer(&self) -> bool {
+        match self {
+            PipedInput::Ready(bytes) => !bytes.is_empty(),
+            PipedInput::Deferred(_, Some(ended_empty)) => !ended_empty(),
+            PipedInput::Deferred(_, None) => true,
+        }
+    }
+
+    /// Take the bytes: the ready ones, or whatever the deferred reader finds.
+    fn read(self) -> Option<Vec<u8>> {
+        match self {
+            PipedInput::Ready(bytes) => Some(bytes),
+            PipedInput::Deferred(read, _) => read(),
+        }
+    }
 }
 
 pub struct Engine {
@@ -551,7 +578,8 @@ impl Engine {
     /// nobody will ever write to", and nothing can: the only safe moment to block on stdin
     /// is when a command has asked for its content.
     pub fn set_piped_input_with(&self, read: impl FnOnce() -> Vec<u8> + 'static) {
-        *self.piped_input.borrow_mut() = Some(PipedInput::Deferred(Box::new(move || Some(read()))));
+        *self.piped_input.borrow_mut() =
+            Some(PipedInput::Deferred(Box::new(move || Some(read())), None));
     }
 
     /// [`set_piped_input_with`](Self::set_piped_input_with) for a reader that may find stdin
@@ -564,7 +592,43 @@ impl Engine {
     /// `content`, a sink that requires it refuses (nothing is written) and one where it is
     /// optional (a ledger close's note) proceeds as asked.
     pub fn set_piped_input_polled(&self, read: impl FnOnce() -> Option<Vec<u8>> + 'static) {
-        *self.piped_input.borrow_mut() = Some(PipedInput::Deferred(Box::new(read)));
+        *self.piped_input.borrow_mut() = Some(PipedInput::Deferred(Box::new(read), None));
+    }
+
+    /// [`set_piped_input_polled`](Self::set_piped_input_polled) with a PROBE that answers,
+    /// without reading anything, whether stdin is already at its end having offered nothing
+    /// (`true`): `/dev/null`, a closed empty pipe, a file read to its end. `false` means it
+    /// has bytes waiting, or cannot be told yet (a producer that has not written).
+    ///
+    /// Ledger #1305. A `source` stage or a `delete` fetches its target's contract only to
+    /// learn whether stdin should fill an argument, and a stdin that will never offer a byte
+    /// cannot. Without the probe every bare `source` in a scripted `-c` (stdin `/dev/null`,
+    /// as a harness or an agent's shell hands it) fetched and CACHED a contract an
+    /// interactive session never asks for, so `urn:kernel:cache` listed rows the session did
+    /// not make. With it, an empty stdin is no value: no contract is fetched for its sake,
+    /// and no stage receives it. A sink still reads it (an empty body, as before).
+    ///
+    /// Why a probe and not a read: reading would consume the bytes of a `while read` loop
+    /// that the stage turns out not to need, and would wait out the idle grace on an
+    /// inherited pipe nobody writes (ledger #1088). The probe does neither.
+    pub fn set_piped_input_probed(
+        &self,
+        read: impl FnOnce() -> Option<Vec<u8>> + 'static,
+        ended_empty: impl Fn() -> bool + 'static,
+    ) {
+        *self.piped_input.borrow_mut() = Some(PipedInput::Deferred(
+            Box::new(read),
+            Some(Box::new(ended_empty)),
+        ));
+    }
+
+    /// Whether a batch's piped stdin is waiting and may still offer a value (see
+    /// [`set_piped_input_probed`](Self::set_piped_input_probed)).
+    fn stdin_may_offer(&self) -> bool {
+        self.piped_input
+            .borrow()
+            .as_ref()
+            .is_some_and(PipedInput::may_offer)
     }
 
     /// Provide a one-shot piped-stdin payload for a batch run: a content-less `sink <iri>` then
@@ -1397,7 +1461,7 @@ impl Engine {
         // argument — a bare content write (the common case) skips it — or a `delete`
         // might take the batch's piped stdin, which only a Delete that DECLARES `content`
         // does (see `delete_takes_content`).
-        let stdin_for_delete = verb == Verb::Delete && self.piped_input.borrow().is_some();
+        let stdin_for_delete = verb == Verb::Delete && self.stdin_may_offer();
         let description = if split_first_word(tail).0.contains('=') || stdin_for_delete {
             self.describe_struct(&iri).await
         } else {
@@ -1436,13 +1500,10 @@ impl Engine {
             // Take FIRST, then read: a deferred reader may block, and holding the
             // RefCell borrow across that is a deadlock waiting to happen.
             let piped = self.piped_input.borrow_mut().take();
-            match piped {
-                Some(PipedInput::Ready(bytes)) => bytes,
-                Some(PipedInput::Deferred(read)) => match read() {
-                    Some(bytes) => bytes,
-                    // An idle stdin: no content at all (see `set_piped_input_polled`).
-                    None => return Ok(request),
-                },
+            match piped.map(PipedInput::read) {
+                Some(Some(bytes)) => bytes,
+                // An idle stdin: no content at all (see `set_piped_input_polled`).
+                Some(None) => return Ok(request),
                 None => Vec::new(),
             }
         } else if tail.is_empty() && stdin_for_delete && delete_takes_content(description.as_ref())
@@ -1454,11 +1515,7 @@ impl Engine {
             // costs nothing (the ledger #1088 hazard). An idle stdin sends what a delete
             // without one always sent.
             let piped = self.piped_input.borrow_mut().take();
-            match piped {
-                Some(PipedInput::Ready(bytes)) => bytes,
-                Some(PipedInput::Deferred(read)) => read().unwrap_or_default(),
-                None => Vec::new(),
-            }
+            piped.and_then(PipedInput::read).unwrap_or_default()
         } else if verb == Verb::Sink {
             // The NARROW quote rule (ledger #1069): a remainder that is one quoted token is
             // unquoted exactly as `content="…"` is; anything else is verbatim.
@@ -1490,8 +1547,9 @@ impl Engine {
         // The contract is only needed to recognise named arguments and route the
         // value; a bare `source <iri>` (no args, no pipe) skips the lookup — unless a
         // batch's piped stdin is waiting, which may be this stage's value (see
-        // `stdin_for_the_required_argument`).
-        let stdin_waiting = incoming.is_none() && self.piped_input.borrow().is_some();
+        // `stdin_for_the_required_argument`). A stdin KNOWN to be empty is not waiting
+        // (ledger #1305): it can fill nothing, so its contract is not worth fetching.
+        let stdin_waiting = incoming.is_none() && self.stdin_may_offer();
         let description = if !args.is_empty() || incoming.is_some() || stdin_waiting {
             self.describe_struct(&iri).await
         } else {
@@ -1588,10 +1646,7 @@ impl Engine {
         // Take FIRST, then read: a deferred reader may block, and holding the RefCell
         // borrow across that is a deadlock waiting to happen (as in `write_request`).
         let piped = self.piped_input.borrow_mut().take();
-        match piped? {
-            PipedInput::Ready(bytes) => Some(bytes),
-            PipedInput::Deferred(read) => read(),
-        }
+        piped?.read()
     }
 
     /// Build the `Sink` [`Request`] for a `sink <iri> [key=value …]` pipeline
@@ -3737,6 +3792,122 @@ mod tests {
         assert!(!read.get(), "no stage needed stdin, so nothing read it");
     }
 
+    /// Counts the Meta requests an engine issues through it: its contract fetches. The
+    /// kernel answers on another thread, as the #1166 test's peer does, so its `block_on`
+    /// never nests inside the engine's.
+    struct MetaCounting(Arc<Kernel>, Arc<std::sync::atomic::AtomicUsize>);
+    impl MetaCounting {
+        fn engine(kernel: Kernel) -> (Engine, Arc<std::sync::atomic::AtomicUsize>) {
+            let metas = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Engine::new(MetaCounting(Arc::new(kernel), Arc::clone(&metas))),
+                metas,
+            )
+        }
+    }
+    impl Resolver for MetaCounting {
+        fn issue(
+            &self,
+            request: Request,
+        ) -> Result<(Representation, ikigai_resolve::CacheStatus), ikigai_core::Error> {
+            if request.verb == Verb::Meta {
+                self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            let kernel = Arc::clone(&self.0);
+            std::thread::spawn(move || kernel.issue(request))
+                .join()
+                .expect("the kernel thread")
+        }
+        fn is_cached(&self, _: &Request, _: &Capability) -> bool {
+            false
+        }
+        fn entries(&self) -> Option<Vec<ikigai_core::SpaceEntry>> {
+            None
+        }
+    }
+
+    /// ledger #1305: a batch whose stdin is KNOWN to be empty (`/dev/null`, a closed empty
+    /// pipe) fetches no contract for stdin's sake. Before, every bare `source` fetched (and
+    /// the kernel cached) its target's Meta in case stdin should fill an argument, so a
+    /// scripted `-c` cached rows an interactive session never makes. The probe is asked, the
+    /// reader is never run, and a stdin that may still offer bytes is consulted exactly as
+    /// before.
+    #[test]
+    fn a_known_empty_stdin_fetches_no_contract() {
+        use std::rc::Rc;
+        use std::sync::atomic::Ordering;
+
+        let (engine, metas) = MetaCounting::engine(select_kernel());
+        let run = |cmd: &str| match engine.eval(cmd) {
+            Action::Output(entry) => entry.result,
+            _ => panic!("expected Action::Output"),
+        };
+        let read = Rc::new(std::cell::Cell::new(false));
+
+        // Known empty: a bare `source` fetches nothing and reads nothing, and the stage that
+        // needed a value goes without one, exactly as at an interactive prompt.
+        let flag = Rc::clone(&read);
+        engine.set_piped_input_probed(
+            move || {
+                flag.set(true);
+                Some(Vec::new())
+            },
+            || true,
+        );
+        assert_eq!(run("source urn:test:lenient").unwrap(), "note=none");
+        // A required argument with no value is refused, as it is at the prompt.
+        assert!(run("source urn:test:upper").is_err());
+        assert_eq!(
+            metas.load(Ordering::SeqCst),
+            0,
+            "no contract for stdin's sake"
+        );
+        // A stage with arguments still fetches the contract (it needs it to name them), but
+        // an empty stdin fills nothing there either.
+        assert_eq!(
+            run("source urn:test:select graph=g").unwrap(),
+            "graph=g query=-"
+        );
+        assert_eq!(metas.load(Ordering::SeqCst), 1);
+        assert!(!read.get(), "an empty stdin is never read by a source");
+
+        // A stdin that may still offer bytes is consulted as before: the bare `source`
+        // fetches its contract and the one required argument takes the value.
+        metas.store(0, Ordering::SeqCst);
+        engine.set_piped_input_probed(|| Some(b"hi".to_vec()), || false);
+        assert_eq!(run("source urn:test:upper").unwrap(), "HI");
+        assert_eq!(metas.load(Ordering::SeqCst), 1);
+
+        // A reader with no probe cannot be asked, so it is treated as possibly offering.
+        metas.store(0, Ordering::SeqCst);
+        engine.set_piped_input_polled(|| None);
+        assert_eq!(run("source urn:test:lenient").unwrap(), "note=none");
+        assert_eq!(
+            metas.load(Ordering::SeqCst),
+            1,
+            "unprobed: fetched as before"
+        );
+    }
+
+    /// The delete half of ledger #1305: a bare `delete` on a known-empty stdin fetches no
+    /// contract and sends what it always sent (an empty body); one whose stdin has bytes
+    /// still fetches, and takes them.
+    #[test]
+    fn a_known_empty_stdin_fetches_no_contract_for_a_delete() {
+        use std::sync::atomic::Ordering;
+        let (engine, metas) = MetaCounting::engine(delete_probe_kernel());
+        let run = |cmd: &str| match engine.eval(cmd) {
+            Action::Output(entry) => entry.result.unwrap(),
+            _ => panic!("expected Action::Output"),
+        };
+        engine.set_piped_input_probed(|| Some(Vec::new()), || true);
+        assert_eq!(run("delete urn:claim"), "content:");
+        assert_eq!(metas.load(Ordering::SeqCst), 0);
+        engine.set_piped_input_probed(|| Some(b"note".to_vec()), || false);
+        assert_eq!(run("delete urn:claim"), "content:note");
+        assert_eq!(metas.load(Ordering::SeqCst), 1);
+    }
+
     /// ledger #1272: `printf q | ikigai --mount "urn:gk:=…" -c 'source urn:gk:nl:sparql:check
     /// focus=ledger'` refused "missing required argument content". The contract DID cross the
     /// mount; what the routing rule missed is that `nl:sparql:check` declares its inputs on a
@@ -3869,6 +4040,11 @@ mod tests {
     /// note, as the ledger's claim does), `urn:plain` declares no body at all. Each answers
     /// what `content` it received.
     fn delete_probe_engine() -> Engine {
+        Engine::new(delete_probe_kernel())
+    }
+
+    /// The kernel behind [`delete_probe_engine`].
+    fn delete_probe_kernel() -> Kernel {
         use ikigai_core::ActionSpec;
         let probe = |id: &'static str| {
             FnEndpoint::new(id, |inv: &Invocation<'_>| {
@@ -3894,14 +4070,14 @@ mod tests {
                 .verb(Verb::Delete)
                 .input(ArgSpec::new("item").summary("the item")),
         );
-        Engine::new(Kernel::with_meta_renderer(
+        Kernel::with_meta_renderer(
             Arc::new(
                 EndpointSpace::new()
                     .bind(Exact::new("urn:claim"), claim)
                     .bind(Exact::new("urn:plain"), plain),
             ),
             Arc::new(JsonRenderer),
-        ))
+        )
     }
 
     /// ledger #1230: `printf note | ikigai -c "delete urn:iki:ledger:claim item=N"` sent the
