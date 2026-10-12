@@ -27,7 +27,11 @@
 //!   capability derived from its identity. A public default (or a fixed `--cap` ceiling that
 //!   narrows the edge); a per-user capability (magic-link / passkey) fills the same seam later.
 //! - **typed error → status**: `Denied`→403, `NotFound`/`Unresolved`→404, invalid/missing
-//!   arg→400, `Conflict`→409, transient→503, else 500.
+//!   arg→400, `Conflict`→409, transient→503, else 500. The body is the message as
+//!   `text/plain`, or a typed JSON object (see [`error_json`]) when [`EdgeConfig::error_body`]
+//!   asks for [`ErrorBody::Json`].
+//! - **a write's answer**: a Sink or Delete whose endpoint answers with a representation is
+//!   `200` with it (a take returns what it took); an empty answer is `204`.
 //! - **server push**: with [`EdgeConfig::push`] set, one `GET` of the push path holds an
 //!   event stream open and tells the page when a golden thread its reads rest on is cut —
 //!   see [`push`].
@@ -351,6 +355,84 @@ pub struct EdgeConfig {
     /// thread its reads rest on is cut. `None` (the default) serves no stream, and the path is
     /// routed like any other. See [`push`].
     pub push: Option<PushConfig>,
+    /// The body a typed kernel error is answered with. [`ErrorBody::Text`] (the default) is
+    /// the error's message as `text/plain`, exactly as before the option existed;
+    /// [`ErrorBody::Json`] is the typed object [`error_json`] renders, as `application/json`.
+    /// The status is the same either way. Refusals the edge makes on its own (`405`, `406`,
+    /// `413`, a strict route variable's `400`) carry no kernel error and stay `text/plain`.
+    pub error_body: ErrorBody,
+}
+
+/// How a typed kernel error is rendered into a response body. See [`EdgeConfig::error_body`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ErrorBody {
+    /// The error's message, as `text/plain; charset=utf-8`.
+    #[default]
+    Text,
+    /// The typed object of [`error_json`], as `application/json`.
+    Json,
+}
+
+/// A typed kernel error as the JSON object [`ErrorBody::Json`] answers with.
+///
+/// Always `kind` (core's [`Error::kind`](ikigai_core::Error::kind), one stable word) and
+/// `message` (the error's display text, the same string the `text/plain` body carries), plus
+/// the fields the variant itself carries, under these names:
+///
+/// | `kind`             | extra fields       |
+/// |--------------------|--------------------|
+/// | `invalid-argument` | `name`, `detail`   |
+/// | `missing-argument` | `name`             |
+/// | `unresolved`       | `target`           |
+/// | `depth-exceeded`   | `depth`, `target`  |
+///
+/// Every other kind carries only its message. A variant core adds later renders with its
+/// own `kind` and `message` and no extra fields until this table names them.
+///
+/// ```
+/// use ikigai_core::{Error, Iri};
+/// use ikigai_web::error_json;
+///
+/// let invalid = Error::InvalidArgument { name: "tuple".into(), detail: "not a name".into() };
+/// assert_eq!(
+///     error_json(&invalid),
+///     r#"{"kind":"invalid-argument","message":"invalid argument `tuple`: not a name","name":"tuple","detail":"not a name"}"#
+/// );
+/// assert_eq!(
+///     error_json(&Error::NotFound("no tuple z yet".into())),
+///     r#"{"kind":"not-found","message":"not found: no tuple z yet"}"#
+/// );
+/// let deep = Error::DepthExceeded { depth: 65, target: Iri::parse("urn:x").unwrap() };
+/// assert_eq!(
+///     error_json(&deep),
+///     r#"{"kind":"depth-exceeded","message":"nesting budget exceeded: sub-request for urn:x would run at depth 65","depth":65,"target":"urn:x"}"#
+/// );
+/// ```
+pub fn error_json(e: &ikigai_core::Error) -> String {
+    use ikigai_core::Error;
+    use serde_json::{Map, Value};
+    let mut body = Map::new();
+    body.insert("kind".into(), Value::from(e.kind()));
+    body.insert("message".into(), Value::from(e.to_string()));
+    match e {
+        Error::InvalidArgument { name, detail } => {
+            body.insert("name".into(), Value::from(name.as_str()));
+            body.insert("detail".into(), Value::from(detail.as_str()));
+        }
+        Error::MissingArgument(name) => {
+            body.insert("name".into(), Value::from(name.as_str()));
+        }
+        Error::Unresolved(target) => {
+            body.insert("target".into(), Value::from(target.as_str()));
+        }
+        Error::DepthExceeded { depth, target } => {
+            body.insert("depth".into(), Value::from(*depth));
+            body.insert("target".into(), Value::from(target.as_str()));
+        }
+        _ => {}
+    }
+    Value::Object(body).to_string()
 }
 
 /// A shared, swappable [`RouteTable`] for hot-reload. The server reads the current table per
@@ -388,6 +470,7 @@ impl Default for EdgeConfig {
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             push: None,
+            error_body: ErrorBody::Text,
         }
     }
 }
@@ -620,11 +703,15 @@ struct Shared {
     /// The live route table read per request — the config's `live_routes` handle, or a
     /// fresh wrap of its static `routes`. Reading is a cheap `Arc` clone.
     routes: LiveRoutes,
-    /// IRIs deleted through this server, with when — a resource we already deleted
-    /// answers a repeat DELETE with 204 (idempotent) rather than 404, for a bounded
-    /// window. In-process only (lost on restart); a persistent ledger is a later step.
-    tombstones: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    /// DELETE requests that succeeded through this server, with when — a repeat of one
+    /// answers 204 (idempotent) rather than 404, for a bounded window. Keyed on the whole
+    /// request (see [`tombstone_key`]). In-process only (lost on restart); a persistent
+    /// ledger is a later step.
+    tombstones: std::sync::Mutex<std::collections::HashMap<TombstoneKey, std::time::Instant>>,
 }
+
+/// A DELETE tombstone's key: the target IRI and the query arguments, ordered by name.
+type TombstoneKey = (String, Vec<(String, String)>);
 
 /// How long a tombstone makes a repeat DELETE idempotent (204) before the resource
 /// reverts to reporting 404.
@@ -992,6 +1079,7 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
         return Resp::text(404, "Not Found", "no route");
     }
     let kernel = &shared.kernel;
+    let config = &shared.config;
     // A matched route supplies the target IRI (from its template); otherwise the mechanical
     // `/noun/partition/key` → `urn:` default.
     let iri_str = match matched.map(|m| &m.iri) {
@@ -1081,21 +1169,8 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
         }
         Negotiated::NotAcceptable => return not_acceptable(&faces, explicit, req),
     }
-    for (k, v) in &req.query {
-        // `as`/`content` are the adapter's own (`as` was negotiated above). On a write, so
-        // are the provenance names (`received`, `client`, `principal`): the transport
-        // supplies them below, and a submitter must not be able to forge an origin by
-        // appending `?client=…` to the URL, nor an identity by appending `?principal=…`.
-        // `principal` is reserved on a READ as well (ledger #879): a read carries none, and
-        // a host that reads the stamped principal off a request must never find a
-        // submitter's there.
-        let reserved = k == "as"
-            || k == "content"
-            || k == "principal"
-            || (verb.is_mutating() && is_provenance(k));
-        if !reserved {
-            request = request.with_arg(k.clone(), ArgRef::Inline(v.clone().into_bytes()));
-        }
+    for (k, v) in forwarded_query(req, verb) {
+        request = request.with_arg(k.to_string(), ArgRef::Inline(v.as_bytes().to_vec()));
     }
     if verb == Verb::Sink {
         request = request.with_arg("content", ArgRef::Inline(req.body.clone()));
@@ -1133,7 +1208,7 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
     // guard for Sink and a conditional guard for Delete. Failing → 412 (or 403 if the cap
     // can't even read to check). Reads carry no precondition here (304 is handled below).
     if verb.is_mutating() && has_precondition(req) {
-        if let Some(resp) = check_write_precondition(kernel, &iri, &cap, req).await {
+        if let Some(resp) = check_write_precondition(config, kernel, &iri, &cap, req).await {
             return resp;
         }
     }
@@ -1141,7 +1216,7 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
     // PATCH is read-modify-write: the request Content-Type selects a patch strategy from
     // the registry, which transforms the current representation before it is Sunk.
     if req.method == "PATCH" {
-        return apply_patch(kernel, &iri, &cap, req).await;
+        return apply_patch(config, kernel, &iri, &cap, req).await;
     }
 
     match kernel.issue(request, &cap).await {
@@ -1167,20 +1242,20 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
             read_resp(req, repr, freshness, vary)
         }
         Ok(repr) if verb == Verb::Delete => {
-            record_tombstone(shared, &iri_str);
+            record_tombstone(shared, tombstone_key(&iri_str, req));
             write_resp(verb, repr)
         }
         Ok(repr) => write_resp(verb, repr),
         // A DELETE of an already-absent resource is idempotent (204) within the tombstone
-        // window; otherwise it's a genuine 404.
-        Err(ikigai_core::Error::NotFound(_)) if verb == Verb::Delete => {
-            if tombstoned(shared, &iri_str) {
+        // window; otherwise it's a genuine 404, carrying the endpoint's own message.
+        Err(e @ ikigai_core::Error::NotFound(_)) if verb == Verb::Delete => {
+            if tombstoned(shared, &tombstone_key(&iri_str, req)) {
                 Resp::status(204, "No Content")
             } else {
-                Resp::text(404, "Not Found", "not found")
+                error_resp(config, &e)
             }
         }
-        Err(e) => error_resp(&e),
+        Err(e) => error_resp(config, &e),
     }
 }
 
@@ -1271,7 +1346,13 @@ fn patch_strategy(content_type: &str) -> Option<PatchStrategy> {
 /// PATCH = read-modify-write. Select a strategy by `Content-Type` (unknown → 415), Source
 /// the current representation (absent → 404, denied → 403), apply the patch (malformed →
 /// 422), and Sink the result — returning it with a fresh `ETag` for chained updates.
-async fn apply_patch(kernel: &Kernel, iri: &Iri, cap: &Capability, req: &HttpRequest) -> Resp {
+async fn apply_patch(
+    config: &EdgeConfig,
+    kernel: &Kernel,
+    iri: &Iri,
+    cap: &Capability,
+    req: &HttpRequest,
+) -> Resp {
     let ct = req
         .header("content-type")
         .unwrap_or("")
@@ -1294,7 +1375,7 @@ async fn apply_patch(kernel: &Kernel, iri: &Iri, cap: &Capability, req: &HttpReq
         .await
     {
         Ok(repr) => repr,
-        Err(e) => return error_resp(&e), // NotFound → 404, Denied → 403
+        Err(e) => return error_resp(config, &e), // NotFound → 404, Denied → 403
     };
     let patched = match strategy(&current.bytes, &req.body) {
         Ok(bytes) => bytes,
@@ -1317,7 +1398,7 @@ async fn apply_patch(kernel: &Kernel, iri: &Iri, cap: &Capability, req: &HttpReq
                 ..Resp::status(200, "OK")
             }
         }
-        Err(e) => error_resp(&e),
+        Err(e) => error_resp(config, &e),
     }
 }
 
@@ -1368,6 +1449,7 @@ fn merge_json(target: &mut serde_json::Value, patch: &serde_json::Value) {
 /// `Source` under the same cap). Returns `Some(resp)` to short-circuit (412/403), or
 /// `None` if the precondition holds and the write should proceed.
 async fn check_write_precondition(
+    config: &EdgeConfig,
     kernel: &Kernel,
     iri: &Iri,
     cap: &Capability,
@@ -1382,7 +1464,7 @@ async fn check_write_precondition(
         Err(ikigai_core::Error::NotFound(_)) => None,
         // Can't read to verify (denied) — surface that rather than guessing.
         Err(ikigai_core::Error::Denied(m)) => {
-            return Some(error_resp(&ikigai_core::Error::Denied(m)))
+            return Some(error_resp(config, &ikigai_core::Error::Denied(m)))
         }
         // Any other read failure: treat as "can't confirm existence" → absent.
         Err(_) => None,
@@ -1432,26 +1514,69 @@ fn etag_list_contains(header: &str, etag: &str, compare: Compare) -> bool {
     })
 }
 
-/// Record that we deleted `iri`, so a repeat DELETE is idempotent for a bounded window.
-fn record_tombstone(shared: &Shared, iri: &str) {
+/// The query arguments a request hands the kernel, in the order the client sent them.
+///
+/// `as`/`content` are the adapter's own (`as` is negotiated separately). On a write, so are
+/// the provenance names (`received`, `client`, `principal`): the transport supplies them, and
+/// a submitter must not be able to forge an origin by appending `?client=…` to the URL, nor an
+/// identity by appending `?principal=…`. `principal` is reserved on a READ as well (ledger
+/// #879): a read carries none, and a host that reads the stamped principal off a request must
+/// never find a submitter's there.
+fn forwarded_query(req: &HttpRequest, verb: Verb) -> impl Iterator<Item = (&str, &str)> {
+    req.query
+        .iter()
+        .filter(move |(k, _)| {
+            let reserved = k == "as"
+                || k == "content"
+                || k == "principal"
+                || (verb.is_mutating() && is_provenance(k));
+            !reserved
+        })
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+}
+
+/// What a DELETE tombstone is keyed on: the target IRI AND the query arguments the kernel was
+/// handed. HTTP names a request's target by its path and its query together, and so does the
+/// endpoint: one path can front many things, chosen by an argument (a take of one item out of
+/// a collection). Keyed on the path alone, one successful delete made every later absent
+/// answer on that path read as `204` for the tombstone's whole window, whatever was asked for.
+/// An argument-free DELETE keys on the IRI alone, exactly as before.
+///
+/// The arguments are ordered by name (a stable sort, so repeats of one name keep the client's
+/// order): the kernel reads arguments by name, so `?a=1&b=2` and `?b=2&a=1` are one request.
+/// `as` and the provenance names are excluded by [`forwarded_query`]: they shape the answer or
+/// record its origin, and never choose what is deleted.
+fn tombstone_key(iri: &str, req: &HttpRequest) -> TombstoneKey {
+    let mut args: Vec<(String, String)> = forwarded_query(req, Verb::Delete)
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    args.sort_by(|a, b| a.0.cmp(&b.0));
+    (iri.to_string(), args)
+}
+
+/// Record that this request deleted something, so its repeat is idempotent for a bounded
+/// window. Expired entries are dropped here: the key now carries the query, so the table
+/// would otherwise keep one entry per distinct successful delete for the life of the process.
+fn record_tombstone(shared: &Shared, key: TombstoneKey) {
     if let Ok(mut t) = shared.tombstones.lock() {
+        t.retain(|_, at| at.elapsed() < TOMBSTONE_TTL);
         // Native-only: `ikigai-web` is the INBOUND HTTP transport — a tokio TcpListener
         // bound to a port — so it has no wasm build. This is the DELETE tombstone's
         // monotonic expiry mark, which must not move when the wall clock does.
         #[allow(clippy::disallowed_methods)]
-        t.insert(iri.to_string(), std::time::Instant::now());
+        t.insert(key, std::time::Instant::now());
     }
 }
 
-/// Whether `iri` has a live (unexpired) tombstone — i.e. we deleted it recently.
-/// Prunes the entry when it has aged past the TTL.
-fn tombstoned(shared: &Shared, iri: &str) -> bool {
+/// Whether this request has a live (unexpired) tombstone — i.e. it deleted something
+/// recently. Prunes the entry when it has aged past the TTL.
+fn tombstoned(shared: &Shared, key: &TombstoneKey) -> bool {
     if let Ok(mut t) = shared.tombstones.lock() {
-        if let Some(at) = t.get(iri) {
+        if let Some(at) = t.get(key) {
             if at.elapsed() < TOMBSTONE_TTL {
                 return true;
             }
-            t.remove(iri);
+            t.remove(key);
         }
     }
     false
@@ -1506,10 +1631,11 @@ fn read_resp(
     }
 }
 
-/// A write response: DELETE, or a Sink returning no body → 204; otherwise 200 with
-/// whatever representation the write produced.
+/// A write response: a Sink or Delete returning no body → 204; otherwise 200 with whatever
+/// representation the write produced. A Delete can answer with one (a take returns the thing
+/// it took), and a 204 would discard it.
 fn write_resp(verb: Verb, repr: ikigai_core::Representation) -> Resp {
-    if verb == Verb::Delete || (verb == Verb::Sink && repr.bytes.is_empty()) {
+    if verb.is_mutating() && repr.bytes.is_empty() {
         return Resp::status(204, "No Content");
     }
     Resp {
@@ -1729,7 +1855,10 @@ fn verb_for_method(method: &str) -> Option<Verb> {
 /// gets. Distinct from **412**, which stays the answer when a precondition the CALLER stated
 /// (`If-Match` / `If-None-Match`) fails; that is checked before the write is attempted, so a
 /// write carrying a failed precondition never reaches the endpoint to conflict at all.
-fn error_resp(e: &ikigai_core::Error) -> Resp {
+///
+/// The body follows [`EdgeConfig::error_body`]: the message as `text/plain` by default, the
+/// typed object of [`error_json`] when the door asked for JSON.
+fn error_resp(config: &EdgeConfig, e: &ikigai_core::Error) -> Resp {
     use ikigai_core::Error;
     let (status, reason) = match e {
         Error::Denied(_) => (403, "Forbidden"),
@@ -1739,7 +1868,14 @@ fn error_resp(e: &ikigai_core::Error) -> Resp {
         _ if e.is_transient() => (503, "Service Unavailable"),
         _ => (500, "Internal Server Error"),
     };
-    Resp::text(status, reason, &format!("{e}"))
+    match config.error_body {
+        ErrorBody::Json => Resp {
+            content_type: "application/json".to_string(),
+            body: error_json(e).into_bytes(),
+            ..Resp::status(status, reason)
+        },
+        ErrorBody::Text => Resp::text(status, reason, &format!("{e}")),
+    }
 }
 
 /// Layer the edge policy onto every response: security headers, and CORS headers when the
@@ -2726,6 +2862,34 @@ mod tests {
             Err(Error::NotFound("never here".into()))
         })
         .with_description(Description::new("ghost").verb(Verb::Delete));
+        // A take: one path, many things behind it, chosen by a query argument. A Delete with
+        // `tuple=<name>` removes that one and ANSWERS with it; an absent one is NotFound with
+        // a message naming it; `tuple=bad` is refused as an invalid argument.
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(vec![
+            "a".to_string(),
+            "b".to_string(),
+        ]));
+        let tuples = FnEndpoint::new("tuples", move |inv: &Invocation<'_>| {
+            let name = inv.inline_str("tuple").unwrap_or("").to_string();
+            if name == "bad" {
+                return Err(Error::InvalidArgument {
+                    name: "tuple".into(),
+                    detail: "not a tuple name".into(),
+                });
+            }
+            let mut pending = pending.lock().unwrap();
+            match pending.iter().position(|t| *t == name) {
+                Some(i) => {
+                    pending.remove(i);
+                    Ok(Representation::new(
+                        ReprType::new("text/plain"),
+                        format!("took {name}").into_bytes(),
+                    ))
+                }
+                None => Err(Error::NotFound(format!("no tuple {name} yet"))),
+            }
+        })
+        .with_description(Description::new("tuples").verb(Verb::Delete));
         // A JSON doc for PATCH: Source → {"a":1,"b":2}; Sink echoes the (patched) body.
         let jdoc = FnEndpoint::new("jdoc", |inv: &Invocation<'_>| {
             if inv.request.verb == Verb::Source {
@@ -2920,6 +3084,7 @@ mod tests {
             .bind(Exact::new("urn:test:newdoc"), newdoc)
             .bind(Exact::new("urn:test:vanishing"), vanishing)
             .bind(Exact::new("urn:test:ghost"), ghost)
+            .bind(Exact::new("urn:test:tuples"), tuples)
             .bind(Exact::new("urn:test:jdoc"), jdoc);
         Arc::new(Kernel::new(Arc::new(space)))
     }
@@ -3614,6 +3779,113 @@ mod tests {
         let addr = start().await;
         let resp = roundtrip(addr, "DELETE /test/ghost HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert!(resp.starts_with("HTTP/1.1 404 Not Found"), "got: {resp}");
+    }
+
+    // A DELETE request for `path` (query included).
+    fn delete(path: &str) -> String {
+        format!("DELETE {path} HTTP/1.1\r\nHost: x\r\n\r\n")
+    }
+
+    #[tokio::test]
+    async fn a_delete_that_answers_with_a_representation_is_200_with_it() {
+        let addr = start().await;
+        let resp = roundtrip(addr, &delete("/test/tuples?tuple=a")).await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
+        assert!(resp.contains("Content-Type: text/plain"), "got: {resp}");
+        assert!(
+            resp.ends_with("\r\n\r\ntook a"),
+            "the taken thing is the body: {resp}"
+        );
+        // An empty answer is still 204, as before.
+        let resp = roundtrip(addr, &delete("/test/vanishing")).await;
+        assert!(resp.starts_with("HTTP/1.1 204"), "got: {resp}");
+    }
+
+    #[tokio::test]
+    async fn a_tombstone_covers_the_whole_request_not_just_the_path() {
+        let addr = start().await;
+        let took = roundtrip(addr, &delete("/test/tuples?tuple=a")).await;
+        assert!(took.starts_with("HTTP/1.1 200"), "took: {took}");
+        // The same path with a different query: a NotFound there is a 404, not the 204 the
+        // first request's tombstone would answer if it keyed on the path alone.
+        let other = roundtrip(addr, &delete("/test/tuples?tuple=z")).await;
+        assert!(other.starts_with("HTTP/1.1 404"), "other: {other}");
+        // The repeat of the request that succeeded is still idempotent.
+        let again = roundtrip(addr, &delete("/test/tuples?tuple=a")).await;
+        assert!(again.starts_with("HTTP/1.1 204"), "again: {again}");
+    }
+
+    #[tokio::test]
+    async fn a_delete_not_found_keeps_the_endpoints_message() {
+        let addr = start().await;
+        let resp = roundtrip(addr, &delete("/test/tuples?tuple=z")).await;
+        assert!(resp.starts_with("HTTP/1.1 404 Not Found"), "got: {resp}");
+        assert!(
+            resp.ends_with("\r\n\r\nnot found: no tuple z yet"),
+            "got: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_error_body_is_text_by_default() {
+        let addr = start().await;
+        let resp = roundtrip(addr, &delete("/test/tuples?tuple=bad")).await;
+        assert!(resp.starts_with("HTTP/1.1 400 Bad Request"), "got: {resp}");
+        assert!(resp.contains("Content-Type: text/plain"), "got: {resp}");
+        assert!(
+            resp.ends_with("\r\n\r\ninvalid argument `tuple`: not a tuple name"),
+            "got: {resp}"
+        );
+    }
+
+    fn json_errors() -> EdgeConfig {
+        EdgeConfig {
+            error_body: ErrorBody::Json,
+            ..EdgeConfig::default()
+        }
+    }
+
+    // The body of a raw response, parsed as JSON.
+    fn json_body(resp: &str) -> serde_json::Value {
+        let body = resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("not JSON ({e}): {resp}"))
+    }
+
+    #[tokio::test]
+    async fn a_door_can_answer_errors_as_typed_json() {
+        let addr = start_with(json_errors()).await;
+        // The variant's own fields ride along with its kind and message.
+        let resp = roundtrip(addr, &delete("/test/tuples?tuple=bad")).await;
+        assert!(resp.starts_with("HTTP/1.1 400 Bad Request"), "got: {resp}");
+        assert!(
+            resp.contains("Content-Type: application/json\r\n"),
+            "got: {resp}"
+        );
+        assert_eq!(
+            json_body(&resp),
+            serde_json::json!({
+                "kind": "invalid-argument",
+                "message": "invalid argument `tuple`: not a tuple name",
+                "name": "tuple",
+                "detail": "not a tuple name",
+            })
+        );
+        // A DELETE's NotFound, with the endpoint's message.
+        let resp = roundtrip(addr, &delete("/test/tuples?tuple=z")).await;
+        assert!(resp.starts_with("HTTP/1.1 404 Not Found"), "got: {resp}");
+        assert_eq!(
+            json_body(&resp),
+            serde_json::json!({"kind": "not-found", "message": "not found: no tuple z yet"})
+        );
+        // A path no endpoint is bound to names the target it could not resolve.
+        let resp = get(addr, "/test/nothing-here", None).await;
+        assert!(resp.starts_with("HTTP/1.1 404"), "got: {resp}");
+        let body = json_body(&resp);
+        assert_eq!(body["kind"], "unresolved", "{resp}");
+        assert_eq!(body["target"], "urn:test:nothing-here", "{resp}");
+        // A successful answer is untouched by the option.
+        let resp = roundtrip(addr, &delete("/test/tuples?tuple=a")).await;
+        assert!(resp.ends_with("\r\n\r\ntook a"), "got: {resp}");
     }
 
     // A raw PATCH request with a merge-patch body.
