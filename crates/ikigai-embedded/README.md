@@ -36,7 +36,10 @@ file's `urn:file:<rel>` thread, so the kernel's cached reads — and any composi
 them — recompute, exactly as a kernel-mediated `Sink` already does. Because the
 watcher and the engine share one `Arc<Kernel>`, they share one cache.
 
-Builds for both native and wasm (the browser frontend mounts the same space).
+Native only: it does not build for wasm32, because it pulls `socket2` through `mdns-sd`
+(peer discovery) and `lettre` (SMTP), and `socket2` has no wasm32 target. The wasm face
+is [ikigai-engine](https://crates.io/crates/ikigai-engine) on its own; ikigai-web-demo
+runs a kernel in a browser through it.
 
 ## Reactive spaces: the host decides what fires, and under what
 

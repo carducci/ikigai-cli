@@ -1885,8 +1885,9 @@ fn code_signers_dir() -> std::path::PathBuf {
 /// operator-curated signers directory. Open by design: a public key's job is to
 /// be read (a signed-only ceiling must resolve it just to verify), and the
 /// operator placing a file in this one directory is the act of publication.
-/// Exactly one path segment — separators and traversal are refused, so nothing
-/// outside the directory is nameable.
+/// Exactly one plain file name ([`ikigai_resolve::is_plain_file_name`]): separators,
+/// traversal, drive prefixes and Windows device names are refused on every platform,
+/// so nothing outside the directory is nameable.
 struct CodeKey {
     dir: std::path::PathBuf,
 }
@@ -1897,7 +1898,9 @@ impl Endpoint for CodeKey {
         let name = inv.bindings.get("path").ok_or_else(|| {
             ikigai_core::Error::MissingArgument("path (the key file name)".to_string())
         })?;
-        if name.contains('/') || name.contains("\\") || name.contains("..") || name.is_empty() {
+        // The Windows rule on every platform (ledger #1307): a drive prefix (`C:x`) joined
+        // on Windows REPLACES the directory, so refusing `/`, `\` and `..` was not enough.
+        if !ikigai_resolve::is_plain_file_name(name) {
             return Err(ikigai_core::Error::Endpoint(format!(
                 "urn:codekey: `{name}` is not a plain file name"
             )));
@@ -1927,6 +1930,63 @@ impl Endpoint for CodeKey {
             .verb(Verb::Source)
             .verb(Verb::Meta)
             .output("application/x-pem-file")
+    }
+}
+
+#[cfg(test)]
+mod codekey_tests {
+    use super::*;
+    use futures::executor::block_on;
+    use ikigai_core::{Capability, Kernel, Request};
+
+    fn kernel(dir: &Path) -> Kernel {
+        Kernel::new(Arc::new(EndpointSpace::new().bind(
+            UriTemplate::parse("urn:codekey:{path}").expect("valid template"),
+            CodeKey {
+                dir: dir.to_path_buf(),
+            },
+        )))
+    }
+
+    fn source(kernel: &Kernel, name: &str) -> ikigai_core::Result<Representation> {
+        let iri = Iri::parse(format!("urn:codekey:{name}")).expect("valid IRI");
+        block_on(kernel.issue(Request::new(Verb::Source, iri), &Capability::root()))
+    }
+
+    /// Ledger #1307: on Windows `dir.join("C:x")` REPLACES `dir`, so a key name with a drive
+    /// prefix would read a file outside the signers directory. The name is refused as not a
+    /// plain file name on EVERY platform, before any path is built; on macOS and Linux the
+    /// same names used to reach the disk and come back NotFound.
+    #[test]
+    fn a_key_name_that_would_escape_on_windows_is_refused() {
+        let dir = std::env::temp_dir().join(format!("ikigai-codekey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("signers dir");
+        std::fs::write(dir.join("k1.pub"), b"a public key").expect("write key");
+        let kernel = kernel(&dir);
+
+        assert_eq!(
+            source(&kernel, "k1.pub")
+                .expect("a plain name resolves")
+                .bytes,
+            b"a public key"
+        );
+        for name in [
+            "C:x",
+            "C:k1.pub",
+            "k1.pub:stream",
+            "CON",
+            "nul.pub",
+            "k1.pub.",
+        ] {
+            match source(&kernel, name) {
+                Err(ikigai_core::Error::Endpoint(why)) => {
+                    assert!(why.contains("not a plain file name"), "{name}: {why}")
+                }
+                other => panic!("urn:codekey:{name} must be refused, got {other:?}"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -5333,14 +5393,11 @@ fn tuplespace_verbs() -> ikigai_core::Capability {
 /// host turns it into a filename under [`space_authority_dir`]; a name that could climb out
 /// of that directory must never get that far. Space names come from directory entries today,
 /// which already cannot contain `/`, but that is a property of the caller: this check makes
-/// the non-escalation hold whatever produced the name.
+/// the non-escalation hold whatever produced the name. The rule is the workspace's one rule
+/// for a joined name ([`ikigai_resolve::is_plain_file_name`]), so a drive prefix (`C:x`) or a
+/// Windows device name is refused here too (ledger #1307).
 fn is_single_segment(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name.contains('/')
-        && !name.contains('\\')
-        && !name.contains('\0')
+    ikigai_resolve::is_plain_file_name(name)
 }
 
 /// The HOST's answer to "what does this space's handler run under?", read FRESH from
@@ -9575,7 +9632,17 @@ mod space_authority_tests {
         std::fs::create_dir_all(authority.join("nested")).unwrap();
         std::fs::write(authority.join("nested").join("x"), "urn:cap:escaped\n").unwrap();
 
-        for name in ["../grants", "nested/x", "..", ".", "", "a\0b", "..\\grants"] {
+        for name in [
+            "../grants",
+            "nested/x",
+            "..",
+            ".",
+            "",
+            "a\0b",
+            "..\\grants",
+            "C:grants",
+            "CON",
+        ] {
             assert_eq!(
                 host_space_authority(&authority, name),
                 None,

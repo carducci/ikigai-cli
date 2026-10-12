@@ -2374,7 +2374,8 @@ fn peer_cert_dir(name: &str) -> Result<std::path::PathBuf, String> {
     ikigai_embedded::config::peer_cert_dir_in(&home, name).ok_or_else(|| {
         format!(
             "peer:{name}: not a single path segment, so it names no certificate directory \
-             (a peer name may not be empty or contain `/`, `\\` or NUL)"
+             (a peer name may not be empty, contain `/`, `\\`, `:` or NUL, or end in `.` or \
+             a space)"
         )
     })
 }
@@ -3798,7 +3799,7 @@ mod peer_name_tests {
 
     #[test]
     fn a_peer_name_with_path_segments_is_refused_before_browsing() {
-        for bad in ["plasma/../quic-plasma", "a\\b", ""] {
+        for bad in ["plasma/../quic-plasma", "a\\b", "", "C:x", "plasma."] {
             match resolve_peer(bad, &Certs::default()) {
                 Err(err) => assert!(err.contains("not a single path segment"), "{bad:?}: {err}"),
                 Ok((addr, _)) => panic!("{bad:?} resolved to {addr}"),
