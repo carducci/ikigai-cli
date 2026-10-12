@@ -79,6 +79,13 @@ forbids.
   inputs into the IRI and Argument inputs as request args, **validate** the JSON
   arguments against the typed contract (a non-conforming call returns a SHACL
   report the model repairs from — never a protocol error), then invoke.
+- **Protocol errors per JSON-RPC 2.0 §5.1** — a line that is not JSON gets
+  `-32700 Parse error` under `"id": null`; JSON that is not a valid Request (no
+  `"jsonrpc": "2.0"`, no `method`, an `id` that is not a string, number or null, a
+  scalar, or any array: batching is not part of MCP 2024-11-05, the revision this
+  server implements) gets `-32600 Invalid Request`, under the request's `id` when it
+  is readable. The reason rides in `error.data`. A notification, or a client's own
+  response (a `result` or an `error` with no `method`), is never answered.
 - **Live grant-swap** — the server watches the grants file; edit the active
   grant and it emits `notifications/tools/list_changed`, so a connected client's
   tool list morphs with no restart. (Broadening is safe here: it is the human
