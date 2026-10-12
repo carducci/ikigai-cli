@@ -157,6 +157,13 @@ pub fn parse_tool_name(name: &str) -> Option<(String, Verb)> {
 /// Semantics: allowlist-wins — a `hide` match is dropped; otherwise, if `show` is
 /// non-empty the tool must match it; an empty filter allows everything (the
 /// default, so an unconfigured grant behaves exactly as before).
+///
+/// A pattern containing `:` is an **IRI prefix** instead (`urn:layer:`, `urn:layer:*`),
+/// matched against the IRIs a tool is BOUND at rather than its name, by
+/// [`Self::allows_tool`]: `show = ["urn:layer:", "urn:layers:"]` projects only what lives
+/// under those prefixes, which is how an MCP entry for a mounted peer leaves out the local
+/// kernel's own tools (ledger #1284). A tool name can never contain `:` ([`sanitize_id`]
+/// maps it to `_`), so the two forms cannot be confused.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolFilter {
     /// If non-empty, only tools matching one of these patterns are shown.
@@ -166,13 +173,45 @@ pub struct ToolFilter {
 }
 
 impl ToolFilter {
-    /// Whether `tool_name` (the sanitized `id__verb` form) survives the filter.
+    /// Whether `tool_name` (the sanitized `id__verb` form) survives the filter, by NAME
+    /// alone: an IRI-prefix pattern matches no name, so a filter that shows only IRI
+    /// prefixes allows nothing here. [`Self::allows_tool`] is the full test.
     pub fn allows(&self, tool_name: &str) -> bool {
-        if self.hide.iter().any(|p| pattern_matches(p, tool_name)) {
+        self.allows_tool(tool_name, &[])
+    }
+
+    /// Whether a tool survives the filter, given its name and the IRIs (or URI-template
+    /// patterns) it is bound at. A name pattern is matched against `tool_name`; an
+    /// IRI-prefix pattern (one containing `:`) against each bound IRI, and it matches when
+    /// any of them starts with it.
+    ///
+    /// ```
+    /// use ikigai_mcp::ToolFilter;
+    ///
+    /// let filter = ToolFilter { show: vec!["urn:layer:".into()], hide: vec![] };
+    /// assert!(filter.allows_tool("layer-talk-say__sink", &["urn:layer:talk:say"]));
+    /// assert!(!filter.allows_tool("echo__source", &["urn:demo:echo/{message}"]));
+    /// // `urn:layers:` does not start with `urn:layer:`: a prefix is a string prefix.
+    /// assert!(!filter.allows_tool("layers-feed__source", &["urn:layers:feed"]));
+    /// ```
+    pub fn allows_tool(&self, tool_name: &str, bound_at: &[&str]) -> bool {
+        let hit = |pattern: &String| match iri_prefix(pattern) {
+            Some(prefix) => bound_at.iter().any(|iri| iri.starts_with(prefix)),
+            None => pattern_matches(pattern, tool_name),
+        };
+        if self.hide.iter().any(hit) {
             return false;
         }
-        self.show.is_empty() || self.show.iter().any(|p| pattern_matches(p, tool_name))
+        self.show.is_empty() || self.show.iter().any(hit)
     }
+}
+
+/// The IRI prefix an IRI-form visibility pattern names (a trailing `*` is allowed and
+/// means the same), or `None` for a tool-name pattern. See [`ToolFilter`].
+fn iri_prefix(pattern: &str) -> Option<&str> {
+    pattern
+        .contains(':')
+        .then(|| pattern.strip_suffix('*').unwrap_or(pattern))
 }
 
 /// Match one visibility pattern against a tool name. Three human-friendly forms,

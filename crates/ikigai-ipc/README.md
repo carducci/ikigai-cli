@@ -55,7 +55,12 @@ and the manifold is the resource an agent must read before it can do anything at
 compose: three kernels deep, the outer hop cuts off at exactly the moment the inner hop
 would have answered with its own degraded catalog. A deep federation raises
 `describe.timeout` at the outermost kernel. Carrying a decrementing *budget* on the wire
-is the real answer and is a protocol change.
+is the real answer and is a protocol change. Until then the `ikigai` binary orders the
+common two-hop case by role: a process that SERVES a door gives its own mounts two thirds of
+`describe.timeout` (20 s by default), so when a client asks a host about a silent peer, the
+host's deadline fires inside the client's and its answer names the peer
+(`the peer at quic://… did not describe itself within 20s`) instead of the client blaming
+the host (ledger #1288).
 
 **Unix only** — the crate is empty on other targets (the `ipc` feature is gated out).
 

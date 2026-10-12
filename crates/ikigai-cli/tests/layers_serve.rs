@@ -797,3 +797,164 @@ fn a_layer_door_without_per_identity_grants_refuses_to_start() {
     assert!(banner.contains("per-client workspaces"), "{banner}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// The connection flags a layer CLIENT passes to follow the door as `who`, with ONE mount
+/// flag naming all three prefixes and ONE certificate set after it (ledger #1283). Before,
+/// this took three `--override` flags, each followed by its own `--cert-dir`, since cert flags
+/// attach to the mount they follow.
+fn follow(certs: &Path, who: &str, target: &str) -> Vec<String> {
+    let dir = certs.to_str().unwrap();
+    vec![
+        "--override".into(),
+        format!("urn:layer:,urn:layers:,urn:collab:={target}"),
+        "--cert-dir".into(),
+        dir.into(),
+        "--client-cert".into(),
+        format!("{dir}/clients/{who}.crt"),
+        "--client-key".into(),
+        format!("{dir}/clients/{who}.key"),
+    ]
+}
+
+/// Run the EMBEDDED client (no `--connect`: the door is mounted) with `connection` and one
+/// command, writing `stdin` when given.
+fn through(home: &Path, connection: &[String], command: &str, stdin: Option<&str>) -> Output {
+    let mut args: Vec<&str> = connection.iter().map(String::as_str).collect();
+    args.extend(["--plain", "-c", command]);
+    let mut child = spawn(home, &args)
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the client starts");
+    if let Some(text) = stdin {
+        let mut pipe = child.stdin.take().expect("piped stdin");
+        pipe.write_all(text.as_bytes()).expect("write stdin");
+    }
+    child.wait_with_output().expect("the client ran")
+}
+
+/// ledger #1283: one mount flag naming `urn:layer:,urn:layers:,urn:collab:` and one cert set
+/// reach all three of the door's prefixes: a say under `urn:layer:`, the multiplexed feed
+/// under `urn:layers:` (which `urn:layer:` does not reach) and the collaboration under
+/// `urn:collab:`. The banner shows the line as written.
+#[test]
+fn one_mount_flag_with_one_cert_set_follows_all_three_layer_prefixes() {
+    let home = scratch("follow");
+    let certs = certs(&home);
+    configure_layers(&home, &certs);
+    let (_door, target, _banner) = serve(&home, &certs, &[]);
+    let alice = follow(&certs, "alice", &target);
+
+    let said = through(
+        &home,
+        &alice,
+        "sink urn:layer:talk:say",
+        Some(&message("one connection")),
+    );
+    let entry = ok(said, "alice says, through the mount")
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    assert!(entry.starts_with("urn:layer:talk:entry:"), "{entry}");
+
+    let feed = ok(
+        through(&home, &alice, "source urn:layers:feed after=talk:0", None),
+        "the multiplexed feed, under urn:layers:",
+    );
+    assert!(
+        feed.contains("talk 1 ") && feed.contains(&format!(" say {entry} {ALICE}")),
+        "the say is in the host-wide feed: {feed}"
+    );
+    let collab = ok(
+        through(&home, &alice, "source urn:collab:pair", None),
+        "the collaboration, under urn:collab:",
+    );
+    assert!(
+        collab.contains("talk"),
+        "the manifest names its layers: {collab}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// ledger #1284: `ikigai mcp` for a layer door lists ONLY the door's tools when told
+/// `--show` the three prefixes. Without `--show` the local kernel's capability-free tools
+/// (`about`, `echo`, `sparql-*`, …) are listed beside them.
+#[test]
+fn mcp_shows_only_the_layer_doors_tools_under_its_prefixes() {
+    let home = scratch("mcp");
+    let certs = certs(&home);
+    configure_layers(&home, &certs);
+    let (_door, target, _banner) = serve(&home, &certs, &[]);
+
+    let tools = |show: bool| -> Vec<String> {
+        let mut args: Vec<String> = vec!["mcp".into()];
+        for scope in [
+            "urn:cap:layer:read:talk",
+            "urn:cap:layer:feed:talk",
+            "urn:cap:layer:say:talk",
+            "urn:cap:collab:read:pair",
+        ] {
+            args.extend(["--scope".into(), scope.into()]);
+        }
+        args.extend(follow(&certs, "alice", &target));
+        if show {
+            for prefix in ["urn:layer:", "urn:layers:", "urn:collab:"] {
+                args.extend(["--show".into(), prefix.into()]);
+            }
+        }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut child = spawn(&home, &args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("mcp starts");
+        {
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            writeln!(
+                stdin,
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}}"
+            )
+            .expect("write tools/list");
+        }
+        let out = ok(child.wait_with_output().expect("mcp ran"), "mcp tools/list");
+        let line = out.lines().next().expect("one response");
+        let v: serde_json::Value = serde_json::from_str(line).expect("a JSON-RPC line");
+        v["result"]["tools"]
+            .as_array()
+            .expect("a tools/list result")
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_string))
+            .collect()
+    };
+
+    let shown = tools(true);
+    assert!(
+        shown.contains(&"layer-talk-say__sink".to_string())
+            && shown.contains(&"layers-feed__source".to_string()),
+        "the door's tools are listed: {shown:?}"
+    );
+    for name in &shown {
+        assert!(
+            name.starts_with("layer-") || name.starts_with("layers-") || name.starts_with("collab"),
+            "only the door's tools, not {name}: {shown:?}"
+        );
+    }
+    let everything = tools(false);
+    assert!(
+        everything.iter().any(|n| n == "echo__source"),
+        "without --show the local capability-free tools are listed too: {everything:?}"
+    );
+    assert!(
+        shown.iter().all(|n| everything.contains(n)),
+        "--show only narrows"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}

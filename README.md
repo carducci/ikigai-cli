@@ -331,6 +331,56 @@ ikigai serve quic://0.0.0.0:4434 --name layers
   channels chose it, and the surface gains `+ layers`. `--layers-state` on a door that hosts
   no layer (no `layers/`, or not a QUIC door) is refused rather than ignored.
 
+## Mounting peers, and following a layer door
+
+`--mount <prefix>=<target>` (alias), `--override` (the same names, served remotely) and
+`--prefer` (an override that falls back to the local binding) compose a remote kernel into
+the one this process builds; `<target>` is a Unix socket path, `quic://host:port`, or
+`peer:<name>`. Certificate flags (`--cert-dir`, `--client-cert`, …) belong to the mount
+they FOLLOW, so two peers never share a certificate set. The config home's `mount` lines
+(`mount = "override urn:x:=quic://host:4433 ~/certs/x"`) say the same thing for the whole
+machine.
+
+**One flag, several prefixes, one connection** (ikigai-cli 0.1.53+). A prefix may be a
+comma-separated list: every prefix in it is served through ONE connection with ONE
+certificate set. A layer door's names live under three prefixes (`urn:layers:` does not
+start with `urn:layer:`), so following one is:
+
+```bash
+ikigai --override urn:layer:,urn:layers:,urn:collab:=quic://door.example:4434 \
+       --cert-dir ~/.ikigai/layers-client/me -c 'source urn:layers:feed after=talk:0'
+```
+
+The three-flag form (`--override urn:layer:=… --cert-dir D --override urn:layers:=…
+--cert-dir D …`) still works; it opens three connections. A comma cannot appear inside a
+prefix, and an empty or repeated prefix in a list is refused. ⚠ An older binary reads the
+list as ONE prefix that matches nothing, so the names resolve locally (or not at all).
+
+**Describe deadlines.** A peer's self-description (an enumeration, a `describe`) runs
+under `describe.timeout` (seconds, default 30, `0` for none). A process that SERVES a door
+gives its own mounts two thirds of it, so when a client asks a host about a peer that has
+gone silent, the host's deadline fires first and the answer names the peer, rather than the
+client's deadline blaming the host.
+
+**MCP for a mounted peer.** `ikigai mcp` takes the same mount flags, and `--show <pattern>`
+(repeatable) narrows the tool LIST to what matches: a tool name, or, with a `:`, an IRI prefix
+the tool is bound under. `ikigai mcp --scope … --override urn:layer:,urn:layers:,urn:collab:=…
+--cert-dir … --show urn:layer: --show urn:layers: --show urn:collab:` lists the door's tools
+without the local kernel's capability-free ones (`about`, `echo`, `sparql-*`, …). It is
+relevance, never authority: the capability still decides what may be called.
+
+## The file root
+
+The local file module (`urn:file:*`) is jailed to one directory, first match wins:
+
+1. `--files <dir>`, in any mode that builds a kernel (relative to the working directory;
+   refused beside `--connect`, which builds none);
+2. `files = "<dir>"` in `config.toml`, instance-scoped as `<name>.files` (relative to the
+   config home, `~/` to `$HOME`). ⚠ The config home is shared by every process on the
+   machine, so an unscoped `files` line moves the daemon's, every door's and the REPL's root;
+3. `$IKIGAI_FILES`, kept as a fallback;
+4. `~/.ikigai/workspace`.
+
 ## The HTTP door
 
 `ikigai serve --http <port> --routes <file> --routes-only --cap <scope>…` serves the

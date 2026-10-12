@@ -70,7 +70,8 @@ fn tools_list(kernel: &Kernel, capability: &Capability, filter: &ToolFilter) -> 
     };
     let mut tools = Vec::new();
     for group in tool_groups(kernel.select_actions(&query), true) {
-        if !filter.allows(&group.base) {
+        let bound_at: Vec<&str> = group.rows.iter().map(|m| m.endpoint.as_str()).collect();
+        if !filter.allows_tool(&group.base, &bound_at) {
             continue;
         }
         let rows = &group.rows;
@@ -1068,6 +1069,55 @@ mod tests {
             module_tools(resp["result"]["tools"].as_array().unwrap()).len(),
             0
         );
+    }
+
+    /// ledger #1284: an IRI-prefix `show` pattern projects only the tools bound under it,
+    /// so an entry meant for a mounted namespace leaves out everything else the kernel
+    /// offers, the kernel's own operations included. The authority is unchanged.
+    #[test]
+    fn an_iri_prefix_show_pattern_projects_only_the_tools_bound_under_it() {
+        let k = kernel();
+        let held = Capability::scoped(["urn:cap:demo:echo"]);
+        let names = |filter: &ToolFilter| -> Vec<String> {
+            let resp = handle(
+                &k,
+                &held,
+                filter,
+                &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+            )
+            .unwrap();
+            resp["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|t| t["name"].as_str().map(str::to_string))
+                .collect()
+        };
+        let all = names(&ToolFilter::default());
+        assert!(
+            all.iter().any(|n| n.starts_with("kernel-")),
+            "unfiltered, the kernel's operations are listed beside echo: {all:?}"
+        );
+        for show in ["urn:demo:", "urn:demo:*", "urn:demo:echo"] {
+            let only = ToolFilter {
+                show: vec![show.to_string()],
+                hide: vec![],
+            };
+            assert_eq!(names(&only), ["echo__source"], "show {show}");
+        }
+        let elsewhere = ToolFilter {
+            show: vec!["urn:layer:".to_string()],
+            hide: vec![],
+        };
+        assert!(names(&elsewhere).is_empty(), "nothing is bound there");
+        // An IRI prefix in `hide` drops what is bound under it, and only that.
+        let hidden = ToolFilter {
+            show: vec![],
+            hide: vec!["urn:demo:".to_string()],
+        };
+        let rest = names(&hidden);
+        assert!(!rest.contains(&"echo__source".to_string()), "{rest:?}");
+        assert_eq!(rest.len(), all.len() - 1, "{rest:?}");
     }
 
     #[test]

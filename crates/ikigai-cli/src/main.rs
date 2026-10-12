@@ -112,6 +112,18 @@ usage:
                                is unreachable (transient failures only; denials still propagate)
   <t> = peer:<name>            find that peer on the local network (mDNS) instead of naming an
                                address; needs a pinned cert at <config>/ikigai/quic-<name>/
+  <p> = <p1>,<p2>,…            several prefixes, ONE connection and one cert set: `--override
+                               urn:layer:,urn:layers:,urn:collab:=quic://door:4434 --cert-dir <d>`
+                               follows a layer door (a comma cannot appear inside a prefix)
+  ikigai mcp [--grant <n>] [--scope <s>] [--show <p>] [mounts…]
+                               serve the manifold as MCP tools over stdio; --show (repeatable)
+                               lists only tools matching <p>: a tool name (`echo`, `repo-*`) or,
+                               with a `:`, an IRI prefix they are bound under (`urn:layer:`), so
+                               an entry for a mounted peer leaves the local tools out. It unions
+                               with a --grant's `show` patterns; authority is unchanged
+  ikigai --files <dir>         the local file module's root (urn:file:*), any mode. Else `files`
+                               in config.toml (instance-scoped as <name>.files; relative to the
+                               config home), else $IKIGAI_FILES, else ~/.ikigai/workspace
   ikigai --no-config-mounts    compose ZERO mounts: decline the machine's topology instead of
                                enumerating a replacement. Honoured by every mode that builds a
                                kernel (REPL, -c, --daemon, serve, mcp); refuses to start beside
@@ -231,6 +243,10 @@ enum Mode {
     Mcp {
         grants: Vec<String>,
         scopes: Vec<String>,
+        /// `--show <pattern>` (repeatable): project only the tools matching one of these,
+        /// unioned with the named grants' `show` lists (ledger #1284). An IRI prefix
+        /// (`urn:layer:`) selects by where a tool is bound. Relevance, never authority.
+        shows: Vec<String>,
         /// Remote kernels composed into the projected manifold (`--mount`/`--override`/
         /// `--prefer`, same syntax as the REPL; no flags ⇒ the machine's own topology
         /// from the config home). A federated mount is most useful HERE: the MCP
@@ -285,12 +301,57 @@ struct ReplArgs {
 /// THAT connection. Cert flags following a `--mount` attach to it; cert flags
 /// before any mount form the default set (used by `--connect`, and by a mount
 /// that declares none of its own).
+///
+/// `prefix` may name SEVERAL prefixes, comma-separated (`urn:layer:,urn:layers:=quic://…`):
+/// one connection, one certificate set, every prefix served through it (ledger #1283). See
+/// [`mount_prefixes`]. It is kept as typed so the banner and `urn:host:posture` show the
+/// line the operator wrote.
 #[derive(Clone)]
 struct Mount {
     prefix: String,
     target: String,
     certs: Certs,
     kind: ikigai_embedded::MountKind,
+}
+
+/// The prefixes one mount flag (or `mount =` line) names. `urn:layer:,urn:layers:,urn:collab:`
+/// is three prefixes served by ONE connection with ONE certificate set (ledger #1283): a layer
+/// door's names live under three prefixes, and `urn:layers:` does not start with `urn:layer:`,
+/// so following one took three `--override` flags, each followed by its own `--cert-dir` (the
+/// cert flags attach to the mount they FOLLOW, so one trailing `--cert-dir` left the first two
+/// on the default set, which a layer client does not have).
+///
+/// A comma therefore cannot appear INSIDE a prefix. An empty segment (`urn:a:,,urn:b:`, a
+/// trailing comma) and the same prefix twice are refused rather than read as something: both
+/// are typos, and an empty prefix would match every IRI. A single prefix is passed through
+/// exactly as before, empty included, so no existing form changes meaning.
+fn mount_prefixes(prefix: &str) -> Result<Vec<&str>, String> {
+    if !prefix.contains(',') {
+        return Ok(vec![prefix]);
+    }
+    let parts: Vec<&str> = prefix.split(',').collect();
+    if parts.iter().any(|part| part.is_empty()) {
+        return Err(format!(
+            "`{prefix}` has an empty prefix (a comma separates prefixes; none may be empty)"
+        ));
+    }
+    for (at, part) in parts.iter().enumerate() {
+        if parts[..at].contains(part) {
+            return Err(format!("`{prefix}` names `{part}` twice"));
+        }
+    }
+    Ok(parts)
+}
+
+/// `<prefix>=<target>` split for the flag (or config line) `what`, with the prefixes checked
+/// by [`mount_prefixes`] here, at parse time, so a bad list stops the start with the usage
+/// block rather than at connect.
+fn mount_spec<'a>(what: &str, spec: &'a str) -> Result<(&'a str, &'a str), String> {
+    let (prefix, target) = spec
+        .split_once('=')
+        .ok_or_else(|| format!("{what} expects <prefix>=<target>, got `{spec}`"))?;
+    mount_prefixes(prefix).map_err(|e| format!("{what}: {e}"))?;
+    Ok((prefix, target))
 }
 
 /// What a kernel-building mode was TOLD about its mounts. THREE postures, not two:
@@ -567,6 +628,7 @@ fn version_requested<'a>(mut args: impl Iterator<Item = &'a str>) -> bool {
 /// `--config-home` is taken out FIRST and applied before any mode is parsed, because every
 /// mode reads the config home and some read it while parsing (a `--mount` line's peer cert
 /// directory, the `arrangement` key) — the flag has to be in force before the first read.
+/// `--files` is taken out the same way, for every mode at once.
 fn parse_args() -> Result<Option<Mode>, String> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     // Read only to resolve a relative `--config-home`: a process whose working directory is
@@ -575,6 +637,12 @@ fn parse_args() -> Result<Option<Mode>, String> {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     if let Some(dir) = take_config_home(&mut args, cwd.as_deref(), home.as_deref())? {
         apply_config_home(dir)?;
+    }
+    if let Some(dir) = take_files(&mut args, cwd.as_deref(), home.as_deref())? {
+        #[cfg(feature = "embedded")]
+        ikigai_embedded::set_file_root(dir);
+        #[cfg(not(feature = "embedded"))]
+        let _ = dir;
     }
     parse_argv(args.into_iter())
 }
@@ -594,16 +662,54 @@ fn take_config_home(
     cwd: Option<&std::path::Path>,
     home: Option<&std::path::Path>,
 ) -> Result<Option<std::path::PathBuf>, String> {
+    take_dir_flag(args, "--config-home", "config home", cwd, home)
+}
+
+/// Take every `--files <dir>` (or `--files=<dir>`) out of `args`: the root the local file
+/// module is jailed to (`urn:file:*`), ABSOLUTE by [`take_config_home`]'s rules, in every mode
+/// (ledger #1285). It wins over the config home's `files` key, which wins over the
+/// `IKIGAI_FILES` variable, kept as the last fallback before `~/.ikigai/workspace` (see
+/// `ikigai_embedded::file_root`). Configuration arrives by flag or config home; the variable
+/// was the one channel a layer door's unit still needed an environment for.
+///
+/// A `--connect` client builds no kernel and has no file root of its own, so the flag beside
+/// it would do nothing, and is refused rather than ignored.
+fn take_files(
+    args: &mut Vec<String>,
+    cwd: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let dir = take_dir_flag(args, "--files", "file root", cwd, home)?;
+    if dir.is_some() && args.iter().any(|arg| arg == "--connect") {
+        return Err(
+            "--files names the file root of a kernel this process BUILDS; a --connect client \
+             resolves on another kernel, whose root is its own: drop one of the two"
+                .to_string(),
+        );
+    }
+    Ok(dir)
+}
+
+/// Take every `<flag> <dir>` (or `<flag>=<dir>`) out of `args` and return the directory,
+/// absolute. `what` names the one thing the directory is, for the refusal of two of them.
+fn take_dir_flag(
+    args: &mut Vec<String>,
+    flag: &str,
+    what: &str,
+    cwd: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let assigned = format!("{flag}=");
     let mut found: Option<std::path::PathBuf> = None;
     let mut at = 0;
     while at < args.len() {
-        let value = if args[at] == "--config-home" {
+        let value = if args[at] == flag {
             args.remove(at);
             if at >= args.len() {
-                return Err("--config-home needs <dir>".to_string());
+                return Err(format!("{flag} needs <dir>"));
             }
             args.remove(at)
-        } else if let Some(value) = args[at].strip_prefix("--config-home=") {
+        } else if let Some(value) = args[at].strip_prefix(assigned.as_str()) {
             let value = value.to_string();
             args.remove(at);
             value
@@ -612,15 +718,13 @@ fn take_config_home(
             continue;
         };
         if value.is_empty() || value.starts_with('-') {
-            return Err(format!(
-                "--config-home needs <dir>, and was given `{value}`"
-            ));
+            return Err(format!("{flag} needs <dir>, and was given `{value}`"));
         }
         let typed = match (value.strip_prefix("~/"), home) {
             (Some(rest), Some(home)) => home.join(rest),
             (Some(_), None) => {
                 return Err(format!(
-                    "--config-home `{value}` starts with `~/` and HOME is not set"
+                    "{flag} `{value}` starts with `~/` and HOME is not set"
                 ))
             }
             (None, _) => std::path::PathBuf::from(&value),
@@ -629,7 +733,7 @@ fn take_config_home(
             typed
         } else {
             cwd.ok_or_else(|| {
-                format!("--config-home `{value}` is relative and the working directory is unknown")
+                format!("{flag} `{value}` is relative and the working directory is unknown")
             })?
             .join(typed)
         }
@@ -639,10 +743,10 @@ fn take_config_home(
         match &found {
             Some(prior) if *prior != absolute => {
                 return Err(format!(
-                "--config-home was given twice, as `{}` and `{}`; a process has one config home",
-                prior.display(),
-                absolute.display()
-            ))
+                    "{flag} was given twice, as `{}` and `{}`; a process has one {what}",
+                    prior.display(),
+                    absolute.display()
+                ))
             }
             _ => found = Some(absolute),
         }
@@ -810,9 +914,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 let spec = argv
                     .next()
                     .ok_or_else(|| format!("{arg} needs <prefix>=<target>"))?;
-                let (prefix, target) = spec
-                    .split_once('=')
-                    .ok_or_else(|| format!("{arg} expects <prefix>=<target>, got `{spec}`"))?;
+                let (prefix, target) = mount_spec(&arg, &spec)?;
                 // Cert flags AFTER a mount attach to it (same rule as the REPL), so two
                 // peers with different identities never share a cert set.
                 mounts.flags.push(Mount {
@@ -981,6 +1083,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
         argv.next();
         let mut grants = Vec::new();
         let mut scopes = Vec::new();
+        let mut shows = Vec::new();
         let mut certs = Certs::default();
         let mut mounts = Mounts::default();
         while let Some(arg) = argv.next() {
@@ -1002,9 +1105,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 let spec = argv
                     .next()
                     .ok_or_else(|| format!("{arg} needs <prefix>=<target>"))?;
-                let (prefix, target) = spec
-                    .split_once('=')
-                    .ok_or_else(|| format!("{arg} expects <prefix>=<target>, got `{spec}`"))?;
+                let (prefix, target) = mount_spec(&arg, &spec)?;
                 mounts.flags.push(Mount {
                     prefix: prefix.to_string(),
                     target: target.to_string(),
@@ -1030,6 +1131,11 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                     argv.next()
                         .ok_or_else(|| "--scope needs a capability IRI".to_string())?,
                 ),
+                "--show" => shows.push(argv.next().ok_or_else(|| {
+                    "--show needs a pattern (a tool name, `repo-*`, or an IRI prefix such as \
+                     `urn:layer:`)"
+                        .to_string()
+                })?),
                 other => return Err(format!("unknown argument after `mcp`: {other}")),
             }
         }
@@ -1038,6 +1144,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
         return Ok(Some(Mode::Mcp {
             grants,
             scopes,
+            shows,
             mounts,
         }));
     }
@@ -1086,9 +1193,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 let spec = argv
                     .next()
                     .ok_or_else(|| "--mount needs <prefix>=<socket>".to_string())?;
-                let (prefix, socket) = spec
-                    .split_once('=')
-                    .ok_or_else(|| format!("--mount expects <prefix>=<socket>, got `{spec}`"))?;
+                let (prefix, socket) = mount_spec("--mount", &spec)?;
                 // Inherit whatever cert flags preceded this mount; any that FOLLOW
                 // it refine this mount alone (see the cert_flag dispatch above).
                 repl.mounts.flags.push(Mount {
@@ -1108,9 +1213,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 let spec = argv
                     .next()
                     .ok_or_else(|| "--override needs <prefix>=<target>".to_string())?;
-                let (prefix, target) = spec
-                    .split_once('=')
-                    .ok_or_else(|| format!("--override expects <prefix>=<target>, got `{spec}`"))?;
+                let (prefix, target) = mount_spec("--override", &spec)?;
                 repl.mounts.flags.push(Mount {
                     prefix: prefix.to_string(),
                     target: target.to_string(),
@@ -1135,9 +1238,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 let spec = argv
                     .next()
                     .ok_or_else(|| "--prefer needs <prefix>=<target>".to_string())?;
-                let (prefix, target) = spec
-                    .split_once('=')
-                    .ok_or_else(|| format!("--prefer expects <prefix>=<target>, got `{spec}`"))?;
+                let (prefix, target) = mount_spec("--prefer", &spec)?;
                 repl.mounts.flags.push(Mount {
                     prefix: prefix.to_string(),
                     target: target.to_string(),
@@ -1225,6 +1326,11 @@ fn main() {
         _ => "repl",
     });
 
+    // Before any mount is resolved: a door's mounts describe under the INNER deadline.
+    if matches!(mode, Mode::Serve { .. }) {
+        SERVES_A_DOOR.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     match mode {
         // One line, stdout, exit 0. Nothing is built, nothing is connected: the
         // question "which build am I on?" is asked precisely when the host is
@@ -1237,10 +1343,11 @@ fn main() {
         Mode::Mcp {
             grants,
             scopes,
+            shows,
             mounts,
         } => {
             arm_local_root();
-            mcp(grants, scopes, mounts)
+            mcp(grants, scopes, shows, mounts)
         }
         Mode::CertGenerate { force, dir } => cert_generate(force, dir),
         Mode::CertAddClient {
@@ -1376,7 +1483,7 @@ fn daemon(mounts: Mounts) {
         for mount in mounts {
             // Each mount connects with ITS OWN certificates.
             match resolve_mount(mount) {
-                Ok(spec) => resolved.push(spec),
+                Ok(specs) => resolved.extend(specs),
                 // A mount that will not connect is fatal here: the daemon's whole reason to
                 // hold a mount is the drain, and a silent no-op is the failure mode this is
                 // fixing. Say so and exit rather than park looking healthy. (A --prefer
@@ -1462,12 +1569,16 @@ fn mcp_capability_in(
 }
 
 /// Build the tool-visibility filter from the named grants — the union of their
-/// `show`/`hide` globs. Distinct from [`mcp_capability`]: authority decides what
-/// the session may call; this decides what the projected tool list bothers to
-/// show. Empty ⇒ allow-all. `--scope` unions carry authority only, no visibility.
+/// `show`/`hide` globs — and the `--show` patterns. Distinct from [`mcp_capability`]:
+/// authority decides what the session may call; this decides what the projected tool
+/// list bothers to show. Empty ⇒ allow-all. `--scope` unions carry authority only, no
+/// visibility; `--show` carries visibility only, no authority.
 #[cfg(feature = "embedded")]
-fn mcp_filter(grants: &[String]) -> ikigai_mcp::ToolFilter {
-    let mut filter = ikigai_mcp::ToolFilter::default();
+fn mcp_filter(grants: &[String], shows: &[String]) -> ikigai_mcp::ToolFilter {
+    let mut filter = ikigai_mcp::ToolFilter {
+        show: shows.to_vec(),
+        hide: Vec::new(),
+    };
     for name in grants {
         let (show, hide) = ikigai_embedded::grant_visibility(name);
         filter.show.extend(show);
@@ -1483,7 +1594,7 @@ fn mcp_filter(grants: &[String]) -> ikigai_mcp::ToolFilter {
 /// client's tool list morphs live — no restart. Broadening is safe here because
 /// it is the HUMAN editing the grant (root re-granting), never the client.
 #[cfg(feature = "embedded")]
-fn mcp(grants: Vec<String>, scopes: Vec<String>, mounts: Mounts) {
+fn mcp(grants: Vec<String>, scopes: Vec<String>, shows: Vec<String>, mounts: Mounts) {
     use ikigai_mcp::server::handle;
     use std::io::{BufRead, Write};
     use std::sync::{Arc, Mutex, RwLock};
@@ -1497,7 +1608,7 @@ fn mcp(grants: Vec<String>, scopes: Vec<String>, mounts: Mounts) {
             std::process::exit(2);
         }
     };
-    let filter = Arc::new(RwLock::new(mcp_filter(&grants)));
+    let filter = Arc::new(RwLock::new(mcp_filter(&grants, &shows)));
     match capability.read().expect("cap lock").scopes() {
         None => eprintln!("ikigai mcp: no --grant/--scope — running UNRESTRICTED (root)"),
         Some(s) => eprintln!(
@@ -1556,7 +1667,7 @@ fn mcp(grants: Vec<String>, scopes: Vec<String>, mounts: Mounts) {
         let mut resolved = Vec::new();
         for mount in mounts {
             match resolve_mount(mount) {
-                Ok(spec) => resolved.push(spec),
+                Ok(specs) => resolved.extend(specs),
                 // Fatal, like the daemon: an MCP server that silently dropped a mount
                 // would project a manifold missing the tools the topology promised.
                 // (A --prefer mount never lands here — it connects on demand.)
@@ -1630,7 +1741,7 @@ fn mcp(grants: Vec<String>, scopes: Vec<String>, mounts: Mounts) {
                             ikigai_core::Capability::scoped(Vec::<String>::new())
                         }
                     };
-                    let fresh_filter = mcp_filter(&grants);
+                    let fresh_filter = mcp_filter(&grants, &shows);
                     let cap_changed =
                         fresh_cap.scopes() != capability.read().expect("cap lock").scopes();
                     let filter_changed = fresh_filter != *filter.read().expect("filter lock");
@@ -1684,7 +1795,7 @@ fn mcp(grants: Vec<String>, scopes: Vec<String>, mounts: Mounts) {
 }
 
 #[cfg(not(feature = "embedded"))]
-fn mcp(_grants: Vec<String>, _scopes: Vec<String>, _mounts: Mounts) {
+fn mcp(_grants: Vec<String>, _scopes: Vec<String>, _shows: Vec<String>, _mounts: Mounts) {
     eprintln!("ikigai: mcp requires the embedded feature");
     std::process::exit(2);
 }
@@ -1788,7 +1899,7 @@ fn build_engine(
                 for mount in mounts {
                     // The target (socket path or quic:// URL) is the mount's origin
                     // label, surfaced in the catalog; each mount pins its OWN peer.
-                    resolved.push(resolve_mount(mount)?);
+                    resolved.extend(resolve_mount(mount)?);
                 }
                 if react {
                     ikigai_embedded::reactive_kernel_with_mounts(resolved)
@@ -1919,9 +2030,7 @@ fn mounts_from_config_lines(
             let spec = parts
                 .next()
                 .ok_or_else(|| format!("mount `{line}`: expected <prefix>=<target>"))?;
-            let (prefix, target) = spec.split_once('=').ok_or_else(|| {
-                format!("mount `{line}`: expected <prefix>=<target>, got `{spec}`")
-            })?;
+            let (prefix, target) = mount_spec(&format!("mount `{line}`"), spec)?;
             let mut certs = Certs::default();
             if let Some(dir) = parts.next() {
                 certs.cert_dir = Some(shellexpand_home(dir, home));
@@ -1966,13 +2075,17 @@ fn home_dir() -> std::path::PathBuf {
 /// its namespace, and a silent no-op is the failure mode worth being loud about.
 /// `--prefer` connects on demand — its whole contract is that the peer may be
 /// absent, so an absent peer at startup is normal operation, not an error.
-fn resolve_mount(mount: Mount) -> Result<ikigai_embedded::MountSpec, String> {
+///
+/// One spec PER PREFIX, every one holding the SAME resolver: a mount that names several
+/// prefixes ([`mount_prefixes`]) is one connection serving all of them, not one per prefix.
+fn resolve_mount(mount: Mount) -> Result<Vec<ikigai_embedded::MountSpec>, String> {
     let Mount {
         prefix,
         target,
         certs,
         kind,
     } = mount;
+    let prefixes = mount_prefixes(&prefix)?;
     let resolver: std::sync::Arc<dyn ikigai_resolve::Resolver> =
         if kind == ikigai_embedded::MountKind::Prefer {
             std::sync::Arc::new(LazyResolver {
@@ -1984,12 +2097,23 @@ fn resolve_mount(mount: Mount) -> Result<ikigai_embedded::MountSpec, String> {
         } else {
             connect_mount(&target, &certs, kind)?
         };
-    Ok(ikigai_embedded::MountSpec {
-        prefix,
-        origin: target,
-        resolver,
-        kind,
-    })
+    Ok(prefixes
+        .into_iter()
+        .map(|prefix| ikigai_embedded::MountSpec {
+            prefix: prefix.to_string(),
+            origin: target.clone(),
+            resolver: std::sync::Arc::clone(&resolver),
+            kind,
+        })
+        .collect())
+}
+
+/// [`resolve_mount`] for a mount that names ONE prefix, the tests' common case.
+#[cfg(test)]
+fn resolve_one_mount(mount: Mount) -> Result<ikigai_embedded::MountSpec, String> {
+    let mut specs = resolve_mount(mount)?;
+    assert_eq!(specs.len(), 1, "one prefix, one spec");
+    Ok(specs.remove(0))
 }
 
 /// A mount that connects on FIRST USE, and re-tries on every use after a failure.
@@ -2275,15 +2399,46 @@ fn resolve_peer(name: &str, _certs: &Certs) -> Result<(String, Certs), String> {
 /// Config home, not an environment variable. ⚠ Raise it when the federation is DEEP:
 /// enumeration is transitive and the bound is per hop, so three kernels deep the outermost
 /// one needs headroom for both the hops below it.
+///
+/// ★ **A process that SERVES a door gives its own mounts a SHORTER deadline** than the one
+/// it is reached under ([`inner_describe_deadline`], ledger #1288). With one value at every
+/// hop, a client asking a host about a silent peer hit ITS deadline first, because it started
+/// first, and blamed the wrong process: "no response from the kernel server (it may be hung
+/// or gone)" about a host that was healthy and waiting on its peer, and the race could cost
+/// a second deadline. Inside the client's bound, the host's own deadline fires first and its
+/// answer names the peer. The role, not the transport, decides: a gonk-shaped host is reached
+/// over a socket and mounts over QUIC, an edge is reached over QUIC and may mount either.
 #[cfg(feature = "embedded")]
 fn describe_timeout(default: std::time::Duration) -> Option<std::time::Duration> {
-    match ikigai_embedded::config::get("describe.timeout")
+    let outer = match ikigai_embedded::config::get("describe.timeout")
         .and_then(|v| v.trim().parse::<u64>().ok())
     {
-        Some(0) => None,
-        Some(secs) => Some(std::time::Duration::from_secs(secs)),
-        None => Some(default),
-    }
+        Some(0) => return None,
+        Some(secs) => std::time::Duration::from_secs(secs),
+        None => default,
+    };
+    Some(if SERVES_A_DOOR.load(std::sync::atomic::Ordering::SeqCst) {
+        inner_describe_deadline(outer)
+    } else {
+        outer
+    })
+}
+
+/// Whether this process serves a door (`serve`, any of the three), set once in `main`
+/// before any mount is resolved. What [`describe_timeout`] keys the inner deadline on.
+#[cfg(feature = "embedded")]
+static SERVES_A_DOOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The describe deadline a serving host gives its mounts, from the one its callers use:
+/// two thirds of it (30 s becomes 20 s), so the host answers with the peer's name and a third
+/// of the caller's bound to spare for the answer to travel back. A ratio rather than a fixed
+/// margin so that a raised `describe.timeout`, read by host and client from one config home,
+/// keeps the order. ⚠ Per hop, as the bound always was: three kernels deep, the middle and
+/// the inner host both take two thirds of the same value. The real fix is a budget carried on
+/// the wire and decremented per hop (the `ikigai_ipc::DEFAULT_DESCRIBE_TIMEOUT` note).
+#[cfg(feature = "embedded")]
+fn inner_describe_deadline(outer: std::time::Duration) -> std::time::Duration {
+    outer * 2 / 3
 }
 
 /// The QUIC idle timeout: `quic.timeout` (seconds) in the host config, else the
@@ -2400,7 +2555,9 @@ fn run_repl(engine: Engine, plain: bool, commands: &[String], topology: &[String
         // routes that stdin to the first content-less `sink` — so a secret is piped in, never
         // placed on the command line — or to the first `source` stage left with one REQUIRED
         // argument and no value for it (`cat q.rq | ikigai -c 'source …:graph-select graph=G'`,
-        // ledger #1166). A TTY stdin is left alone (nothing to read, no block).
+        // ledger #1166), or to the first content-less `delete` whose contract declares
+        // `content` (a claim's release note, ledger #1230). A TTY stdin is left alone (nothing
+        // to read, no block).
         #[cfg(not(target_family = "wasm"))]
         {
             use std::io::IsTerminal;
@@ -2474,8 +2631,8 @@ fn read_stdin_unless_idle(grace: std::time::Duration) -> Option<Vec<u8>> {
         Ok(()) => done.recv().ok(),
         Err(_) => {
             eprintln!(
-                "ikigai: nothing arrived on stdin within {}s, so the sink was sent with no \
-                 content (pipe the value in, or name it with content=…)",
+                "ikigai: nothing arrived on stdin within {}s, so the command that asked for it \
+                 was sent without it (pipe the value in, or name it with content=…)",
                 grace.as_secs()
             );
             None
@@ -2681,7 +2838,7 @@ fn serve_quic(
         let composed = mount_posture(&mounts, declined);
         let mut resolved = Vec::new();
         for mount in mounts {
-            resolved.push(resolve_mount(mount)?);
+            resolved.extend(resolve_mount(mount)?);
         }
         // Capability-on-the-wire: every connection's ceiling is minted per-connection
         // from *which* certificate authenticated. The cert IS the credential — the
@@ -2753,8 +2910,8 @@ fn serve_quic(
                  a served connection reaches only {}/<its segment>/… — the file module is \
                  jailed there and refuses everything outside it, capability or not.\n  \
                  write the path RELATIVE to the client's own workspace (`urn:cap:fs:read:notes` \
-                 grants the `notes` it addresses as `urn:file:notes/…`), or point IKIGAI_FILES \
-                 at the tree you meant to serve.",
+                 grants the `notes` it addresses as `urn:file:notes/…`), or point `--files` (or \
+                 `files` in the config home) at the tree you meant to serve.",
                 unaddressable.join("\n  "),
                 file_root.display()
             ));
@@ -3203,7 +3360,7 @@ fn serve_ipc(path: Option<String>, mounts: Mounts) -> ! {
     let mut resolved = Vec::new();
     for mount in mounts {
         match resolve_mount(mount) {
-            Ok(spec) => resolved.push(spec),
+            Ok(specs) => resolved.extend(specs),
             Err(e) => {
                 eprintln!("ikigai: {e}");
                 std::process::exit(2);
@@ -3403,7 +3560,7 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
     let mut resolved = Vec::new();
     for mount in mounts {
         match resolve_mount(mount) {
-            Ok(spec) => resolved.push(spec),
+            Ok(specs) => resolved.extend(specs),
             Err(e) => {
                 eprintln!("ikigai: {e}");
                 std::process::exit(2);
@@ -4075,6 +4232,86 @@ mod mount_cert_tests {
         assert_eq!(mounts[2].certs.cert_dir.as_deref(), Some("/certs/plasma"));
     }
 
+    /// ledger #1283: a layer door's names live under three prefixes. One flag names all
+    /// three, ONE `--cert-dir` after it covers them, and they resolve to one spec per prefix
+    /// over ONE shared resolver, which is one connection.
+    #[test]
+    fn one_mount_flag_serves_several_prefixes_over_one_resolver() {
+        let mounts = mounts_of(&[
+            "--prefer",
+            "urn:layer:,urn:layers:,urn:collab:=quic://127.0.0.1:1",
+            "--cert-dir",
+            "/certs/hub",
+        ]);
+        assert_eq!(mounts.len(), 1, "one flag is one mount");
+        assert_eq!(mounts[0].certs.cert_dir.as_deref(), Some("/certs/hub"));
+        // `--prefer`, so nothing dials: what is under test is the expansion, not a peer.
+        let specs = resolve_mount(mounts[0].clone()).expect("a prefer mount resolves lazily");
+        let prefixes: Vec<&str> = specs.iter().map(|spec| spec.prefix.as_str()).collect();
+        assert_eq!(prefixes, ["urn:layer:", "urn:layers:", "urn:collab:"]);
+        for spec in &specs[1..] {
+            assert!(
+                std::sync::Arc::ptr_eq(&specs[0].resolver, &spec.resolver),
+                "{} shares the first prefix's resolver",
+                spec.prefix
+            );
+            assert_eq!(spec.origin, "quic://127.0.0.1:1");
+            assert_eq!(spec.kind, ikigai_embedded::MountKind::Prefer);
+        }
+    }
+
+    /// A malformed prefix list stops the parse, in every flag and in a config line, rather
+    /// than reading an empty prefix (which would match every IRI) or a doubled one.
+    #[test]
+    fn an_empty_or_doubled_prefix_in_a_list_is_refused() {
+        for spec in [
+            "urn:a:,,urn:b:=quic://h:1",
+            "urn:a:,=quic://h:1",
+            ",urn:a:=quic://h:1",
+            "urn:a:,urn:a:=quic://h:1",
+        ] {
+            for flag in ["--mount", "--override", "--prefer"] {
+                let err = match parse_argv(argv(&[flag, spec]).into_iter()) {
+                    Err(e) => e,
+                    Ok(_) => panic!("{flag} {spec} parsed"),
+                };
+                assert!(
+                    err.contains(flag) && (err.contains("empty") || err.contains("twice")),
+                    "{flag} {spec}: {err}"
+                );
+            }
+            for mode in [&["serve", "/tmp/x.sock"][..], &["mcp"][..]] {
+                let mut args = mode.to_vec();
+                args.extend(["--override", spec]);
+                assert!(parse_argv(argv(&args).into_iter()).is_err(), "{args:?}");
+            }
+            let line = format!("override {spec} ~/certs");
+            assert!(
+                mounts_from_config_lines(vec![line.clone()], std::path::Path::new("/h")).is_err(),
+                "{line}"
+            );
+        }
+        // A single prefix is passed through as before, an empty one included.
+        assert_eq!(mount_prefixes("urn:a:"), Ok(vec!["urn:a:"]));
+        assert_eq!(mount_prefixes(""), Ok(vec![""]));
+    }
+
+    /// The config home's `mount` line takes the same list, with its cert directory.
+    #[test]
+    fn a_config_mount_line_names_several_prefixes() {
+        let mounts = mounts_from_config_lines(
+            vec!["override urn:layer:,urn:layers:=quic://door:4434 ~/certs/hub".to_string()],
+            std::path::Path::new("/home/b"),
+        )
+        .expect("the line parses");
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].prefix, "urn:layer:,urn:layers:");
+        assert_eq!(
+            mounts[0].certs.cert_dir.as_deref(),
+            Some("/home/b/certs/hub")
+        );
+    }
+
     /// The other half of prefer-mount catalog citizenship: `entries()` dials a
     /// peer that has never been used, so `list` shows a prefer-mounted
     /// namespace WITHOUT a prior resolution through it. (Before this, the
@@ -4111,7 +4348,7 @@ mod mount_cert_tests {
             certs: Certs::default(),
             kind: ikigai_embedded::MountKind::Prefer,
         };
-        let spec = resolve_mount(mount).expect("prefer resolves lazily");
+        let spec = resolve_one_mount(mount).expect("prefer resolves lazily");
         let entries = spec
             .resolver
             .entries()
@@ -4175,7 +4412,7 @@ mod mount_cert_tests {
             certs: Certs::default(),
             kind: ikigai_embedded::MountKind::Prefer,
         };
-        let spec = resolve_mount(mount).expect("a prefer mount must not fail at startup");
+        let spec = resolve_one_mount(mount).expect("a prefer mount must not fail at startup");
         assert!(
             spec.resolver.transport().contains("not connected"),
             "transport should say the peer is not connected, got: {}",
@@ -4319,7 +4556,7 @@ mod mount_flag_tests {
     #[test]
     fn a_down_prefer_peer_says_prefer_not_mount() {
         let absent = "/tmp/ikigai-test-absent-peer.sock";
-        let spec = resolve_mount(Mount {
+        let spec = resolve_one_mount(Mount {
             prefix: "urn:repo:".to_string(),
             target: absent.to_string(),
             certs: Certs::default(),
@@ -4517,6 +4754,45 @@ mod config_home_flag_tests {
             take(&["--config-home", "/work/here/cfg", "--config-home=cfg"]).0,
             Ok(Some(PathBuf::from("/work/here/cfg")))
         );
+    }
+
+    fn take_files_from(args: &[&str]) -> (Result<Option<PathBuf>, String>, Vec<String>) {
+        let mut args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let found = take_files(
+            &mut args,
+            Some(Path::new("/work/here")),
+            Some(Path::new("/home/b")),
+        );
+        (found, args)
+    }
+
+    /// ledger #1285: `--files <dir>` in any mode, absolute, out of argv before the mode is
+    /// parsed; twice with two directories is refused, and beside `--connect` (which builds
+    /// no kernel, so has no file root) it is refused rather than ignored.
+    #[test]
+    fn files_is_taken_absolute_from_every_mode() {
+        let (found, rest) = take_files_from(&["serve", "quic://0.0.0.0:4434", "--files", "ws"]);
+        assert_eq!(found, Ok(Some(PathBuf::from("/work/here/ws"))));
+        assert_eq!(rest, ["serve", "quic://0.0.0.0:4434"]);
+        let (found, rest) = take_files_from(&["--files=~/door/ws", "-c", "list"]);
+        assert_eq!(found, Ok(Some(PathBuf::from("/home/b/door/ws"))));
+        assert_eq!(rest, ["-c", "list"]);
+        let (found, _) = take_files_from(&["mcp", "--files", "/abs/ws"]);
+        assert_eq!(found, Ok(Some(PathBuf::from("/abs/ws"))));
+        assert_eq!(take_files_from(&["-c", "list"]).0, Ok(None));
+
+        let twice = take_files_from(&["--files", "/a", "--files", "/b"])
+            .0
+            .unwrap_err();
+        assert!(twice.contains("one file root"), "{twice}");
+        assert!(take_files_from(&["--files"])
+            .0
+            .unwrap_err()
+            .contains("--files needs <dir>"));
+        let connect = take_files_from(&["--connect", "/tmp/s.sock", "--files", "/a"])
+            .0
+            .unwrap_err();
+        assert!(connect.contains("--connect"), "{connect}");
     }
 }
 
@@ -5025,7 +5301,7 @@ mod prefer_mount_capability_tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        let spec = resolve_mount(Mount {
+        let spec = resolve_one_mount(Mount {
             prefix: "urn:peer:".to_string(),
             target: path.display().to_string(),
             certs: Certs::default(),
