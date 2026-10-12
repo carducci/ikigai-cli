@@ -215,3 +215,52 @@ fn an_empty_config_home_says_it_composed_nothing() {
         "nothing was declined — the config home simply had no mount lines: {seen}"
     );
 }
+
+/// Ledger #1381, through the real binary: a mount FLAG's leading `~` is the HOME the process
+/// was started with, as a `mount` line's is. No shell expands a `~` after `=`, so the quoted
+/// spelling below is exactly what reaches the binary. The banner names the expanded path,
+/// which is the path the dial uses.
+#[test]
+fn a_mount_flags_tilde_is_the_processes_home() {
+    let home = scratch("tilde", &[]);
+    let (seen, _) = serve(&home, &["--prefer", "urn:x:=~/iki-np-absent-t.sock"]);
+    let expanded = home.join("iki-np-absent-t.sock");
+    assert!(
+        seen.contains(&format!("mount   prefer urn:x: -> {}", expanded.display())),
+        "the banner must name the expanded path: {seen}"
+    );
+    assert!(
+        !seen.contains("~/iki-np-absent-t.sock"),
+        "the literal `~` must not survive to the banner: {seen}"
+    );
+}
+
+/// The self-mount guard and the dial agree on a `~` flag target: a flag that spells this
+/// process's own socket with `~` is skipped as own, and the door still serves (an eager
+/// `--mount` that reached the dial would have refused to start on the absent socket).
+#[test]
+fn a_tilde_flag_naming_the_own_socket_is_skipped() {
+    let home = scratch("tilde-own", &[]);
+    let (seen, status) = serve(&home, &["--mount", "urn:x:=~/s.sock"]);
+    assert!(
+        seen.contains("targets this process's own serve socket"),
+        "the guard must recognize its own socket through `~`: {seen}"
+    );
+    assert!(
+        seen.contains("serving on"),
+        "it must still serve: {seen} ({status:?})"
+    );
+}
+
+/// Another user's home is refused by name, before anything is dialed, and the refusal names
+/// the flag that was typed.
+#[test]
+fn a_tilde_user_flag_target_refuses_to_start() {
+    let home = scratch("tilde-user", &[]);
+    let (seen, status) = serve(&home, &["--override", "urn:x:=~bob/x.sock"]);
+    assert_eq!(status, Some(2), "a refused topology exits 2: {seen}");
+    assert!(
+        seen.contains("--override `urn:x:=~bob/x.sock`") && seen.contains("another user's home"),
+        "the refusal must name the flag and the rule: {seen}"
+    );
+}

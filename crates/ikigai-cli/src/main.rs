@@ -2079,14 +2079,22 @@ fn build_engine(
 /// it was given became its whole topology (ledger #410).
 #[cfg(feature = "embedded")]
 fn mounts_or_config(mounts: Mounts) -> Result<Vec<Mount>, String> {
-    resolve_mounts(mounts, config_mounts)
+    resolve_mounts(mounts, &home_dir(), config_mounts)
 }
 
 /// [`mounts_or_config`] with the config home's topology as a THUNK, so a test can assert what
 /// the flag actually promises — that declining does not READ the file — instead of only that
 /// the result came back empty, which an absent or unreadable config home produces too.
+///
+/// A mount FLAG's target takes the workspace's one `~` rule here, as a `mount` line's does in
+/// [`mounts_from_config_lines`] (ledger #1381): no shell expands a `~` after `=`, so `--mount
+/// 'urn:x:=~/x.sock'` reaches this process as written. Expanding it HERE, in the one function
+/// every kernel-building door calls, means the self-mount guard, the banner and the dial all
+/// see the same path; before, the guard expanded it and the dial did not. `home` is read once
+/// by the caller, like the config lines' (see [`home_dir`]).
 fn resolve_mounts(
     mounts: Mounts,
+    home: &std::path::Path,
     config: impl FnOnce() -> Result<Vec<Mount>, String>,
 ) -> Result<Vec<Mount>, String> {
     // The backstop for the exclusion: each parse site refuses first (with the usage block),
@@ -2097,7 +2105,22 @@ fn resolve_mounts(
     } else if mounts.flags.is_empty() {
         config()
     } else {
-        Ok(mounts.flags)
+        mounts
+            .flags
+            .into_iter()
+            .map(|mut mount| {
+                mount.target =
+                    ikigai_resolve::expand_home_str(&mount.target, Some(home)).map_err(|e| {
+                        format!(
+                            "{} `{}={}`: {e}",
+                            mount_flag(mount.kind),
+                            mount.prefix,
+                            mount.target
+                        )
+                    })?;
+                Ok(mount)
+            })
+            .collect()
     }
 }
 
@@ -4327,7 +4350,7 @@ mod mount_posture_tests {
             flags: Vec::new(),
             declined: true,
         };
-        let resolved = resolve_mounts(declined, || {
+        let resolved = resolve_mounts(declined, std::path::Path::new("/home/b"), || {
             panic!("--no-config-mounts must not read the config home")
         })
         .expect("declining is not an error");
@@ -4338,7 +4361,7 @@ mod mount_posture_tests {
     /// still inherits the machine: no flags ⇒ the config home's `mount` lines.
     #[test]
     fn no_flags_still_compose_the_machines_topology() {
-        let resolved = resolve_mounts(Mounts::default(), || {
+        let resolved = resolve_mounts(Mounts::default(), std::path::Path::new("/home/b"), || {
             Ok(vec![mount(ikigai_embedded::MountKind::Prefer)])
         })
         .expect("a parsing config home is not an error");
@@ -4353,10 +4376,107 @@ mod mount_posture_tests {
             flags: vec![mount(ikigai_embedded::MountKind::Prefer)],
             declined: false,
         };
-        let resolved = resolve_mounts(flagged, || panic!("flags win wholesale"))
-            .expect("flags are not an error");
+        let resolved = resolve_mounts(flagged, std::path::Path::new("/home/b"), || {
+            panic!("flags win wholesale")
+        })
+        .expect("flags are not an error");
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].prefix, "urn:x:");
+    }
+
+    /// The mount flags a kernel-building mode parsed, for the `~` tests below.
+    fn flag_mounts(args: &[&str]) -> Mounts {
+        match parse_argv(argv(args).into_iter()) {
+            Ok(Some(Mode::Repl(repl))) => repl.mounts,
+            Ok(Some(Mode::Daemon { mounts })) => mounts,
+            Ok(Some(Mode::Serve { mounts, .. })) => mounts,
+            Ok(Some(Mode::Mcp { mounts, .. })) => mounts,
+            other => panic!(
+                "expected a kernel-building mode from {args:?}: {:?}",
+                other.is_ok()
+            ),
+        }
+    }
+
+    /// Ledger #1381: each mount FLAG's target takes the `~` rule a `mount` line takes. No shell
+    /// expands a `~` after `=`, so before this the flag dialed the literal `~/x.sock`. Every
+    /// mode that builds a kernel, all three flags; a target that does not begin with `~` is
+    /// left as written.
+    #[test]
+    fn each_mount_flag_expands_a_leading_tilde() {
+        let home = std::path::Path::new("/home/b");
+        let modes: [&[&str]; 4] = [&[], &["--daemon"], &["serve", "/tmp/s.sock"], &["mcp"]];
+        for mode in modes {
+            for flag in ["--mount", "--override", "--prefer"] {
+                let args: Vec<&str> = mode
+                    .iter()
+                    .copied()
+                    .chain([flag, "urn:x:=~/x.sock", flag, "urn:y:=quic://plasma:4433"])
+                    .collect();
+                let resolved =
+                    resolve_mounts(flag_mounts(&args), home, || panic!("flags win wholesale"))
+                        .unwrap_or_else(|e| panic!("{args:?} must resolve: {e}"));
+                assert_eq!(resolved[0].target, "/home/b/x.sock", "{args:?}");
+                assert_eq!(resolved[1].target, "quic://plasma:4433", "{args:?}");
+            }
+        }
+    }
+
+    /// The config lines' refusals, by name: another user's `~bob/…`, and a `~` with no home
+    /// to expand it against (an unset HOME reaches here as the empty path, see `home_dir`).
+    /// The refusal names the flag the operator typed, not a config line.
+    #[test]
+    fn a_mount_flag_refuses_another_users_home_and_a_missing_home() {
+        for flag in ["--mount", "--override", "--prefer"] {
+            let e = resolve_mounts(
+                flag_mounts(&[flag, "urn:x:=~bob/x.sock"]),
+                std::path::Path::new("/home/b"),
+                || panic!("flags win wholesale"),
+            )
+            .err()
+            .expect("`~bob` must be refused");
+            assert!(
+                e.starts_with(&format!("{flag} `urn:x:=~bob/x.sock`")),
+                "{e}"
+            );
+            assert!(e.contains("another user's home (`~bob`)"), "{e}");
+
+            let e = resolve_mounts(
+                flag_mounts(&[flag, "urn:x:=~/x.sock"]),
+                std::path::Path::new(""),
+                || panic!("flags win wholesale"),
+            )
+            .err()
+            .expect("a `~` with no home must be refused");
+            assert!(e.starts_with(&format!("{flag} `urn:x:=~/x.sock`")), "{e}");
+            assert!(e.contains("HOME is not set"), "{e}");
+        }
+    }
+
+    /// The disagreement ledger #1381 named, closed: `serve`'s self-mount guard always expanded a `~`
+    /// target, the dial did not, so a flag spelling this process's own socket with `~` was
+    /// skipped as own while the same flag pointing elsewhere dialed a literal path. Now the
+    /// target the guard judges IS the target the dial gets.
+    #[cfg(all(feature = "embedded", feature = "ipc", unix))]
+    #[test]
+    fn the_self_mount_guard_and_the_dial_see_one_flag_target() {
+        let home = std::path::Path::new("/home/b");
+        let socket = std::path::Path::new("/home/b/.ikigai/s.sock");
+        for flag in ["--mount", "--override", "--prefer"] {
+            let resolved = resolve_mounts(
+                flag_mounts(&[
+                    "serve",
+                    "/home/b/.ikigai/s.sock",
+                    flag,
+                    "urn:x:=~/.ikigai/s.sock",
+                ]),
+                home,
+                || panic!("flags win wholesale"),
+            )
+            .expect("a `~` flag target resolves");
+            assert_eq!(resolved[0].target, socket.to_str().unwrap(), "{flag}");
+            assert!(is_own_socket(&resolved[0].target, socket, home), "{flag}");
+        }
     }
 
     /// Both postures at once is a STARTUP ERROR naming both flags — in EITHER order on the

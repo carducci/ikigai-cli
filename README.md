@@ -420,11 +420,11 @@ machine.
 names a path expands a leading `~` to the current user's home by one rule: a `mount` line's
 socket and certificate directory (`mount = "prefer urn:x:=~/.ikigai/x.sock"`), `files`,
 `layers.state`, `arrangement`, `browse.root` and `browse.store`, and the `--config-home` and
-`--files` flags. Only `~` and `~/…` are expanded. Another user's `~name/…`, and any `~` while
-`HOME` is unset, stop the start with a message naming the key, rather than becoming a literal
-path. Before 0.1.58 a `mount` line's socket was dialed as the literal `~/x.sock`. ⚠ A
-`--mount`/`--override`/`--prefer` FLAG's target is not expanded, and no shell expands a `~`
-that follows `=`, so write that path out in full on the command line.
+`--files` flags. Since 0.1.59 the `--mount`/`--override`/`--prefer` flags' targets do too, so
+`--mount 'urn:x:=~/x.sock'` works even though no shell expands a `~` that follows `=`. Only `~`
+and `~/…` are expanded. Another user's `~name/…`, and any `~` while `HOME` is unset, stop the
+start with a message naming the key or flag, rather than becoming a literal path. Before 0.1.58
+a `mount` line's socket was dialed as the literal `~/x.sock`, and before 0.1.59 a mount flag's.
 
 **One flag, several prefixes, one connection** (ikigai-cli 0.1.53+). A prefix may be a
 comma-separated list: every prefix in it is served through ONE connection with ONE

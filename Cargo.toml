@@ -1546,8 +1546,14 @@ ikigai-ledger = "0.11.0"
 # the `tuples` read and take, `application/json` on the lists, `say` and `out`), and an `as=` a
 # resource does not offer is refused rather than answered in another face. The front forwards `as`
 # and defaults it to those faces, so a participant needs only an HTTP client and a JSON parser;
-# 0.2.6 answered a take in Turtle only. `"0.2.7"` is `<0.3.0`.
-ikigai-layers = "0.2.7"
+# 0.2.6 answered a take in Turtle only.
+# ⚠ …and 0.2.8 is the gateway's ARRAY floor (ledger #1377, ikigai-rs/ikigai-layers PR 20): its
+# shipped context (`ikigai_layers::gateway::CONTEXT`) declares a request's `argument` `@set`, so
+# the JSON-LD face gives it as an array even with one value; 0.2.7's compacted one argument to a
+# bare string. Participants of a gateway between kernels rely on the array. `tests/layers_https.rs`
+# installs that context into its config home; a deployed config home carries its OWN copy of the
+# file, which is what a running host reads. `"0.2.8"` is `<0.3.0`.
+ikigai-layers = "0.2.8"
 # ── Intra-workspace siblings: LOCKSTEP pins, not floors ───────────────────────
 # The seventeen members that take `version.workspace = true` are released TOGETHER, at one
 # version, always. So every sibling pin below states the CURRENT workspace version rather
