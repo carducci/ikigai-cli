@@ -21,34 +21,182 @@ use crate::{action_to_tool, parse_tool_name, ToolFilter};
 /// The MCP protocol revision this server implements against.
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
-/// Dispatch one JSON-RPC message. Returns the response value to write back, or
-/// `None` for a notification (no `id` ⇒ no reply).
+/// JSON-RPC 2.0 §5.1: the input is not JSON at all.
+pub const PARSE_ERROR: i64 = -32700;
+/// JSON-RPC 2.0 §5.1: the input is JSON but not a valid Request object.
+pub const INVALID_REQUEST: i64 = -32600;
+/// JSON-RPC 2.0 §5.1: the method does not exist.
+pub const METHOD_NOT_FOUND: i64 = -32601;
+
+/// Dispatch one parsed JSON-RPC message. Returns the response value to write back, or
+/// `None` when JSON-RPC 2.0 says nothing is owed: a notification (a `method` and no
+/// `id`), or a RESPONSE from the client (a `result` or an `error` and no `method`).
+///
+/// Anything else that is not a valid Request gets `-32600 Invalid Request`, under the
+/// message's `id` when that is readable (a string, a number or null) and under `null`
+/// otherwise — never silence, which a client cannot tell from a hang.
+///
+/// A JSON array is a batch, and batching is not part of the MCP revision this server
+/// implements (2024-11-05: MCP added batches in 2025-03-26 and
+/// removed them again in 2025-06-18), so every array, empty or not, is one
+/// `-32600` under `null`.
+///
+/// ```
+/// # use ikigai_core::{Capability, EndpointSpace, Kernel};
+/// # use ikigai_mcp::{server::handle, ToolFilter};
+/// # use serde_json::json;
+/// # let kernel = Kernel::new(std::sync::Arc::new(EndpointSpace::new()));
+/// # let (cap, filter) = (Capability::root(), ToolFilter::default());
+/// // No `jsonrpc` member: invalid, answered under the id it carried.
+/// let reply = handle(&kernel, &cap, &filter, &json!({"id": 7, "method": "ping"})).unwrap();
+/// assert_eq!(reply["id"], 7);
+/// assert_eq!(reply["error"]["code"], -32600);
+/// assert_eq!(reply["error"]["message"], "Invalid Request");
+///
+/// // A response from the client to a server-initiated request: valid, never answered.
+/// let response = json!({"jsonrpc": "2.0", "id": 3, "result": {}});
+/// assert!(handle(&kernel, &cap, &filter, &response).is_none());
+/// ```
 pub fn handle(
     kernel: &Kernel,
     capability: &Capability,
     filter: &ToolFilter,
     msg: &Value,
 ) -> Option<Value> {
-    let id = msg.get("id").cloned();
-    let method = msg.get("method").and_then(Value::as_str)?;
+    let (id, method) = match shape(msg) {
+        Shape::Request { id, method } => (id, method),
+        Shape::Notification | Shape::Response => return None,
+        Shape::Invalid { id, reason } => {
+            return Some(err(id, INVALID_REQUEST, "Invalid Request", Some(&reason)))
+        }
+    };
 
     match method {
-        // Notifications (no id): acknowledged by doing nothing.
-        _ if id.is_none() => None,
-        "initialize" => Some(ok(id?, initialize_result())),
-        "ping" => Some(ok(id?, json!({}))),
-        "tools/list" => Some(ok(id?, tools_list(kernel, capability, filter))),
-        "tools/call" => Some(ok(id?, tools_call(kernel, capability, msg.get("params")))),
-        other => Some(err(id?, -32601, &format!("method not found: {other}"))),
+        "initialize" => Some(ok(id, initialize_result())),
+        "ping" => Some(ok(id, json!({}))),
+        "tools/list" => Some(ok(id, tools_list(kernel, capability, filter))),
+        "tools/call" => Some(ok(id, tools_call(kernel, capability, msg.get("params")))),
+        other => Some(err(
+            id,
+            METHOD_NOT_FOUND,
+            &format!("method not found: {other}"),
+            None,
+        )),
     }
+}
+
+/// Dispatch one line of MCP stdio, as the raw bytes read (a trailing `\n` or `\r\n` is
+/// ignored). A blank line is framing slack and gets no reply; a line that is not JSON —
+/// invalid UTF-8 included — gets `-32700 Parse error` under `null`; anything else goes
+/// to [`handle`].
+///
+/// ```
+/// # use ikigai_core::{Capability, EndpointSpace, Kernel};
+/// # use ikigai_mcp::{server::handle_line, ToolFilter};
+/// # let kernel = Kernel::new(std::sync::Arc::new(EndpointSpace::new()));
+/// # let (cap, filter) = (Capability::root(), ToolFilter::default());
+/// let reply = handle_line(&kernel, &cap, &filter, b"not json\n").unwrap();
+/// assert_eq!(reply["id"], serde_json::Value::Null);
+/// assert_eq!(reply["error"]["code"], -32700);
+/// assert_eq!(reply["error"]["message"], "Parse error");
+/// assert!(handle_line(&kernel, &cap, &filter, b"  \r\n").is_none());
+/// ```
+pub fn handle_line(
+    kernel: &Kernel,
+    capability: &Capability,
+    filter: &ToolFilter,
+    line: &[u8],
+) -> Option<Value> {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    if line.iter().all(u8::is_ascii_whitespace) {
+        return None;
+    }
+    match serde_json::from_slice::<Value>(line) {
+        Ok(msg) => handle(kernel, capability, filter, &msg),
+        Err(e) => Some(err(
+            Value::Null,
+            PARSE_ERROR,
+            "Parse error",
+            Some(&e.to_string()),
+        )),
+    }
+}
+
+/// What a parsed message IS, by JSON-RPC 2.0 §4 and §5.
+enum Shape<'a> {
+    /// A `method` and an `id`: owed exactly one response.
+    Request { id: Value, method: &'a str },
+    /// A `method` and no `id`: never answered, not even with an error (§4.1).
+    Notification,
+    /// A `result` or an `error` and no `method`: the client answering a request the
+    /// server sent. Never answered — even when malformed, since replying to a reply is
+    /// how two peers trade errors forever, and JSON-RPC gives a response no reply.
+    Response,
+    /// Anything else: `-32600`, under `id` (null when no id was readable).
+    Invalid { id: Value, reason: String },
+}
+
+fn shape(msg: &Value) -> Shape<'_> {
+    let Some(obj) = msg.as_object() else {
+        let reason = match msg {
+            Value::Array(batch) if batch.is_empty() => "an empty batch".to_string(),
+            Value::Array(_) => format!(
+                "a batch: JSON-RPC batching is not part of MCP {PROTOCOL_VERSION}; \
+                 send each message on its own line"
+            ),
+            _ => "a JSON-RPC message is an object".to_string(),
+        };
+        return Shape::Invalid {
+            id: Value::Null,
+            reason,
+        };
+    };
+    let method = obj.get("method");
+    if method.is_none() && (obj.contains_key("result") || obj.contains_key("error")) {
+        return Shape::Response;
+    }
+    if method.is_some() && !obj.contains_key("id") {
+        return Shape::Notification;
+    }
+    let invalid = |id: &Value, reason: &str| Shape::Invalid {
+        id: id.clone(),
+        reason: reason.to_string(),
+    };
+    let id = match obj.get("id") {
+        Some(id @ (Value::String(_) | Value::Number(_) | Value::Null)) => id.clone(),
+        None => Value::Null,
+        Some(_) => return invalid(&Value::Null, "`id` must be a string, a number or null"),
+    };
+    if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return invalid(&id, "`jsonrpc` must be exactly \"2.0\"");
+    }
+    let Some(method) = method else {
+        return invalid(&id, "no `method`, and no `result` or `error` either");
+    };
+    let Some(method) = method.as_str() else {
+        return invalid(&id, "`method` must be a string");
+    };
+    if obj
+        .get("params")
+        .is_some_and(|p| !(p.is_object() || p.is_array()))
+    {
+        return invalid(&id, "`params` must be an object or an array");
+    }
+    Shape::Request { id, method }
 }
 
 fn ok(id: Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
 
-fn err(id: Value, code: i64, message: &str) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+/// A JSON-RPC error object; `data` carries the reason when the standard message is terse.
+fn err(id: Value, code: i64, message: &str, data: Option<&str>) -> Value {
+    let mut error = json!({ "code": code, "message": message });
+    if let Some(data) = data {
+        error["data"] = json!(data);
+    }
+    json!({ "jsonrpc": "2.0", "id": id, "error": error })
 }
 
 fn initialize_result() -> Value {
@@ -483,26 +631,37 @@ fn tool_error(message: String) -> Value {
 }
 
 /// The stdin→stdout loop: read newline-delimited JSON-RPC, dispatch, write each
-/// response as one line. Runs until stdin closes.
+/// response as one line. Runs until stdin closes. See [`serve_io`].
 pub fn serve(kernel: &Kernel, capability: &Capability) -> std::io::Result<()> {
-    use std::io::{BufRead, Write};
+    serve_io(
+        kernel,
+        capability,
+        std::io::stdin().lock(),
+        std::io::stdout(),
+    )
+}
+
+/// [`serve`] over any line source and sink. Every line goes through [`handle_line`], so
+/// a line that is not JSON — invalid UTF-8 included — is answered with `-32700` and the
+/// loop goes on; it neither ends the session nor passes in silence.
+pub fn serve_io(
+    kernel: &Kernel,
+    capability: &Capability,
+    mut input: impl std::io::BufRead,
+    mut output: impl std::io::Write,
+) -> std::io::Result<()> {
     let filter = ToolFilter::default(); // allow-all: the plain server shows the full grant
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if input.read_until(b'\n', &mut line)? == 0 {
+            return Ok(());
         }
-        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
-            continue; // a malformed line is ignored, not fatal
-        };
-        if let Some(response) = handle(kernel, capability, &filter, &msg) {
-            writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
-            stdout.flush()?;
+        if let Some(response) = handle_line(kernel, capability, &filter, &line) {
+            writeln!(output, "{}", serde_json::to_string(&response)?)?;
+            output.flush()?;
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1486,5 +1645,114 @@ mod manifold_identity_948 {
             .filter(|n| n.starts_with("toUpper"))
             .collect();
         assert_eq!(names, ["toUpper__source"]);
+    }
+}
+
+/// ledger #1309: JSON-RPC 2.0 §5.1 error replies, through the loop.
+#[cfg(test)]
+mod jsonrpc_1309 {
+    use super::*;
+    use ikigai_core::EndpointSpace;
+
+    /// `ping` is all these tests call, and it needs no endpoint.
+    fn kernel() -> Kernel {
+        Kernel::new(std::sync::Arc::new(EndpointSpace::new()))
+    }
+
+    /// ledger #1309: every line through the real loop, one reply per line that is owed one,
+    /// in order. Before, six of the invalid lines were skipped in silence (the first five and
+    /// `"method":5`), three were answered as if valid (no `jsonrpc`, `"1.0"`, `params: 3`)
+    /// and one under an object id, and the invalid UTF-8 line ENDED the session.
+    #[test]
+    fn the_stdio_loop_answers_every_invalid_line_per_json_rpc_5_1() {
+        let input: Vec<u8> = [
+            &b"not json\n"[..],
+            b"[]\n",
+            b"[{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}]\n",
+            b"42\n",
+            b"{\"jsonrpc\":\"2.0\",\"id\":7}\n",
+            b"{\"id\":8,\"method\":\"ping\"}\n",
+            b"{\"jsonrpc\":\"1.0\",\"id\":9,\"method\":\"ping\"}\n",
+            b"{\"jsonrpc\":\"2.0\",\"id\":{\"x\":1},\"method\":\"ping\"}\n",
+            b"{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":5}\n",
+            b"{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"ping\",\"params\":3}\n",
+            b"\xff\xfe\n",
+            // Owed nothing: a response from the client (result, then error), a notification,
+            // and a notification that is not even valid. A blank line is framing slack.
+            b"{\"jsonrpc\":\"2.0\",\"id\":12,\"result\":{}}\n",
+            b"{\"jsonrpc\":\"2.0\",\"id\":13,\"error\":{\"code\":-1,\"message\":\"no\"}}\n",
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+            b"{\"method\":\"bogus\",\"params\":3}\n",
+            b"\r\n",
+            // And the session is still alive at the end, CRLF framing included.
+            b"{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"ping\"}\r\n",
+        ]
+        .concat();
+        let mut out = Vec::new();
+        serve_io(&kernel(), &Capability::root(), &input[..], &mut out).expect("the loop runs");
+        let replies: Vec<Value> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("each reply is one JSON line"))
+            .collect();
+        let got: Vec<(Value, Option<i64>)> = replies
+            .iter()
+            .map(|r| (r["id"].clone(), r["error"]["code"].as_i64()))
+            .collect();
+        let null = Value::Null;
+        assert_eq!(
+            got,
+            [
+                (null.clone(), Some(PARSE_ERROR)),
+                (null.clone(), Some(INVALID_REQUEST)),
+                (null.clone(), Some(INVALID_REQUEST)),
+                (null.clone(), Some(INVALID_REQUEST)),
+                (json!(7), Some(INVALID_REQUEST)),
+                (json!(8), Some(INVALID_REQUEST)),
+                (json!(9), Some(INVALID_REQUEST)),
+                (null.clone(), Some(INVALID_REQUEST)),
+                (json!(10), Some(INVALID_REQUEST)),
+                (json!(11), Some(INVALID_REQUEST)),
+                (null.clone(), Some(PARSE_ERROR)),
+                (json!(14), None),
+            ]
+        );
+        for r in &replies {
+            assert_eq!(r["jsonrpc"], "2.0", "{r}");
+        }
+        assert_eq!(replies[0]["error"]["message"], "Parse error");
+        assert_eq!(replies[1]["error"]["message"], "Invalid Request");
+        assert_eq!(replies[11]["result"], json!({}));
+        // The reason rides in `data`, so a client can see WHY without the message drifting
+        // from the standard's text.
+        assert!(
+            replies[2]["error"]["data"]
+                .as_str()
+                .unwrap()
+                .contains("batching is not part of MCP 2024-11-05"),
+            "{}",
+            replies[2]
+        );
+    }
+
+    /// The exact bytes JSON-RPC 2.0 §5.1 gives for a Parse error, `data` aside.
+    #[test]
+    fn a_parse_error_is_the_standard_reply_under_a_null_id() {
+        let mut reply = handle_line(
+            &kernel(),
+            &Capability::root(),
+            &ToolFilter::default(),
+            b"{\"jsonrpc\": \"2.0\", \"method\": \"foobar, \"params\": \"bar\", \"baz]",
+        )
+        .expect("a parse error is answered");
+        reply["error"]
+            .as_object_mut()
+            .unwrap()
+            .remove("data")
+            .expect("the parser's reason rides in data");
+        assert_eq!(
+            reply,
+            json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}})
+        );
     }
 }

@@ -108,6 +108,14 @@ members = ["crates/*"]
 #   rises to "0.2.2" (a true floor: under 0.2.0 this door would admit nothing); 0.2.1 holds
 #   `<state>/host.lock`, so a second host over one state directory is refused; 0.2.2 adds
 #   `urn:layers:me`. ikigai-fs 0.1.9 in the lock (Windows-meaning names refused everywhere).
+# - `ikigai mcp` answers invalid input per JSON-RPC 2.0 §5.1 instead of skipping it (ledger
+#   #1309): a line that is not JSON gets -32700 Parse error under id null, and JSON that is not
+#   a valid Request (no `"jsonrpc":"2.0"`, no `method`, a bad `id`/`params`, a scalar, or ANY
+#   array: batching is not in MCP 2024-11-05) gets -32600 under its id when readable. A
+#   notification or a client response is still never answered, and a line that is not UTF-8
+#   is a Parse error rather than the end of the session. `ikigai_mcp::server::{handle_line,
+#   serve_io}` are new; ⚠ Behavior: `server::handle` now answers what it used to drop, and a
+#   message without `"jsonrpc":"2.0"` is refused where it used to be served.
 #
 # 0.1.54 was A REQUEST-DERIVED FILE NAME IS ONE ENTRY ON EVERY PLATFORM.
 # ⚠ Stacked on 0.1.53, which was merged and preflighted READY but NOT on crates.io: publishing
