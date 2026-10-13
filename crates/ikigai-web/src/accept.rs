@@ -171,6 +171,24 @@ mod tests {
         assert_eq!(classify(&os(libc::EIO)), Fault::BackOff);
     }
 
+    /// ledger #1411: on Windows an accept error carries a WinSock code, not an errno, and a
+    /// dead listener (`WSAENOTSOCK`, `WSAEBADF`, `WSAEINVAL`, `WSAEFAULT`) must end the loop
+    /// the way `ENOTSOCK` and its kin do on Unix, rather than back off against it forever.
+    #[cfg(windows)]
+    #[test]
+    fn a_dead_listener_is_fatal_on_windows() {
+        let os = io::Error::from_raw_os_error;
+        for code in [10038, 10009, 10022, 10014] {
+            assert_eq!(classify(&os(code)), Fault::Fatal, "WinSock {code}");
+        }
+        for code in [10024, 10055] {
+            assert_eq!(classify(&os(code)), Fault::BackOff, "WinSock {code}");
+        }
+        for code in [10053, 10054, 10061, 10004, 10035] {
+            assert_eq!(classify(&os(code)), Fault::Skip, "WinSock {code}");
+        }
+    }
+
     #[test]
     fn an_error_without_an_errno_is_classified_by_kind() {
         let kind = |k| io::Error::new(k, "synthetic");
