@@ -38,12 +38,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked -p ikigai-resolve --lib -- file_name home
   # The native Windows PROBE (ledger #1162): what breaks when the whole workspace is built and
-  # tested on Windows. It REPORTS and does not gate: both cargo steps carry
-  # `continue-on-error: true`, so a red step leaves the job (and the PR) green. Ledger #1162 is
-  # the item that turns this into a gate, once `docs/windows.md`'s map is worked down; until
-  # then a gate here would block every PR on day one. So that it is never a probe that
-  # silently passes (field guide 9c), the last step writes each cargo step's outcome to the job
-  # summary and raises a `::warning::` annotation for every one that failed.
+  # tested on Windows, and what the built binary does there. It REPORTS and does not gate:
+  # every probe step carries `continue-on-error: true`, so a red step leaves the job (and the
+  # PR) green. Ledger #1162 is the item that turns this into a gate, once `docs/windows.md`'s
+  # map is worked down; until then a gate here would block every PR on day one. So that it is
+  # never a probe that silently passes (field guide 9c), the last step writes each step's
+  # outcome to the job summary and raises a `::warning::` annotation for every one that did
+  # not pass.
   # The build takes the binary's install features (`quic,web`) and `--keep-going`, so one
   # failing crate does not hide the next one's errors; `--no-fail-fast` does the same for test.
   # ⚠ Inline cargo beside the shared caller, like `windows-file-names` above.
@@ -60,6 +61,55 @@ jobs:
         name: cargo build -p ikigai-cli --features quic,web
         continue-on-error: true
         run: cargo build -p ikigai-cli --locked --features quic,web --keep-going
+      # Smoke the binary that step built (quic,web), in the order docs/windows.md's map is
+      # ordered by. Every cli integration test is `cfg(unix)`, so nothing else runs the binary
+      # on Windows.
+      # 1. `--version` and a local `-c` from PowerShell with HOME UNSET, as a native Windows shell
+      #    has it (Git Bash sets HOME; cmd and PowerShell set USERPROFILE instead).
+      - id: local
+        name: smoke - --version and a local -c (PowerShell, no HOME)
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          Remove-Item Env:HOME -ErrorAction SilentlyContinue
+          $ikigai = Join-Path $PWD 'target\debug\ikigai.exe'
+          & $ikigai --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $ikigai --quiet -c 'source urn:host:identity'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      # 2. The remote path a collaborator would use: a QUIC door (`ikigai serve quic://`) and a
+      #    one-shot client that reaches it through an --override mount, in a scratch home. The
+      #    door binds port 0 and the client reads the bound port off its banner.
+      - id: quic
+        name: smoke - a QUIC door and an ikigai -c client through it
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          ikigai="$PWD/target/debug/ikigai.exe"
+          scratch="$RUNNER_TEMP/iwp"
+          mkdir -p "$scratch/config/ikigai"
+          export HOME="$scratch" XDG_CONFIG_HOME="$scratch/config" IKIGAI_FILES="$scratch/files"
+          "$ikigai" cert generate --dir "$scratch/certs" </dev/null
+          "$ikigai" serve quic://127.0.0.1:0 --name win --cert-dir "$scratch/certs" </dev/null 2>"$scratch/door.log" &
+          door=$!
+          for _ in $(seq 1 240); do
+            grep -q 'serving on' "$scratch/door.log" && break
+            sleep 0.5
+          done
+          cat "$scratch/door.log"
+          address=$(sed -n 's/.*serving on \([^ ]*\).*/\1/p' "$scratch/door.log" | head -n 1)
+          echo "door address: $address"
+          status=0
+          "$ikigai" --quiet --override "urn:host:=$address" --cert-dir "$scratch/certs" \
+            -c 'source urn:host:identity' </dev/null || status=$?
+          kill "$door" || true
+          exit "$status"
+      # Last of the cargo steps: it rebuilds target\debug\ikigai.exe under the DEFAULT features
+      # (no quic), so the smoke steps above run first.
       - id: test
         name: cargo test --workspace
         continue-on-error: true
@@ -75,12 +125,17 @@ jobs:
             echo "| --- | --- |"
             echo "| build -p ikigai-cli --features quic,web | ${{ steps.build.outcome }} |"
             echo "| test --workspace | ${{ steps.test.outcome }} |"
+            echo "| smoke: --version and a local -c, no HOME | ${{ steps.local.outcome }} |"
+            echo "| smoke: QUIC door and a -c client | ${{ steps.quic.outcome }} |"
             echo ""
             echo "The breakage map is docs/windows.md."
           } >> "$GITHUB_STEP_SUMMARY"
-          if [ "${{ steps.build.outcome }}" != "success" ]; then
-            echo "::warning title=Windows probe::cargo build -p ikigai-cli --features quic,web failed on Windows (non-gating; ledger #1162, docs/windows.md)"
-          fi
-          if [ "${{ steps.test.outcome }}" != "success" ]; then
-            echo "::warning title=Windows probe::cargo test --workspace failed on Windows (non-gating; ledger #1162, docs/windows.md)"
-          fi
+          report() {
+            if [ "$2" != "success" ]; then
+              echo "::warning title=Windows probe::$1 did not pass on Windows: $2 (non-gating; ledger #1162, docs/windows.md)"
+            fi
+          }
+          report "cargo build -p ikigai-cli --features quic,web" "${{ steps.build.outcome }}"
+          report "cargo test --workspace" "${{ steps.test.outcome }}"
+          report "the local smoke (--version, -c, no HOME)" "${{ steps.local.outcome }}"
+          report "the QUIC smoke (door and -c client)" "${{ steps.quic.outcome }}"
