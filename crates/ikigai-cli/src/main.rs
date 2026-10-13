@@ -2681,7 +2681,7 @@ fn connect_mount_quic(
     ))
 }
 
-#[cfg(all(feature = "embedded", feature = "ipc"))]
+#[cfg(all(feature = "embedded", feature = "ipc", unix))]
 fn connect_mount_ipc(
     socket: &str,
     kind: ikigai_embedded::MountKind,
@@ -2704,14 +2704,16 @@ fn connect_mount_ipc(
     Ok(std::sync::Arc::new(resolver))
 }
 
-#[cfg(all(feature = "embedded", not(feature = "ipc")))]
+// `ikigai-ipc` is `#![cfg(unix)]` (empty elsewhere), so the `ipc` feature alone does not
+// make the dial exist: a default Windows build has the feature and an empty crate.
+#[cfg(all(feature = "embedded", not(all(feature = "ipc", unix))))]
 fn connect_mount_ipc(
     _socket: &str,
     _kind: ikigai_embedded::MountKind,
     flag: &'static str,
 ) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
     Err(format!(
-        "{flag} of a Unix socket needs the `ipc` feature (Unix only)"
+        "{flag} of a Unix socket needs the `ipc` feature on a Unix platform"
     ))
 }
 
@@ -4416,7 +4418,9 @@ mod mount_posture_tests {
                 let resolved =
                     resolve_mounts(flag_mounts(&args), home, || panic!("flags win wholesale"))
                         .unwrap_or_else(|e| panic!("{args:?} must resolve: {e}"));
-                assert_eq!(resolved[0].target, "/home/b/x.sock", "{args:?}");
+                // `home.join`, not a literal: on Windows the join's separator is `\`.
+                let expanded = home.join("x.sock");
+                assert_eq!(resolved[0].target, expanded.to_str().unwrap(), "{args:?}");
                 assert_eq!(resolved[1].target, "quic://plasma:4433", "{args:?}");
             }
         }
@@ -4736,9 +4740,10 @@ mod mount_posture_tests {
         assert_eq!(mounts[0].kind, ikigai_embedded::MountKind::Prefer);
         assert_eq!(mounts[0].prefix, "urn:iki:store:");
         assert_eq!(mounts[1].kind, ikigai_embedded::MountKind::Alias);
+        let expanded = std::path::Path::new("/Users/x").join(".config/ikigai/quic-bug");
         assert_eq!(
             mounts[1].certs.cert_dir.as_deref(),
-            Some("/Users/x/.config/ikigai/quic-bug"),
+            expanded.to_str(),
             "a config line's `~` is expanded against the home it was handed"
         );
     }
@@ -4906,10 +4911,8 @@ mod mount_cert_tests {
         .expect("the line parses");
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].prefix, "urn:layer:,urn:layers:");
-        assert_eq!(
-            mounts[0].certs.cert_dir.as_deref(),
-            Some("/home/b/certs/hub")
-        );
+        let expanded = std::path::Path::new("/home/b").join("certs/hub");
+        assert_eq!(mounts[0].certs.cert_dir.as_deref(), expanded.to_str());
     }
 
     /// ledger #1379: a config-home `mount` line's SOCKET takes the `~` its cert directory
@@ -4922,8 +4925,13 @@ mod mount_cert_tests {
                 std::path::Path::new("/home/b"),
             )
             .expect("the line parses");
-            assert_eq!(mounts[0].target, "/home/b/.ikigai/gonk.sock", "{mode}");
-            assert_eq!(mounts[0].certs.cert_dir.as_deref(), Some("/home/b/certs"));
+            let home = std::path::Path::new("/home/b");
+            let socket = home.join(".ikigai/gonk.sock");
+            assert_eq!(mounts[0].target, socket.to_str().unwrap(), "{mode}");
+            assert_eq!(
+                mounts[0].certs.cert_dir.as_deref(),
+                home.join("certs").to_str()
+            );
         }
         // A target that is not a path is never touched.
         for target in ["quic://bug.local:4433", "peer:plasma", "/abs/x.sock"] {
@@ -4962,6 +4970,7 @@ mod mount_cert_tests {
 
     /// The end to end case the ledger item reported: a `~` socket in a config line DIALS the
     /// expanded path. The home is a scratch directory, never `$HOME`.
+    #[cfg(all(feature = "ipc", unix))]
     #[test]
     fn a_config_mount_lines_tilde_socket_dials_the_peer() {
         use ikigai_core::{builtins, EndpointSpace, Exact, Kernel};
@@ -5000,6 +5009,7 @@ mod mount_cert_tests {
     /// REPL's list was blind to an undialed prefer mount — the same
     /// chicken-and-egg cli #270 fixed for mcp, which the ikigai-deno
     /// satellite then hit interactively.)
+    #[cfg(all(feature = "ipc", unix))]
     #[test]
     fn a_prefer_mounts_entries_dial_a_live_peer() {
         use ikigai_core::{builtins, EndpointSpace, Exact, Kernel};
