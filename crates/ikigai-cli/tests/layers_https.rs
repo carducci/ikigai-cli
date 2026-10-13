@@ -1053,3 +1053,140 @@ fn the_gateway_crosses_between_an_http_participant_and_a_quic_participant() {
     assert_eq!(answered.bytes, b"hello");
     assert_eq!(answered.repr_type.media_type, "text/plain");
 }
+
+/// What one `Expect: 100-continue` exchange on the front came to.
+struct Expected {
+    /// The head of the door's first answer: the interim `100`, or a final status it chose to
+    /// answer at once.
+    first: String,
+    /// How long the door took to say it.
+    waited: Duration,
+    /// The final answer.
+    last: Http,
+}
+
+/// Send a POST the way a client honoring `Expect: 100-continue` does (a JVM HTTP client sends
+/// Expect on every POST with a body): the head alone, then wait for the door's first answer,
+/// and send the body only once invited. The wait is bounded by `PATIENCE` so a door that never
+/// answers fails the test rather than hanging it; the caller asserts how long it took.
+fn expect_continue(host: &Host, path: &str, token: Option<&str>, body: &[u8]) -> Expected {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let tls = ikigai_quic::pinned_https_client_tls(&host.server_pem).unwrap();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(tls));
+        let tcp = tokio::net::TcpStream::connect(&host.https).await.unwrap();
+        let name = tokio_rustls::rustls::pki_types::ServerName::try_from("ikigai").unwrap();
+        let mut stream = connector
+            .connect(name, tcp)
+            .await
+            .expect("TLS with the pinned certificate");
+        let mut head = format!(
+            "POST {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nExpect: 100-continue\r\n",
+            host.https
+        );
+        if let Some(token) = token {
+            head.push_str(&format!("Authorization: Bearer {token}\r\n"));
+        }
+        head.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        let started = now();
+        let mut got = Vec::new();
+        let mut tmp = [0u8; 1024];
+        let end = tokio::time::timeout(PATIENCE, async {
+            loop {
+                if let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                    return end + 4;
+                }
+                match stream.read(&mut tmp).await {
+                    Ok(0) | Err(_) => return got.len(),
+                    Ok(n) => got.extend_from_slice(&tmp[..n]),
+                }
+            }
+        })
+        .await
+        .expect("the door answered the head at all");
+        let waited = started.elapsed();
+        let first = String::from_utf8_lossy(&got[..end]).to_string();
+        let mut out = if first.starts_with("HTTP/1.1 100 ") {
+            stream.write_all(body).await.unwrap();
+            stream.flush().await.unwrap();
+            got[end..].to_vec()
+        } else {
+            got
+        };
+        let _ = stream.read_to_end(&mut out).await;
+        let split = out
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .unwrap_or_else(|| panic!("no final head in {:?}", String::from_utf8_lossy(&out)));
+        let head = String::from_utf8_lossy(&out[..split]).to_string();
+        let status = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("no status in {head}"));
+        Expected {
+            first,
+            waited,
+            last: Http {
+                status,
+                head,
+                body: out[split + 4..].to_vec(),
+            },
+        }
+    })
+}
+
+/// ledger #1408: a client that sends `Expect: 100-continue` (a JVM HTTP client does, on every
+/// POST with a body) is never left waiting out its own expect timeout. A drop is invited at once
+/// and lands; a POST without a token and a POST to a GET-only path are answered promptly too.
+#[test]
+fn an_expecting_client_is_answered_promptly_on_every_route() {
+    let host = host("expect");
+    let bob = host.mint(BOB);
+    // Far under the 1 s curl waits and the 3 s a JVM client waits; a door that says nothing
+    // costs the full timeout, so this is the line between the two, with room for a loaded CI.
+    let prompt = Duration::from_millis(900);
+
+    let dropped = expect_continue(
+        &host,
+        "/layer/tasks/tuples",
+        Some(&bob),
+        offer("e1", "Expect").as_bytes(),
+    );
+    assert_eq!(dropped.first, "HTTP/1.1 100 Continue\r\n\r\n");
+    assert!(
+        dropped.waited < prompt,
+        "the drop waited {:?} for its invitation",
+        dropped.waited
+    );
+    assert_eq!(
+        dropped.last.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&dropped.last.body)
+    );
+    let pending = host.https("GET", "/layer/tasks/rd", Some(&bob), b"");
+    assert_eq!(
+        pending.json()["tuples"][0]["subject"],
+        "urn:layer:tasks:offer:e1"
+    );
+
+    let message = br#"{"@id": "urn:layer:new", "@type": "Message", "body": "nobody"}"#;
+    let anonymous = expect_continue(&host, "/layer/talk/say", None, message);
+    assert!(
+        anonymous.waited < prompt,
+        "the 401 waited {:?}",
+        anonymous.waited
+    );
+    assert_eq!(anonymous.last.status, 401);
+
+    let wrong = expect_continue(&host, "/layers/me", Some(&bob), message);
+    assert!(wrong.waited < prompt, "the 405 waited {:?}", wrong.waited);
+    assert_eq!(wrong.last.status, 405);
+    assert_eq!(wrong.last.header("allow").as_deref(), Some("GET"));
+}
