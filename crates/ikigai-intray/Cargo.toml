@@ -52,7 +52,11 @@ spargebra = { version = "0.4", features = ["sep-0006"] }
 # algebra bounds. Both exist only from 0.2.18.
 # ⚠ 0.2.19 (ledger #1333, #1354) is a SECURITY floor taken with the root's, so the two pins cannot resolve
 # apart off-tree: an update's triple terms are bounded. No signature changed; the API floor above is unchanged.
-ikigai-store = "0.2.19"
+# ⚠ 0.2.21 (ledger #1426, #1427, #1428, #1429) is a SECURITY floor taken with the root's, not an API floor:
+# a GRAPH block and three planner-erasable wrappers hid join operands from `check_query`'s MAX_JOIN_OPERANDS,
+# so an in-bounds `match=` could plan uncancellably for minutes, and the overdue cap now reserves its slot
+# at start. A real FILTER closing a group now counts that group into the enclosing join. No signature changed.
+ikigai-store = "0.2.21"
 
 [dev-dependencies]
 futures = { workspace = true }

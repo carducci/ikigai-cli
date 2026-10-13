@@ -107,6 +107,14 @@ members = ["crates/*"]
 # - `ikigai-embedded`'s `store` module docs named two private items (`STORE_SPACE`, `refusal`) as
 #   intra-doc links, which `cargo doc --all-features` under `-D warnings` refuses
 #   (`private_intra_doc_links`); they are code spans now. Docs only.
+# - ⚠ SECURITY FLOOR: `ikigai-store` "0.2.21" (root and intray; ledger #1426, #1427, #1428, #1429),
+#   folded in before publishing so 0.1.61 never ships 0.2.19. A GRAPH block and three
+#   planner-erasable wrappers hid join operands from MAX_JOIN_OPERANDS, so an in-bounds query (a
+#   `match=` included) planned uncancellably for minutes; the overdue cap reserves its slot at
+#   start; `urn:iki:store:load` bounds document size and XML entity expansion. ⚠ Behavior: a real
+#   FILTER closing a group now counts that group into the enclosing join, so two groups of 20 are
+#   refused as one join of 40. The widest join this workspace writes has 7 operands. Lock-only
+#   otherwise: no other package or edge moved.
 #
 # 0.1.60 was AN HTTP DOOR ANSWERS `Expect: 100-continue`.
 # Stacked on 0.1.59, which was already on crates.io; nothing unpublished sat beneath it.
@@ -1520,7 +1528,13 @@ ikigai-meeting = "0.1.2" # 0.1.2 = the Zoom `account_id` moves out of the token 
 # ⚠ …and 0.2.19 (ledger #1333, #1354), a SECURITY floor taken with `ikigai-intray`'s: an update's triple
 # terms are bounded in what it leaves in the store (#1333), and a `<<( )>>` template nests to
 # MAX_RDF_NESTING rather than being refused as too branchy (#1354). No signature changed.
-ikigai-store = { version = "0.2.19", features = ["persistent"] }
+# ⚠ …and 0.2.21 (ledger #1426, #1427, #1428, #1429), a SECURITY floor taken with `ikigai-intray`'s, not
+# an API floor: a GRAPH block and three planner-erasable wrappers hid join operands from
+# MAX_JOIN_OPERANDS, so an in-bounds query planned uncancellably for minutes (#1426, #1429); the overdue
+# cap reserves its slot at start (#1427); `urn:iki:store:load` bounds document size and XML entity
+# expansion (#1428). ⚠ Behavior: a real FILTER closing a group now counts that group into the enclosing
+# join (two groups of 20 are refused as one join of 40). No signature changed.
+ikigai-store = { version = "0.2.21", features = ["persistent"] }
 # The work ledger (`urn:iki:ledger:*`): items, comments, labels, links, claims and
 # `next`, as RDF in the store above. It owns no bytes — every read is a scoped SPARQL
 # query at `urn:iki:store:graph-select` and every write a scoped UPDATE at
