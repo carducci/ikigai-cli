@@ -26,8 +26,36 @@
 //! and once at its end rather than once per retry; and a dead listener ends the loop instead
 //! of sleeping on it forever.
 //!
+//! **On Windows** an accept error carries a WinSock code (`WSAGetLastError`), not an errno, so
+//! the Unix table above cannot see it, and before ledger #1411 every one of them fell through
+//! to the `io::ErrorKind` fallback, which never yields [`Fault::Fatal`]: a dead listener backed
+//! off and retried forever. `winsock` is the Windows table, each code placed where the Unix
+//! table places its errno twin:
+//!
+//! | WinSock | code | errno twin | fault |
+//! | --- | --- | --- | --- |
+//! | `WSAEBADF` | 10009 | `EBADF` | Fatal |
+//! | `WSAEFAULT` | 10014 | `EFAULT` | Fatal |
+//! | `WSAEINVAL` | 10022 | `EINVAL` (not listening) | Fatal |
+//! | `WSAENOTSOCK` | 10038 | `ENOTSOCK` | Fatal |
+//! | `WSAEMFILE` | 10024 | `EMFILE` | BackOff |
+//! | `WSAENOBUFS` | 10055 | `ENOBUFS` | BackOff |
+//! | `WSAEINTR` | 10004 | `EINTR` | Skip |
+//! | `WSAEWOULDBLOCK` | 10035 | `EAGAIN` | Skip |
+//! | `WSAECONNABORTED` | 10053 | `ECONNABORTED` | Skip |
+//! | `WSAECONNRESET` | 10054 | `ECONNRESET` | Skip |
+//! | `WSAECONNREFUSED` | 10061 | `ECONNREFUSED` | Skip |
+//!
+//! The Unix Skip set's other members (`ETIMEDOUT`, `ENETDOWN`, `ENETUNREACH`, `EHOSTDOWN`,
+//! `EHOSTUNREACH`, `ENOPROTOOPT`, `EOPNOTSUPP`, `EPROTO`, `EPERM`) are there because LINUX
+//! passes a connection's pending network error out of `accept(2)`. Windows documents no such
+//! rule: its `accept` lists `WSAENETDOWN` as the network subsystem failing, which retrying at
+//! once would spin on. So their WinSock twins are deliberately left to the fallback, which
+//! backs off, exactly as they did before. A code neither table names keeps the door trying.
+//!
 //! ⚠ `ikigai-ipc` carries a twin of this table for the socket door (a synchronous loop, so the
-//! wait is a thread sleep there). Change both or neither.
+//! wait is a thread sleep there). Change both or neither. That crate is `cfg(unix)`, so the
+//! Windows table has no twin there.
 
 use std::io;
 use std::time::Duration;
@@ -63,6 +91,10 @@ pub(crate) enum Fault {
 
 /// Classify one accept error. See the module docs for the table and why.
 pub(crate) fn classify(e: &io::Error) -> Fault {
+    #[cfg(windows)]
+    if let Some(fault) = e.raw_os_error().and_then(winsock) {
+        return fault;
+    }
     #[cfg(unix)]
     if let Some(code) = e.raw_os_error() {
         return match code {
@@ -92,6 +124,37 @@ pub(crate) fn classify(e: &io::Error) -> Fault {
         | io::ErrorKind::Interrupted
         | io::ErrorKind::WouldBlock => Fault::Skip,
         _ => Fault::BackOff,
+    }
+}
+
+/// The Windows table: what a WinSock code from `accept` means, or `None` for a code it does
+/// not name (left to the `io::ErrorKind` fallback, which backs off). See the module docs for
+/// each code's errno twin and why the Linux-only Skip entries have none here.
+///
+/// Pure and compiled for tests on every platform, so the table is checked wherever the suite
+/// runs; [`classify`] consults it only on Windows, where these codes mean what it says.
+#[cfg(any(windows, test))]
+fn winsock(code: i32) -> Option<Fault> {
+    /// WinSock error codes (`winerror.h`), named here rather than pulled from `windows-sys`
+    /// for eleven constants that have not changed since Winsock 1.1.
+    const WSAEINTR: i32 = 10004;
+    const WSAEBADF: i32 = 10009;
+    const WSAEFAULT: i32 = 10014;
+    const WSAEINVAL: i32 = 10022;
+    const WSAEMFILE: i32 = 10024;
+    const WSAEWOULDBLOCK: i32 = 10035;
+    const WSAENOTSOCK: i32 = 10038;
+    const WSAECONNABORTED: i32 = 10053;
+    const WSAECONNRESET: i32 = 10054;
+    const WSAENOBUFS: i32 = 10055;
+    const WSAECONNREFUSED: i32 = 10061;
+    match code {
+        WSAEBADF | WSAENOTSOCK | WSAEINVAL | WSAEFAULT => Some(Fault::Fatal),
+        WSAEMFILE | WSAENOBUFS => Some(Fault::BackOff),
+        WSAECONNABORTED | WSAECONNRESET | WSAECONNREFUSED | WSAEINTR | WSAEWOULDBLOCK => {
+            Some(Fault::Skip)
+        }
+        _ => None,
     }
 }
 
@@ -169,6 +232,46 @@ mod tests {
         }
         // An errno nobody listed keeps the door trying rather than ending it.
         assert_eq!(classify(&os(libc::EIO)), Fault::BackOff);
+    }
+
+    /// ledger #1411: on Windows an accept error carries a WinSock code, not an errno, and a
+    /// dead listener (`WSAENOTSOCK`, `WSAEBADF`, `WSAEINVAL`, `WSAEFAULT`) must end the loop
+    /// the way `ENOTSOCK` and its kin do on Unix, rather than back off against it forever.
+    #[cfg(windows)]
+    #[test]
+    fn a_dead_listener_is_fatal_on_windows() {
+        let os = io::Error::from_raw_os_error;
+        for code in [10038, 10009, 10022, 10014] {
+            assert_eq!(classify(&os(code)), Fault::Fatal, "WinSock {code}");
+        }
+        for code in [10024, 10055] {
+            assert_eq!(classify(&os(code)), Fault::BackOff, "WinSock {code}");
+        }
+        for code in [10053, 10054, 10061, 10004, 10035] {
+            assert_eq!(classify(&os(code)), Fault::Skip, "WinSock {code}");
+        }
+        // WSAENETDOWN: the network subsystem failed; back off rather than spin on it.
+        assert_eq!(classify(&os(10050)), Fault::BackOff);
+    }
+
+    /// The Windows table, checked on every platform (ledger #1411); the test above checks
+    /// that `classify` consults it on Windows.
+    #[test]
+    fn the_winsock_table_places_each_code_with_its_errno_twin() {
+        for code in [10038, 10009, 10022, 10014] {
+            assert_eq!(winsock(code), Some(Fault::Fatal), "WinSock {code}");
+        }
+        for code in [10024, 10055] {
+            assert_eq!(winsock(code), Some(Fault::BackOff), "WinSock {code}");
+        }
+        for code in [10053, 10054, 10061, 10004, 10035] {
+            assert_eq!(winsock(code), Some(Fault::Skip), "WinSock {code}");
+        }
+        // The Linux-only pending-network-error Skips have no WinSock entry: WSAENETDOWN,
+        // WSAETIMEDOUT, WSAEOPNOTSUPP and a code nobody listed are left to the fallback.
+        for code in [10050, 10060, 10045, 10093] {
+            assert_eq!(winsock(code), None, "WinSock {code}");
+        }
     }
 
     #[test]
