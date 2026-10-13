@@ -169,17 +169,24 @@ Nothing here blocked the smoke run. These are what a person would hit next.
   how the flag's absolutizing is specified on Windows, not only a separator.
 - size: small.
 
-**W9. The HTTP edge never stops on a dead listener on Windows.**
+**W9. The HTTP edge never stops on a dead listener on Windows.** FIXED (ledger #1411).
 - crate: `ikigai-web` (`accept.rs`); compile warning, verbatim: ``warning: variant `Fatal` is never
   constructed``.
 - cause: the accept-error table is `cfg(unix)` errno values; on Windows only `io::ErrorKind` is
   consulted, which never yields `Fatal`, so a listener that can no longer accept backs off and
   retries forever instead of ending the loop with an error.
-- cfg-gated already: yes, which is the gap.
-- remedy: a `cfg(windows)` arm mapping the WinSock codes (`WSAENOTSOCK` 10038, `WSAEBADF` 10009,
-  `WSAEINVAL` 10022 to `Fatal`; `WSAEMFILE` 10024, `WSAENOBUFS` 10055 to `BackOff`) and its
-  test. `ikigai-web/tests/accept_errors.rs` is `cfg(unix)` too.
-- size: small.
+- cfg-gated already: yes, which was the gap.
+- fix: a `cfg(windows)` arm in `classify` consults a WinSock table (`winsock`), each code placed
+  with its errno twin: `WSAEBADF` 10009, `WSAEFAULT` 10014, `WSAEINVAL` 10022, `WSAENOTSOCK` 10038
+  to `Fatal`; `WSAEMFILE` 10024, `WSAENOBUFS` 10055 to `BackOff`; `WSAEINTR` 10004,
+  `WSAEWOULDBLOCK` 10035, `WSAECONNABORTED` 10053, `WSAECONNRESET` 10054, `WSAECONNREFUSED` 10061
+  to `Skip`. The Unix Skip entries that exist because Linux passes a pending network error out of
+  `accept(2)` (`ENETDOWN`, `ETIMEDOUT`, …) have no WinSock entry on purpose: Windows documents
+  `WSAENETDOWN` from `accept` as the network subsystem failing, so it keeps backing off rather
+  than spinning. The table is pure and tested on every platform; a `cfg(windows)` test checks
+  that `classify` consults it, and it failed on this job before the fix. The module docs carry
+  the full table. `ikigai-web/tests/accept_errors.rs` (real descriptor exhaustion) is still
+  `cfg(unix)` (W12).
 
 **W10. The space's take is not a compare-and-swap on Windows.**
 - crate: `ikigai-intray`; verbatim:
@@ -201,7 +208,7 @@ Nothing here blocked the smoke run. These are what a person would hit next.
 
 **W11. Windows-only warnings would fail a `clippy -D warnings` gate.** `ikigai-embedded`
 (`Permission`, `judge_permissions`, `judge_directory`: pure judges tested on every platform but
-called only under `cfg(unix)`), `ikigai-web` (`Fault::Fatal`, W9), and one unused test helper
+called only under `cfg(unix)`), `ikigai-web` (`Fault::Fatal`, W9, now fixed), and one unused test helper
 (`public_registration_succeeds`). Small; it is the first thing a Windows clippy job would need.
 
 **W12. Coverage: the binary is almost untested on Windows.** 19 of the 20 integration test files
