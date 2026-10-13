@@ -2681,7 +2681,7 @@ fn connect_mount_quic(
     ))
 }
 
-#[cfg(all(feature = "embedded", feature = "ipc"))]
+#[cfg(all(feature = "embedded", feature = "ipc", unix))]
 fn connect_mount_ipc(
     socket: &str,
     kind: ikigai_embedded::MountKind,
@@ -2704,14 +2704,16 @@ fn connect_mount_ipc(
     Ok(std::sync::Arc::new(resolver))
 }
 
-#[cfg(all(feature = "embedded", not(feature = "ipc")))]
+// `ikigai-ipc` is `#![cfg(unix)]` (empty elsewhere), so the `ipc` feature alone does not
+// make the dial exist: a default Windows build has the feature and an empty crate.
+#[cfg(all(feature = "embedded", not(all(feature = "ipc", unix))))]
 fn connect_mount_ipc(
     _socket: &str,
     _kind: ikigai_embedded::MountKind,
     flag: &'static str,
 ) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
     Err(format!(
-        "{flag} of a Unix socket needs the `ipc` feature (Unix only)"
+        "{flag} of a Unix socket needs the `ipc` feature on a Unix platform"
     ))
 }
 
@@ -4962,6 +4964,7 @@ mod mount_cert_tests {
 
     /// The end to end case the ledger item reported: a `~` socket in a config line DIALS the
     /// expanded path. The home is a scratch directory, never `$HOME`.
+    #[cfg(all(feature = "ipc", unix))]
     #[test]
     fn a_config_mount_lines_tilde_socket_dials_the_peer() {
         use ikigai_core::{builtins, EndpointSpace, Exact, Kernel};
@@ -5000,6 +5003,7 @@ mod mount_cert_tests {
     /// REPL's list was blind to an undialed prefer mount — the same
     /// chicken-and-egg cli #270 fixed for mcp, which the ikigai-deno
     /// satellite then hit interactively.)
+    #[cfg(all(feature = "ipc", unix))]
     #[test]
     fn a_prefer_mounts_entries_dial_a_live_peer() {
         use ikigai_core::{builtins, EndpointSpace, Exact, Kernel};
