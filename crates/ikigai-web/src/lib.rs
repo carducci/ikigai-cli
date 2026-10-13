@@ -923,7 +923,10 @@ async fn read_head<S: AsyncRead + Unpin>(sock: &mut S, buf: &mut Vec<u8>) -> std
 /// request it serves: the head within [`EdgeConfig::header_timeout`] and 64 KiB, a body only
 /// by `Content-Length` (a transfer coding is refused, not ignored), at most
 /// [`EdgeConfig::max_body_bytes`] (refused with `413`, never truncated), delivered within
-/// [`EdgeConfig::body_timeout`], and never a partial one.
+/// [`EdgeConfig::body_timeout`], and never a partial one. An HTTP/1.1 request that asks
+/// `Expect: 100-continue` is sent the interim `HTTP/1.1 100 Continue` once its head has passed
+/// every check made on the head alone, and before the body is read, so a client holding its
+/// body back is never left waiting out its own timeout.
 ///
 /// `Ok(Some(request))` is a whole request, `peer` set on it. `Ok(None)` means there is nothing
 /// to answer: the client hung up before a request arrived, or the request was REFUSED and the
@@ -1060,6 +1063,26 @@ where
         )
         .await;
     }
+    // INVITE A BODY THE CLIENT IS HOLDING BACK (ledger #1408). A client that sends `Expect:
+    // 100-continue` sends the head alone and waits for the interim `100` before the body, so a
+    // door that reads the body without saying it costs every write the client's whole expect
+    // timeout (curl's 1 s, a JVM HTTP client's 3 s), or, for a client that never gives up, the
+    // body deadline and a 408. It is sent HERE, after every refusal that is decided on the head
+    // alone (framing, the declared length), so a refused client is spared the upload: that is
+    // what the expectation is for. Not for HTTP/1.0, which cannot read an interim answer and
+    // whose expectation a server MUST ignore, and not when the whole body has already arrived
+    // (RFC 9110 §10.1.1). Any other expectation is ignored, as RFC 9110 permits.
+    if body.len() < cl && expects_continue(&buf[..header_end], &req) {
+        let invite = async {
+            sock.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+            sock.flush().await
+        };
+        match tokio::time::timeout(wt, invite).await {
+            Ok(done) => done?,
+            // A client that will not take the invitation has no one left to answer.
+            Err(_) => return Ok(None),
+        }
+    }
     // No second size check is needed in the loop: it stops at `cl`, and `cl <= max`. The
     // read may overshoot by one buffer, which is why the body is cut to the length the
     // client declared — those trailing bytes are the next pipelined request, not this body.
@@ -1101,6 +1124,22 @@ where
     req.body = body;
     req.peer = peer;
     Ok(Some(req))
+}
+
+/// Whether a request asks `Expect: 100-continue` in a version that can take the interim
+/// answer: HTTP/1.1, read off the request line of `head` (the request head through its last
+/// header line), and the expectation's token in any case (RFC 9110 §10.1.1).
+fn expects_continue(head: &[u8], req: &HttpRequest) -> bool {
+    let line = head.split(|&b| b == b'\n').next().unwrap_or_default();
+    let version = line
+        .split(|b| b.is_ascii_whitespace())
+        .rfind(|part| !part.is_empty());
+    version == Some(&b"HTTP/1.1"[..])
+        && req.header("expect").is_some_and(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("100-continue"))
+        })
 }
 
 /// Write a refusal [`read_request`] decided on, and report that there is no request.
@@ -5019,6 +5058,148 @@ mod tests {
             out.ends_with("hello"),
             "only the declared five bytes are the body, got: {out}"
         );
+    }
+
+    /// How long a client that sent `Expect: 100-continue` may wait for the door's first word.
+    /// A JVM HTTP client waits 3 s and curl 1 s before sending the body anyway, so a door that
+    /// says nothing costs every write that long (ledger #1408); a prompt door answers in
+    /// milliseconds.
+    const PROMPT: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// Send `head` the way a client honoring `Expect: 100-continue` does: the head alone, then
+    /// wait (at most [`PROMPT`]) for the door's first answer before the body. Returns that first
+    /// answer's head and the final response: after a `100`, the body is sent and the final
+    /// response is what follows; a door may instead answer its final status at once (RFC 9110
+    /// §10.1.1), and then the body is never sent.
+    async fn expect_continue(addr: SocketAddr, head: &str, body: &[u8]) -> (String, String) {
+        let mut c = connect(addr).await;
+        c.write_all(head.as_bytes()).await.unwrap();
+        let mut got = Vec::new();
+        let mut tmp = [0u8; 1024];
+        let first = tokio::time::timeout(PROMPT, async {
+            loop {
+                if let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                    return end + 4;
+                }
+                match c.read(&mut tmp).await {
+                    Ok(0) | Err(_) => return got.len(),
+                    Ok(n) => got.extend_from_slice(&tmp[..n]),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the door said nothing within {PROMPT:?} to a head asking `Expect: \
+                 100-continue`, so the client sits out its whole expect timeout"
+            )
+        });
+        let interim = String::from_utf8_lossy(&got[..first]).into_owned();
+        let mut rest = got[first..].to_vec();
+        if interim.starts_with("HTTP/1.1 100 ") {
+            c.write_all(body).await.unwrap();
+        } else {
+            rest = got;
+        }
+        let _ = c.read_to_end(&mut rest).await;
+        (interim, String::from_utf8_lossy(&rest).into_owned())
+    }
+
+    /// ledger #1408: a write whose client asks `Expect: 100-continue` gets the interim `100`
+    /// at once, then its answer. The door reads the body only after inviting it, so a door
+    /// that never invites leaves the client waiting out its own timeout on every write.
+    #[tokio::test]
+    async fn an_expecting_write_is_invited_to_send_its_body_at_once() {
+        let addr = start().await;
+        let (interim, out) = expect_continue(
+            addr,
+            "POST /test/writable HTTP/1.1\r\nHost: x\r\nContent-Type: text/plain\r\n\
+             Expect: 100-continue\r\nContent-Length: 5\r\n\r\n",
+            b"hello",
+        )
+        .await;
+        assert_eq!(interim, "HTTP/1.1 100 Continue\r\n\r\n");
+        assert!(out.starts_with("HTTP/1.1 200 "), "got: {out}");
+        assert!(
+            out.ends_with("hello"),
+            "the body reached the endpoint: {out}"
+        );
+    }
+
+    /// The token is case-insensitive (RFC 9110 §10.1.1), as clients spell it variously.
+    #[tokio::test]
+    async fn the_expectation_is_read_case_insensitively() {
+        let addr = start().await;
+        let (interim, out) = expect_continue(
+            addr,
+            "PUT /test/writable HTTP/1.1\r\nHost: x\r\nContent-Type: text/plain\r\n\
+             expect: 100-Continue\r\nContent-Length: 2\r\n\r\n",
+            b"hi",
+        )
+        .await;
+        assert_eq!(interim, "HTTP/1.1 100 Continue\r\n\r\n");
+        assert!(out.starts_with("HTTP/1.1 200 "), "got: {out}");
+    }
+
+    /// A route that does not take the method is not a reason to leave the client waiting:
+    /// it answers promptly (its `405` after the body, or before it), never after a stall.
+    #[tokio::test]
+    async fn an_expecting_post_to_a_read_only_path_is_answered_promptly() {
+        let addr = start().await;
+        let (_, out) = expect_continue(
+            addr,
+            "POST /test/id/hello HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\n\
+             Content-Length: 5\r\n\r\n",
+            b"hello",
+        )
+        .await;
+        assert!(out.starts_with("HTTP/1.1 405 "), "got: {out}");
+    }
+
+    /// The same for a door that refuses the caller at admission (the general door's form of
+    /// an unauthenticated write; the layers front's `401` is pinned in the cli's own suite).
+    #[tokio::test]
+    async fn an_expecting_write_refused_at_admission_is_answered_promptly() {
+        let addr = start_with(admitting(403)).await;
+        let (_, out) = expect_continue(
+            addr,
+            "POST /test/writable HTTP/1.1\r\nHost: evil\r\nExpect: 100-continue\r\n\
+             Content-Length: 5\r\n\r\n",
+            b"hello",
+        )
+        .await;
+        assert!(out.starts_with("HTTP/1.1 403 "), "got: {out}");
+    }
+
+    /// A declared length over the bound is refused with its final status and NO invitation:
+    /// saving the client that upload is what `Expect` is for.
+    #[tokio::test]
+    async fn an_expecting_body_over_the_bound_is_refused_without_an_invitation() {
+        let addr = start().await;
+        let (interim, out) = expect_continue(
+            addr,
+            "PUT /test/writable HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\n\
+             Content-Length: 50000000\r\n\r\n",
+            b"",
+        )
+        .await;
+        assert!(interim.starts_with("HTTP/1.1 413 "), "got: {interim}");
+        assert!(!out.contains("100 Continue"), "got: {out}");
+    }
+
+    /// An HTTP/1.0 client cannot read an interim answer, so the expectation is ignored there
+    /// (RFC 9110 §10.1.1): the answer is the final one alone.
+    #[tokio::test]
+    async fn an_http_1_0_request_gets_no_invitation() {
+        let addr = start().await;
+        let out = roundtrip(
+            addr,
+            "PUT /test/writable HTTP/1.0\r\nHost: x\r\nExpect: 100-continue\r\n\
+             Content-Length: 5\r\n\r\nhello",
+        )
+        .await;
+        assert!(out.starts_with("HTTP/1.1 200 "), "got: {out}");
+        assert!(!out.contains("100 Continue"), "got: {out}");
     }
 
     // Real headers, verbatim. A suite that only ever sends `*/*` is exactly how a
