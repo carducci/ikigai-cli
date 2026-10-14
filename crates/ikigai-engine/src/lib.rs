@@ -21,5 +21,5 @@ mod plan;
 pub mod plan_space;
 pub mod suggest;
 
-pub use engine::{Action, CacheStats, Engine, Entry, Viewer, COMMANDS, HELP};
+pub use engine::{Action, CacheStats, ContractNote, Engine, Entry, Viewer, COMMANDS, HELP};
 pub use fanout::FanOut;

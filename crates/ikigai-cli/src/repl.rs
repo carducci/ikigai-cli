@@ -34,6 +34,7 @@ pub fn run_commands(engine: Engine, commands: &[String]) -> i32 {
                     eprintln!("[{label}]");
                 }
                 report_fan_out(&engine);
+                report_contract_notes(&engine);
                 total.merge(entry.cache);
                 ran += 1;
             }
@@ -109,6 +110,7 @@ pub fn run(engine: Engine, topology: &[String], quiet: bool) {
                     eprintln!("[{label}]");
                 }
                 report_fan_out(&engine);
+                report_contract_notes(&engine);
             }
             Action::Noop => {}
         }
@@ -126,6 +128,16 @@ pub fn run(engine: Engine, topology: &[String], quiet: bool) {
 fn report_fan_out(engine: &Engine) {
     if let Some(fan_out) = engine.last_fan_out() {
         eprintln!("[{fan_out}]");
+    }
+}
+
+/// Say which targets' argument contracts the line could not read (ledger #98) — one
+/// `[contract unavailable for …]` line each, on stderr beside the cache and fan-out notes.
+/// Without a contract the engine routes a value to `in` and leaves an undeclared
+/// `key=value` as text; that still works, and this is what says it happened.
+fn report_contract_notes(engine: &Engine) {
+    for note in engine.last_contract_notes() {
+        eprintln!("[{note}]");
     }
 }
 
