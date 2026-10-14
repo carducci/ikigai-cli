@@ -491,6 +491,53 @@ The local file module (`urn:file:*`) is jailed to one directory, first match win
 3. `$IKIGAI_FILES`, kept as a fallback;
 4. `~/.ikigai/workspace`.
 
+## The spam filter (`ikigai-bayes`)
+
+The local root binds [`ikigai-bayes`](https://github.com/ikigai-rs/ikigai-bayes), a
+SpamBayes-style text classifier, when it is given a state directory and at least one model:
+
+```sh
+ikigai --daemon --name edge --bayes-state ~/.ikigai/bayes --bayes-model contact
+printf 'buy now' | ikigai -c 'source urn:bayes:contact:score'            # spam / ham / unsure, and why
+printf '%s' "$msg" | ikigai -c 'sink urn:bayes:contact:train label=spam'  # or label=ham
+```
+
+- `--bayes-state <dir>` (relative to the working directory), else `bayes.state` in `config.toml`
+  (instance-scoped as `<name>.bayes.state`; relative to the config home, a leading `~` to
+  `$HOME`). `--bayes-model <name>` repeats, else every `bayes.models` line (instance-scoped as
+  `<name>.bayes.models`; a line may name several, separated by commas). Both halves or neither:
+  with neither nothing is bound; one without the other stops the start.
+- Each model is `urn:bayes:<name>:score`, `:train`, `:untrain` and `:stats`, plus
+  `urn:bayes:models`. A pipe fills `content`.
+- **One process per state directory.** The module holds `<state>/LOCK` for the life of the process,
+  so a second process on the same directory stops at startup with the holder's pid. The flags are
+  accepted by the REPL and `-c`, `--daemon`, `mcp` and `serve <socket>`, and refused by the served
+  doors (`serve quic://…`, `serve --http`) and `--connect`. ⚠ The config home is shared by every
+  process on the machine, so prefer the flags on the one unit that holds the model, or the
+  `<name>.` keys: unscoped `bayes.*` lines make every REPL try to open it.
+- **The state is as sensitive as the messages** (it keeps every trained message's token set). A
+  missing directory is created at mode 0700; an existing one that group or others can read is
+  reported on stderr.
+- Startup prints one line: `ikigai: bayes: contact (N messages: S spam, H ham) — state in <dir>
+  (flag)` (not in a `-c` batch or `--quiet`).
+
+**Authority.** Each model's doors declare `urn:cap:bayes:read:<name>` (score, stats) and
+`urn:cap:bayes:train:<name>` (train, untrain); `urn:bayes:models` needs none. Nothing grants them
+by default: a REPL's root session holds everything, and anything narrower needs the grant. A
+reactive space's handler runs under the host's `<config home>/space-authority/<space>` file (one
+`urn:cap:` scope per line), so on the edge the contact reactor scores and the block reactor
+trains with:
+
+```text
+# ~/.config/ikigai/space-authority/contact          (the contact reactor scores)
+urn:cap:bayes:read:contact
+
+# ~/.config/ikigai/space-authority/contact-blocks   (a block or not-spam click trains)
+urn:cap:bayes:train:contact
+```
+
+Each line is added beside the scopes the file already lists; the file is re-read on every tuple.
+
 ## The HTTP door
 
 `ikigai serve --http <port> --routes <file> --routes-only --cap <scope>…` serves the

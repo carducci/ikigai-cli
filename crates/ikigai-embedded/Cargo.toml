@@ -99,6 +99,12 @@ ikigai-shacl = { workspace = true }
 # (`layers.rs`, ledger #1188). Bound beside `ikigai-shacl` above: admission composes
 # `urn:shacl:validate`, and a layer whose validator is missing admits nothing.
 ikigai-layers = { workspace = true }
+# The spam filter (`urn:bayes:*`, `src/bayes.rs`, ledger #1512), bound in the local root only when
+# the binary arms it with a state directory and named models. Unconditional rather than behind a
+# feature: it adds no third-party crate to the graph (core, serde, serde_json are here already),
+# so a feature would buy no build time and would add a configuration CI has to cover (field
+# guide 9c). The SWITCH is the state directory plus the models, as `layers/` is for the layer host.
+ikigai-bayes = { workspace = true }
 # LLM inference (urn:llm:ask + urn:llm:<provider>:ask), on the native ureq transport.
 ikigai-llm = { workspace = true }
 # Video-conference scheduling (urn:meeting:schedule + urn:meeting:zoom:schedule), on the same
