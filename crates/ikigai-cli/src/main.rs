@@ -368,8 +368,15 @@ struct Mount {
 /// trailing comma) and the same prefix twice are refused rather than read as something: both
 /// are typos, and an empty prefix would match every IRI. A single prefix is passed through
 /// exactly as before, empty included, so no existing form changes meaning.
+///
+/// A prefix under the kernel's reserved namespace (`urn:kernel:`, or `urn:kernel` itself) is
+/// refused too (ledger #1337): core answers those names itself, ahead of every mount, so such
+/// a mount never applies, and an override that silently reads the LOCAL manifold is worse
+/// than a refusal for an operator checking a door's. A prefix that merely CONTAINS the
+/// namespace (`urn:`) still mounts everything else under it.
 fn mount_prefixes(prefix: &str) -> Result<Vec<&str>, String> {
     if !prefix.contains(',') {
+        refuse_kernel_prefix(prefix)?;
         return Ok(vec![prefix]);
     }
     let parts: Vec<&str> = prefix.split(',').collect();
@@ -382,8 +389,25 @@ fn mount_prefixes(prefix: &str) -> Result<Vec<&str>, String> {
         if parts[..at].contains(part) {
             return Err(format!("`{prefix}` names `{part}` twice"));
         }
+        refuse_kernel_prefix(part)?;
     }
     Ok(parts)
+}
+
+/// The namespace core answers itself, ahead of every mount (core's `CORE_SEAL`).
+const KERNEL_NAMESPACE: &str = "urn:kernel:";
+
+/// Refuse a mount prefix every name under which is the kernel's own (see [`mount_prefixes`]).
+fn refuse_kernel_prefix(prefix: &str) -> Result<(), String> {
+    if prefix.starts_with(KERNEL_NAMESPACE) || prefix == KERNEL_NAMESPACE.trim_end_matches(':') {
+        return Err(format!(
+            "`{prefix}` is under `{KERNEL_NAMESPACE}`, the namespace every kernel answers ITSELF \
+             ahead of any mount, so this mount would never apply and the names would be read \
+             from this kernel, not the target. To read another kernel's `{KERNEL_NAMESPACE}*`, \
+             connect to it: `ikigai --connect <target> -c 'source urn:kernel:actions'`"
+        ));
+    }
+    Ok(())
 }
 
 /// `<prefix>=<target>` split for the flag (or config line) `what`, with the prefixes checked
@@ -4868,6 +4892,47 @@ mod mount_cert_tests {
 
     /// A malformed prefix list stops the parse, in every flag and in a config line, rather
     /// than reading an empty prefix (which would match every IRI) or a doubled one.
+    /// ledger #1337: core answers `urn:kernel:` itself, ahead of every mount, so a mount,
+    /// override or prefer under it never applies, and `--override urn:kernel:=quic://door`
+    /// read the LOCAL manifold as if it were the door's. Refused at parse time, naming the
+    /// reserved prefix, in every flag, every mode and the config home's `mount` line.
+    #[test]
+    fn a_mount_under_the_kernels_reserved_prefix_is_refused() {
+        for spec in [
+            "urn:kernel:=quic://door:4433",
+            "urn:kernel:actions=quic://door:4433",
+            "urn:kernel=quic://door:4433",
+            "urn:a:,urn:kernel:=quic://door:4433",
+        ] {
+            for flag in ["--mount", "--override", "--prefer"] {
+                let err = match parse_argv(argv(&[flag, spec]).into_iter()) {
+                    Err(e) => e,
+                    Ok(_) => panic!("{flag} {spec} parsed"),
+                };
+                assert!(
+                    err.contains(flag)
+                        && err.contains("`urn:kernel:`")
+                        && err.contains("--connect"),
+                    "{flag} {spec}: {err}"
+                );
+            }
+            for mode in [&["serve", "/tmp/x.sock"][..], &["mcp"][..]] {
+                let mut args = mode.to_vec();
+                args.extend(["--override", spec]);
+                assert!(parse_argv(argv(&args).into_iter()).is_err(), "{args:?}");
+            }
+            let line = format!("override {spec} ~/certs");
+            let err = mounts_from_config_lines(vec![line.clone()], std::path::Path::new("/h"))
+                .map(|_| ())
+                .expect_err(&line);
+            assert!(err.contains("`urn:kernel:`"), "{line}: {err}");
+        }
+        // A prefix that merely CONTAINS the kernel's namespace still mounts: everything else
+        // under it goes to the peer, and the kernel's own names stay the kernel's.
+        assert_eq!(mount_prefixes("urn:"), Ok(vec!["urn:"]));
+        assert_eq!(mount_prefixes("urn:kernels:"), Ok(vec!["urn:kernels:"]));
+    }
+
     #[test]
     fn an_empty_or_doubled_prefix_in_a_list_is_refused() {
         for spec in [

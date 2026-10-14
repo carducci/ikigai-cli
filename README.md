@@ -416,6 +416,14 @@ they FOLLOW, so two peers never share a certificate set. The config home's `moun
 (`mount = "override urn:x:=quic://host:4433 ~/certs/x"`) say the same thing for the whole
 machine.
 
+**Nothing mounts under `urn:kernel:`** (ikigai-cli 0.1.62+). Every kernel answers its own
+`urn:kernel:*` names itself, ahead of any mount, so a mount, override or prefer under that
+prefix would never apply: before 0.1.62 `--override urn:kernel:=quic://door` was accepted and
+read THIS kernel's manifold as if it were the door's. It is refused at startup, naming the
+prefix. To read another kernel's catalog or action manifold, connect to it:
+`ikigai --connect quic://door:4433 -c 'source urn:kernel:actions'`. A broader prefix such as
+`urn:` still mounts, and the kernel's own names stay the kernel's.
+
 **A leading `~` in a config-home path** (ikigai-cli 0.1.58+). Every config-home value that
 names a path expands a leading `~` to the current user's home by one rule: a `mount` line's
 socket and certificate directory (`mount = "prefer urn:x:=~/.ikigai/x.sock"`), `files`,
