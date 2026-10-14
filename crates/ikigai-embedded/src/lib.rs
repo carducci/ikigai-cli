@@ -48,6 +48,10 @@ const XSD_BOOLEAN: &str = "http://www.w3.org/2001/XMLSchema#boolean";
 // harvested from the root's own constructor list, the declaration read through a bootstrap
 // kernel, and `urn:iki:host:arrangement`, the root's arrangement as a declaration.
 pub mod arrangement;
+// The spam filter (`urn:bayes:*`, ledger #1512): bound in the local root when the binary arms it
+// with a state directory and named models. One writer per state directory, so one open per
+// process; see the module note.
+pub mod bayes;
 mod browse;
 pub mod clients;
 pub mod config;
@@ -4722,6 +4726,15 @@ fn root_members() -> Vec<Arc<dyn Space>> {
     #[cfg(feature = "store")]
     if let Some(space) = store::setup() {
         spaces.push(space as Arc<dyn Space>);
+    }
+    // The spam filter (urn:bayes:{model}:score/train/untrain/stats + urn:bayes:models), when
+    // the binary ARMED it (`--bayes-state` + `--bayes-model`, or the config home's `bayes.*`
+    // keys) — see the `bayes` module. An `Arc` of ONE space, opened once per process, for the
+    // store's reason above: the state directory admits one writer, and a second open refuses
+    // even inside this process. A process that never armed it (a served door, a test binary)
+    // binds nothing here. NOT in `served_space`: the public face must never hold the model.
+    if let Some(space) = bayes::space() {
+        spaces.push(space);
     }
     // The stored programs (`PROGRAMS`): each bound as an endpoint — the program IS the
     // endpoint — IF the workspace provides its file. Absent the file, the endpoint simply

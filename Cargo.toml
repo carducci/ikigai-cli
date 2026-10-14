@@ -1647,6 +1647,12 @@ ikigai-ledger = "0.11.0"
 # workspace that changes nothing a request sees: `ikigai-shacl` above keeps its defaults, so feature
 # unification links rudof and admission validates with it, exactly as under 0.2.8. `"0.2.9"` is `<0.3.0`.
 ikigai-layers = "0.2.9"
+# The spam filter the local root binds when armed (`ikigai-embedded/src/bayes.rs`, ledger #1512):
+# a naive-Bayes text classifier as `urn:bayes:{model}:*`. 0.1.0 is the first release and the API
+# this host calls (`Bayes::open`, `ModelConfig::new`, `space`, `model_iri`). It brings no new
+# third-party crate: its dependencies are ikigai-core, serde and serde_json, already here.
+# ⚠ `"0.1.0"` is `<0.2.0`: raise it when the module reaches 0.2.
+ikigai-bayes = "0.1.0"
 # ── Intra-workspace siblings: LOCKSTEP pins, not floors ───────────────────────
 # The seventeen members that take `version.workspace = true` are released TOGETHER, at one
 # version, always. So every sibling pin below states the CURRENT workspace version rather

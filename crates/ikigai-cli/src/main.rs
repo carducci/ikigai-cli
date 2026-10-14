@@ -130,6 +130,17 @@ usage:
   ikigai --files <dir>         the local file module's root (urn:file:*), any mode. Else `files`
                                in config.toml (instance-scoped as <name>.files; relative to the
                                config home), else $IKIGAI_FILES, else ~/.ikigai/workspace
+  ikigai --bayes-state <dir> --bayes-model <name>
+                               bind the spam filter (ikigai-bayes: urn:bayes:<name>:score, :train,
+                               :untrain, :stats, urn:bayes:models) in the LOCAL root, over a state
+                               directory this process holds alone (a second process on it is
+                               refused, naming the holder's pid). --bayes-model repeats. Else
+                               `bayes.state` / `bayes.models` in config.toml (instance-scoped as
+                               <name>.bayes.*; relative to the config home). Both halves or neither:
+                               with no model named nothing is bound. A missing directory is created
+                               at 0700. REPL, -c, --daemon, mcp and serve <socket>; refused by the
+                               served doors and --connect. The doors need urn:cap:bayes:read:<name>
+                               and urn:cap:bayes:train:<name>, which nothing grants by default
   ikigai --no-config-mounts    compose ZERO mounts: decline the machine's topology instead of
                                enumerating a replacement. Honoured by every mode that builds a
                                kernel (REPL, -c, --daemon, serve, mcp); refuses to start beside
@@ -679,6 +690,40 @@ fn refuse_arrangement_flag(door: &str) {
     }
 }
 
+/// Open the spam filter's models for a mode that builds the local root, once, before the first
+/// kernel is built (ledger #1512): `--bayes-state` + `--bayes-model`, else the config home's
+/// `bayes.*` keys. **Fail loud**: half a setting, a state directory another process holds (the
+/// refusal names its pid) or a model file that will not load stops the start, exit 2 — never a
+/// host that runs without the filter it was told to bind. `announce` prints the one startup
+/// line on stderr; a `-c` batch and `--quiet` stay quiet.
+#[cfg(feature = "embedded")]
+fn arm_bayes(announce: bool) {
+    match ikigai_embedded::bayes::arm() {
+        Ok(Some(line)) if announce => eprintln!("{line}"),
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("ikigai: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Refuse `--bayes-state` / `--bayes-model` on a door that builds no local root. The served
+/// postures are minimal by design, and the public HTTP face in particular must never hold the
+/// model: one writer per state directory, and the daemon is it.
+#[cfg(feature = "embedded")]
+fn refuse_bayes_flags(door: &str) {
+    if ikigai_embedded::bayes::flags_given() {
+        eprintln!(
+            "ikigai: {} and {} bind the spam filter in the LOCAL root, and {door} does not build \
+             one",
+            ikigai_embedded::bayes::STATE_FLAG,
+            ikigai_embedded::bayes::MODEL_FLAG
+        );
+        std::process::exit(2);
+    }
+}
+
 /// `-V` / `--version` appearing anywhere in argv.
 ///
 /// The scan is exact-token and unconditional — it does not know which flags take a
@@ -711,7 +756,60 @@ fn parse_args() -> Result<Option<Mode>, String> {
         #[cfg(not(feature = "embedded"))]
         let _ = dir;
     }
+    let (bayes_state, bayes_models) = take_bayes(&mut args, cwd.as_deref(), home.as_deref())?;
+    #[cfg(feature = "embedded")]
+    ikigai_embedded::bayes::set_flags(bayes_state, bayes_models);
+    #[cfg(not(feature = "embedded"))]
+    let _ = (bayes_state, bayes_models);
     parse_argv(args.into_iter())
+}
+
+/// Take every `--bayes-state <dir>` and `--bayes-model <name>` (either also as `--flag=value`)
+/// out of `args`, in every mode at once like [`take_files`] (ledger #1512). The directory is made
+/// ABSOLUTE by [`take_dir_flag`]'s rules; the model flag repeats, one name each, in the order
+/// given. Nothing is opened here: the modes that build the local root ARM the model once the
+/// instance name is known (`arm_bayes`), and the served doors refuse the flags by name.
+///
+/// A `--connect` client builds no kernel, so either flag beside it would do nothing, and is
+/// refused rather than ignored.
+fn take_bayes(
+    args: &mut Vec<String>,
+    cwd: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+) -> Result<(Option<std::path::PathBuf>, Vec<String>), String> {
+    let state = take_dir_flag(args, "--bayes-state", "bayes state directory", cwd, home)?;
+    let mut models = Vec::new();
+    let mut at = 0;
+    while at < args.len() {
+        let value = if args[at] == "--bayes-model" {
+            args.remove(at);
+            if at >= args.len() {
+                return Err("--bayes-model needs <name>".to_string());
+            }
+            args.remove(at)
+        } else if let Some(value) = args[at].strip_prefix("--bayes-model=") {
+            let value = value.to_string();
+            args.remove(at);
+            value
+        } else {
+            at += 1;
+            continue;
+        };
+        if value.is_empty() || value.starts_with('-') {
+            return Err(format!(
+                "--bayes-model needs <name>, and was given `{value}`"
+            ));
+        }
+        models.push(value);
+    }
+    if (state.is_some() || !models.is_empty()) && args.iter().any(|arg| arg == "--connect") {
+        return Err(
+            "--bayes-state and --bayes-model bind the spam filter in a kernel this process \
+             BUILDS; a --connect client resolves on another kernel: drop one of the two"
+                .to_string(),
+        );
+    }
+    Ok((state, models))
 }
 
 /// Take every `--config-home <dir>` (or `--config-home=<dir>`) out of `args` and return the
@@ -1463,6 +1561,7 @@ fn main() {
         Mode::Version => println!("{VERSION_LINE}"),
         Mode::Daemon { mounts } => {
             arm_local_root();
+            arm_bayes(true);
             daemon(mounts)
         }
         Mode::Mcp {
@@ -1472,6 +1571,7 @@ fn main() {
             mounts,
         } => {
             arm_local_root();
+            arm_bayes(true);
             mcp(grants, scopes, shows, mounts)
         }
         Mode::CertGenerate { force, dir } => cert_generate(force, dir),
@@ -1513,6 +1613,7 @@ fn main() {
             // The inbound HTTP face takes precedence over IPC/QUIC when `--http` is given.
             (Some(bind), _) => {
                 refuse_arrangement_flag("the HTTP door (`serve --http`), a served posture,");
+                refuse_bayes_flags("the HTTP door (`serve --http`), a served posture,");
                 serve_http(HttpDoor {
                     bind: &bind,
                     caps: &caps,
@@ -1527,6 +1628,7 @@ fn main() {
             }
             (None, Some(t)) if is_quic(t) => {
                 refuse_arrangement_flag("a QUIC door (`serve quic://…`), a served posture,");
+                refuse_bayes_flags("a QUIC door (`serve quic://…`), a served posture,");
                 serve_quic(
                     t,
                     &certs,
@@ -1545,6 +1647,7 @@ fn main() {
             // declaration arranges it exactly as it arranges the REPL's.
             (None, _) => {
                 arm_local_root();
+                arm_bayes(true);
                 serve_ipc(target, mounts)
             }
         },
@@ -1558,6 +1661,7 @@ fn main() {
                 refuse_arrangement_flag("`--connect`, which resolves on another kernel,");
             } else {
                 arm_local_root();
+                arm_bayes(!args.quiet && args.commands.is_empty());
             }
             let (engine, topology) =
                 build_engine(args.connect, args.mounts, &args.certs, args.react).unwrap_or_else(
