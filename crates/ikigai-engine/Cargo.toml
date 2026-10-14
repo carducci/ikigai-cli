@@ -56,7 +56,8 @@ ikigai-fs = { workspace = true }
 ikigai-shacl = { workspace = true }
 serde_json = { workspace = true }
 # The module recipe as one test over the plan space (`tests/conformance.rs`, plan-reader
-# only). 0.6.0 is the floor for SPACE-NAME, the check that `plan_space::space()` claims
-# `urn:iki:space:engine:plan` over the same doors on every call. ⚠ `^0.6.0` is also a
-# ceiling below 0.7.0.
-ikigai-conformance = "0.6.1"
+# only). 0.8.0 is the floor for `Suite::own` (the walk is scoped to the plan doors and the
+# test's stub; `shacl-validate` is inherited, not walked) and REQUIRED; 0.6.0 brought
+# SPACE-NAME, the check that `plan_space::space()` claims `urn:iki:space:engine:plan` over the
+# same doors on every call. ⚠ `^0.8.0` is also a ceiling below 0.9.0.
+ikigai-conformance = "0.8.0"

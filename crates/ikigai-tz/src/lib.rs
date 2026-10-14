@@ -190,14 +190,19 @@ pub fn fresh(repr: Representation, now: DateTime<Utc>, source: NowSource) -> Rep
 /// `urn:tz:convert` — re-represent an instant in the `to=` zone. See the [module docs](crate).
 pub fn convert() -> FnEndpoint {
     FnEndpoint::new("tz-convert", |inv: &Invocation<'_>| {
-        let input = inv
-            .inline_str("in")
-            .or_else(|_| inv.inline_str("content"))
-            .map_err(|_| {
-                Error::Endpoint(
-                    "urn:tz:convert: pass the datetime as `in` (or piped `content`)".to_string(),
-                )
-            })?;
+        // Typed both ways (ikigai-conformance 0.8's REQUIRED): with neither `in` nor a piped
+        // `content` the call is refused as a `MissingArgument` naming `in`, the declared
+        // input; an `in` that is present but unreadable is an `InvalidArgument` naming it,
+        // never "missing" and never a fall-through to `content` (ledger #1001's rule).
+        let input = match inv.inline_str("in") {
+            Err(Error::MissingArgument(_)) => match inv.inline_str("content") {
+                Err(Error::MissingArgument(_)) => {
+                    return Err(Error::MissingArgument("in".to_string()))
+                }
+                content => content?,
+            },
+            given => given?,
+        };
         let to = zone_arg(inv, "to")?;
         let instant = to_instant(input.trim(), inv)?;
         Ok(text(instant.with_timezone(&to).to_rfc3339()).cacheable())
@@ -387,6 +392,45 @@ mod tests {
                 assert!(detail.contains("UTF-8"), "{detail}");
             }
             other => panic!("expected InvalidArgument for `to`, got {other:?}"),
+        }
+    }
+
+    /// ikigai-conformance 0.8 REQUIRED: a call with no datetime at all is a typed
+    /// `MissingArgument` naming the declared input `in`, not an untyped endpoint error, so a
+    /// caller can tell its own omission from a failure of the endpoint.
+    #[test]
+    fn a_missing_datetime_is_a_typed_missing_in() {
+        let kernel = Kernel::new(Arc::new(space()));
+        let request = Request::new(Verb::Source, Iri::parse("urn:tz:convert").unwrap())
+            .with_arg("to", ArgRef::Inline(b"UTC".to_vec()));
+        match block_on(kernel.issue(request, &Capability::root())) {
+            Err(Error::MissingArgument(name)) => assert_eq!(name, "in"),
+            other => panic!("expected MissingArgument(`in`), got {other:?}"),
+        }
+    }
+
+    /// The piped form still works: `content` stands in for `in` when `in` is absent.
+    #[test]
+    fn a_piped_datetime_still_converts() {
+        let kernel = Kernel::new(Arc::new(space()));
+        let request = Request::new(Verb::Source, Iri::parse("urn:tz:convert").unwrap())
+            .with_arg("content", ArgRef::Inline(b"2026-07-21T12:00:00Z".to_vec()))
+            .with_arg("to", ArgRef::Inline(b"UTC".to_vec()));
+        let repr = block_on(kernel.issue(request, &Capability::root())).expect("converts");
+        assert_eq!(repr.bytes, b"2026-07-21T12:00:00+00:00");
+    }
+
+    /// An `in` that is present but unreadable is invalid, naming `in`; it does not fall
+    /// through to `content` and come back as "missing".
+    #[test]
+    fn a_present_but_unreadable_datetime_is_invalid_not_missing() {
+        let kernel = Kernel::new(Arc::new(space()));
+        let request = Request::new(Verb::Source, Iri::parse("urn:tz:convert").unwrap())
+            .with_arg("in", ArgRef::Inline(vec![0xff, 0xfe]))
+            .with_arg("to", ArgRef::Inline(b"UTC".to_vec()));
+        match block_on(kernel.issue(request, &Capability::root())) {
+            Err(Error::InvalidArgument { name, .. }) => assert_eq!(name, "in"),
+            other => panic!("expected InvalidArgument for `in`, got {other:?}"),
         }
     }
 

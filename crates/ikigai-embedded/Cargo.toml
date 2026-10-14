@@ -151,19 +151,16 @@ futures = { workspace = true }
 # `tests/conformance.rs` for what that changes: the walk fires endpoints under root, and a
 # composing host binds subprocess, network, inference, mail and platform seams.
 #
-# 0.2.0, not 0.1: DECLARATIONS audits the suite's OWN declarations, and a composing host is
-# where that matters most — ONE `Suite` over TWO manifolds carried declarations that could
-# not apply to whichever kernel was being walked. `tests/conformance.rs` is three suites now.
-#
-# ⚠ `"0.2.0"` is a RANGE `<0.3.0`, so this suite is CEILINGED below 0.3.0's AUTHORITY check and
-# 0.5.0's purity rule. 0.5.1 was tried on 2026-10-06 (with core 0.1.85) and reports three
-# findings on endpoints this crate owns — `host-arrangement` CACHEABLE (cached with no thread
-# but its own name), and `calendar-request` / `contact-block` AUTHORITY on the HTTP door (a
-# Sink declaring no `requires` that resolved under no grants). Each needs a decision, not a
-# pin edit, so the move waits for the arc that makes them. Re-tried 2026-10-10 at 0.6.1 (core
-# 0.1.92, the post-0.1.44 re-pin): the SAME three findings and no others against this crate's
-# own endpoints, so the decisions are still the blocker, not the suite.
-ikigai-conformance = "0.2.0"
+# 0.8.0 (the wave of 2026-10-14), up from 0.2.0: `Suite::own` scopes each walk to the ids this
+# workspace owns, so the endpoints of the crates this host composes are inherited and never
+# fired (that replaced a hand partition and about thirty hazard opt-outs), and REQUIRED holds
+# each required input to a typed refusal. The three findings that held this pin at 0.2.0 since
+# 2026-10-06 are decided in `tests/conformance.rs`: `host-arrangement` is declared pure (it
+# re-renders the arrangement the kernel was built from), and `calendar-request` /
+# `contact-block` waive AUTHORITY and REQUIRED with their reasons (a signed link token is the
+# authority, and a bad link of any kind answers one uniform page).
+# ⚠ `^0.8.0` is also a ceiling below 0.9.0.
+ikigai-conformance = "0.8.0"
 # The conformance fixture SEEDS the two edge verifying keys and one signing key, so the
 # decision faces are walked over real state instead of reporting "did not resolve". Same
 # version and features as the library dependency above: the fixture must write exactly the
