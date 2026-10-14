@@ -63,7 +63,10 @@ pub fn generate(force: bool, dir_override: Option<PathBuf>) -> Result<PathBuf, S
         let existing: Vec<String> = ["server.crt", "server.key", "client.crt", "client.key"]
             .iter()
             .map(|name| dir.join(name))
-            .filter(|path| path.exists())
+            // `symlink_metadata`, not `exists()`: a dangling link is something at the path
+            // too, and the exclusive create below would refuse it after half the set was
+            // written.
+            .filter(|path| std::fs::symlink_metadata(path).is_ok())
             .map(|path| path.display().to_string())
             .collect();
         if !existing.is_empty() {
@@ -95,16 +98,57 @@ pub fn generate(force: bool, dir_override: Option<PathBuf>) -> Result<PathBuf, S
 }
 
 /// Write `contents` to `path` with `mode`, refusing to clobber unless `force`.
+///
+/// The file is created EXCLUSIVELY with `mode` at open (ledger #90): it is never on disk
+/// with the umask's mode, waiting for a chmod, and an exclusive create refuses whatever is
+/// already at the path, a symlink included, so the existence check and the write are one
+/// step and a key never lands at a link's target. `force` writes a private temporary the
+/// same way beside `path` and renames it over the path, which replaces a file (or a link)
+/// there whole rather than writing through it.
 fn write(path: &std::path::Path, contents: &str, mode: u32, force: bool) -> Result<(), String> {
-    if path.exists() && !force {
-        return Err(format!(
-            "{} already exists (use `--force` to overwrite)",
-            path.display()
-        ));
+    if !force {
+        return write_new(path, contents, mode).map_err(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => format!(
+                "{} already exists (use `--force` to overwrite)",
+                path.display()
+            ),
+            _ => format!("write {}: {e}", path.display()),
+        });
     }
-    std::fs::write(path, contents).map_err(|e| format!("write {}: {e}", path.display()))?;
-    restrict(path, mode)?;
-    Ok(())
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("write {}: no file name", path.display()))?;
+    let partial = path.with_file_name(format!(
+        ".{}.partial-{}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    // A partial left by a crashed run of THIS pid cannot be told from ours; it is ours to
+    // replace. Removing it removes a link too, never its target.
+    let _ = std::fs::remove_file(&partial);
+    write_new(&partial, contents, mode).map_err(|e| format!("write {}: {e}", partial.display()))?;
+    std::fs::rename(&partial, path).map_err(|e| {
+        let _ = std::fs::remove_file(&partial);
+        format!("replace {}: {e}", path.display())
+    })
+}
+
+/// Create `path` exclusively (`O_CREAT|O_EXCL`, which also refuses a symlink there) with
+/// `mode` from the first byte, and write `contents`.
+fn write_new(path: &std::path::Path, contents: &str, mode: u32) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode; // Non-Unix: the user-private config directory's ACLs govern.
+    let mut file = options.open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()
 }
 
 /// The server's identity (its cert + key).
@@ -259,4 +303,97 @@ fn restrict(path: &std::path::Path, mode: u32) -> Result<(), String> {
 fn restrict(_path: &std::path::Path, _mode: u32) -> Result<(), String> {
     // Non-Unix: rely on the user-private config directory's ACLs.
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A fresh scratch directory for one test, removed when the guard drops.
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("ikigai-cli-quic-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn mode(path: &std::path::Path) -> u32 {
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    /// ledger #90: a key is written private from its first byte, `0600` at OPEN, never
+    /// written world-readable and chmod-ed after.
+    #[test]
+    fn a_key_is_private_and_refuses_to_clobber() {
+        let s = Scratch::new("private");
+        let key = s.0.join("server.key");
+        write(&key, "secret", 0o600, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&key).unwrap(), "secret");
+        assert_eq!(mode(&key), 0o600);
+        let err = write(&key, "other", 0o600, false).unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        assert_eq!(std::fs::read_to_string(&key).unwrap(), "secret");
+    }
+
+    /// The existence check and the write were two steps, and the write FOLLOWED a symlink:
+    /// a dangling link at the key's path passed `exists()` and the key landed wherever it
+    /// pointed. Created exclusively at open, the link is refused and nothing is written.
+    #[test]
+    fn a_key_is_never_written_through_a_symlink() {
+        let s = Scratch::new("symlink");
+        let elsewhere = s.0.join("elsewhere");
+        let key = s.0.join("client.key");
+        std::os::unix::fs::symlink(&elsewhere, &key).unwrap();
+        assert!(write(&key, "secret", 0o600, false).is_err());
+        assert!(
+            !elsewhere.exists(),
+            "the key must not land at the link's target"
+        );
+    }
+
+    /// `--force` REPLACES the file at the path: a world-readable file there is replaced by a
+    /// private one, and a symlink there is replaced, not written through.
+    #[test]
+    fn force_replaces_the_path_and_never_writes_through_it() {
+        let s = Scratch::new("force");
+        let key = s.0.join("server.key");
+        std::fs::write(&key, "old").unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write(&key, "new", 0o600, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&key).unwrap(), "new");
+        assert_eq!(mode(&key), 0o600);
+
+        let target = s.0.join("target");
+        std::fs::write(&target, "untouched").unwrap();
+        let link = s.0.join("client.key");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        write(&link, "secret", 0o600, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+        assert!(!std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "secret");
+        assert_eq!(mode(&link), 0o600);
+        // No temporary is left beside the key.
+        let names: Vec<String> = std::fs::read_dir(&s.0)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 3, "{names:?}");
+    }
 }
