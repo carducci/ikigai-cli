@@ -153,7 +153,8 @@ usage:
                                home stores its hash, re-read on every request
   ikigai layers-token list     the tokens: id, the client each is bound to, label, minted
   ikigai layers-token revoke <id>  remove one; its next request is refused (401)
-  ikigai -c '<command>' ...    run command(s) non-interactively, then exit
+  ikigai -c '<command>' ...    run command(s) non-interactively, then exit. Each -c is ONE
+                               statement (a newline does not split it): repeat -c for more
   ikigai -e '<sexpr>' ...       evaluate a Lisp s-expression (urn:lisp:eval), then exit
   ikigai --load <uri> [--cap <s>]  read a script resource and evaluate it as Lisp (--cap narrows first)
   ikigai -h | --help           show this help
