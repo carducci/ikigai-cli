@@ -1265,6 +1265,9 @@ impl Engine {
             .iter()
             .map(|_| Arc::new(Mutex::new(None)))
             .collect();
+        // What a failed branch's argument help reads the contract with, kept before the
+        // requests move into their branches (and before any width hint joins them).
+        let shapes: Vec<RequestShape> = requests.iter().map(RequestShape::of).collect();
         let joins: Vec<BoxFuture<()>> = requests
             .into_iter()
             .zip(hints)
@@ -1327,15 +1330,17 @@ impl Engine {
             // A slot is only ever written whole, so a poisoned lock still holds a whole
             // value; an EMPTY slot means the spawner never ran the branch at all.
             let filled = slot.lock().unwrap_or_else(|p| p.into_inner()).take();
-            let (representation, status) = filled
-                .ok_or_else(|| {
-                    format!(
-                        "branch {} of the fan-out never ran: the spawner returned without \
-                         running it",
-                        at + 1
-                    )
-                })?
-                .map_err(|e| describe(&*self.resolver, &e))?;
+            let result = filled.ok_or_else(|| {
+                format!(
+                    "branch {} of the fan-out never ran: the spawner returned without \
+                     running it",
+                    at + 1
+                )
+            })?;
+            let (representation, status) = match result {
+                Ok(answer) => answer,
+                Err(e) => return Err(self.explain_failure(&shapes[at], &e).await),
+            };
             stats.record(status);
             outputs.push(Staged::from(representation));
         }
@@ -2118,6 +2123,22 @@ impl Engine {
     /// second case is UNAVAILABLE rather than absent, and is recorded as a
     /// [`ContractNote`] for the line (ledger #98).
     pub(crate) async fn describe_struct(&self, iri: &Iri) -> Option<Description> {
+        match self.fetch_contract(iri).await {
+            Ok(description) => Some(description),
+            Err(None) => None,
+            Err(Some(reason)) => {
+                self.note_contract_unavailable(iri, reason);
+                None
+            }
+        }
+    }
+
+    /// The fetch behind [`describe_struct`](Self::describe_struct), without its note:
+    /// `Err(None)` when nothing resolves there (no contract, absent), `Err(Some(reason))`
+    /// when the contract could not be read (unavailable). The error path's argument help
+    /// reads through this, because a contract it merely failed to decorate a refusal with
+    /// is not one the line's routing needed.
+    async fn fetch_contract(&self, iri: &Iri) -> Result<Description, Option<String>> {
         let request = Request::new(Verb::Meta, iri.clone())
             .with_arg("as", ArgRef::Inline(b"application/json".to_vec()));
         // The contract fetch is internal plumbing — its cache outcome isn't part
@@ -2136,26 +2157,55 @@ impl Engine {
             // Nothing resolves there: no contract to read. The request this contract was
             // for fails the same way, and says so itself.
             Err(ikigai_core::Error::Unresolved(_) | ikigai_core::Error::NotFound(_)) => {
-                return None
+                return Err(None)
             }
-            Err(e) => {
-                self.note_contract_unavailable(iri, e.to_string());
-                return None;
-            }
+            Err(e) => return Err(Some(e.to_string())),
         };
-        match serde_json::from_slice(&representation.bytes) {
-            Ok(description) => Some(description),
-            Err(e) => {
-                self.note_contract_unavailable(
-                    iri,
-                    format!(
-                        "its Meta answer is not a JSON description ({}): {e}",
-                        representation.repr_type.media_type
-                    ),
-                );
-                None
-            }
+        serde_json::from_slice(&representation.bytes).map_err(|e| {
+            Some(format!(
+                "its Meta answer is not a JSON description ({}): {e}",
+                representation.repr_type.media_type
+            ))
+        })
+    }
+
+    /// A failed request as a face should say it: [`describe`]'s words, plus — for a typed
+    /// argument refusal — what the target's own contract says about that argument
+    /// (ledger #1499).
+    ///
+    /// ```text
+    /// error: missing required argument `content`
+    ///        `content`: the Turtle to read
+    ///        pipe a value in or pass content=…
+    /// ```
+    ///
+    /// The typed error's own words stay the FIRST line, unchanged, so a script that
+    /// matches them still matches; core's `Display` and the wire form are untouched (the
+    /// faces pin them). The contract is read only here, after the request has already
+    /// failed, so it costs nothing on a request that succeeds. No contract — a kernel with
+    /// no JSON Meta renderer, a target that does not declare the argument — leaves the
+    /// message exactly as [`describe`] gives it.
+    async fn explain_failure(&self, shape: &RequestShape, error: &ikigai_core::Error) -> String {
+        let text = describe(&*self.resolver, error);
+        let (name, missing) = match error {
+            ikigai_core::Error::MissingArgument(name) => (name, true),
+            ikigai_core::Error::InvalidArgument { name, .. } => (name, false),
+            _ => return text,
+        };
+        let Ok(description) = self.fetch_contract(&shape.target).await else {
+            return text;
+        };
+        let lines = argument_help(shape, &description, name, missing);
+        if lines.is_empty() {
+            return text;
         }
+        let mut out = text;
+        for line in lines {
+            out.push('\n');
+            out.push_str(SUGGESTION_INDENT);
+            out.push_str(&line);
+        }
+        out
     }
 
     /// Issue a request, record how the resolver's cache served it, and decode the
@@ -2191,11 +2241,17 @@ impl Engine {
         let capability = self.capability.borrow().clone();
         // The empty chain takes the unscoped path inside `issue_as_async_in` on every resolver,
         // so a line without `as-of=` issues exactly what it issued before chains existed.
-        let (representation, status) = self
+        // The request is consumed by the issue; keep what the error path's argument help
+        // needs to read the contract with.
+        let shape = RequestShape::of(&request);
+        let answer = self
             .resolver
             .issue_as_async_in(request, &capability, incoming, self.line_scope())
-            .await
-            .map_err(|e| describe(&*self.resolver, &e))?;
+            .await;
+        let (representation, status) = match answer {
+            Ok(answer) => answer,
+            Err(e) => return Err(self.explain_failure(&shape, &e).await),
+        };
         let mut stats = self.cache.get();
         stats.record(status);
         self.cache.set(stats);
@@ -2236,6 +2292,99 @@ fn describe(resolver: &dyn Resolver, error: &ikigai_core::Error) -> String {
         Some(note) => format!("{text}\n{SUGGESTION_INDENT}{note}"),
         None => text,
     }
+}
+
+/// What the error path needs from a request it no longer holds: issuing consumes it, and
+/// the argument help reads the target's contract only after the request has failed.
+struct RequestShape {
+    verb: Verb,
+    target: Iri,
+    /// The arguments the request carried by name.
+    named: Vec<String>,
+}
+
+impl RequestShape {
+    fn of(request: &Request) -> Self {
+        RequestShape {
+            verb: request.verb,
+            target: request.target.clone(),
+            named: request.args.keys().cloned().collect(),
+        }
+    }
+}
+
+/// The lines a typed argument refusal of `name` gains from the target's contract
+/// (ledger #1499), in order: the argument's own summary (and, for an enumeration, what it
+/// accepts), then — for a MISSING argument that a value would fill — how to give it. Empty
+/// when the contract does not declare `name` for the request's verb, or says nothing
+/// about it, so an endpoint refusing on behalf of an argument it does not own (a
+/// sub-request's) borrows nobody's description.
+fn argument_help(
+    shape: &RequestShape,
+    description: &Description,
+    name: &str,
+    missing: bool,
+) -> Vec<String> {
+    let inputs = verb_inputs(description, shape.verb);
+    let Some(spec) = inputs.iter().find(|input| input.name == name) else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    // One line under the `error: ` prefix: a summary written across lines is folded.
+    let mut about = spec
+        .summary
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !spec.one_of.is_empty() {
+        let accepted = format!("one of: {}", spec.one_of.join(", "));
+        about = if about.is_empty() {
+            accepted
+        } else {
+            format!("{about} ({accepted})")
+        };
+    }
+    if !about.is_empty() {
+        lines.push(format!("`{name}`: {about}"));
+    }
+    if missing && spec.source == InputSource::Argument && takes_the_value(shape, description, name)
+    {
+        lines.push(format!("pipe a value in or pass {name}=…"));
+    }
+    lines
+}
+
+/// Whether a piped or positional value would land on `name` for this request — the
+/// engine's own routing rule, asked again: a Sink's or Delete's value is always its
+/// `content`, and a Source's goes where [`route_value_name`] sends it. `name` itself is
+/// left out of the named set, so an argument given EMPTY (and refused as missing) still
+/// counts as the value's.
+fn takes_the_value(shape: &RequestShape, description: &Description, name: &str) -> bool {
+    match shape.verb {
+        Verb::Sink | Verb::Delete => name == "content",
+        Verb::Source => {
+            let named: Vec<&str> = shape
+                .named
+                .iter()
+                .map(String::as_str)
+                .filter(|named| *named != name)
+                .collect();
+            route_value_name(&shape.target, Some(description), &named).is_ok_and(|to| to == name)
+        }
+        _ => false,
+    }
+}
+
+/// The inputs a target declares for `verb`, read through `action_specs()` so the flat and
+/// the per-verb authoring forms answer alike (see [`source_inputs`]); a contract that
+/// declares no such verb keeps the flat list.
+fn verb_inputs(description: &Description, verb: Verb) -> Vec<ikigai_core::ArgSpec> {
+    description
+        .action_specs()
+        .into_iter()
+        .find(|action| action.verb == verb)
+        .map(|action| action.inputs)
+        .unwrap_or_else(|| description.inputs.clone())
 }
 
 /// `config` command: with no argument, show the config file and current
@@ -2378,12 +2527,7 @@ pub(crate) fn route_value_name(
 /// winning for its verb, so this is the Source action's inputs either way. A description
 /// that declares no Source verb at all keeps the flat list, as before.
 fn source_inputs(description: &Description) -> Vec<ikigai_core::ArgSpec> {
-    description
-        .action_specs()
-        .into_iter()
-        .find(|action| action.verb == Verb::Source)
-        .map(|action| action.inputs)
-        .unwrap_or_else(|| description.inputs.clone())
+    verb_inputs(description, Verb::Source)
 }
 
 /// Whether a target's DELETE declares a `content` argument, which is what lets a `-c`
@@ -3700,6 +3844,184 @@ mod tests {
         assert!(!out.contains("did you mean"), "{out}");
     }
 
+    // --- argument help on a typed argument refusal (ledger #1499) ---------------
+
+    /// A Source endpoint with one required `content` (so it is where a pipe or a
+    /// positional value lands) beside an optional `base`, refusing the way the modules
+    /// converted to typed errors do: `MissingArgument`, whose own words name only the
+    /// argument.
+    fn needs_content_endpoint() -> FnEndpoint {
+        FnEndpoint::new("needs", |inv: &Invocation<'_>| {
+            let content = inv.inline_str("content")?;
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                content.as_bytes().to_vec(),
+            ))
+        })
+        .with_description(
+            Description::new("needs")
+                .verb(Verb::Source)
+                .verb(Verb::Meta)
+                .input(ArgSpec::new("content").summary("the Turtle to read"))
+                .input(ArgSpec::new("base").optional().summary("the base IRI")),
+        )
+    }
+
+    /// Two required inputs, so with both unnamed neither is the pipe's (a value would be
+    /// ambiguous), plus an enumerated optional `mode` that refuses an unknown value with a
+    /// typed `InvalidArgument`.
+    fn pair_endpoint() -> FnEndpoint {
+        FnEndpoint::new("pair", |inv: &Invocation<'_>| {
+            let graph = inv.inline_str("graph")?;
+            let query = inv.inline_str("query")?;
+            if let Ok(mode) = inv.inline_str("mode") {
+                if mode != "fast" && mode != "exact" {
+                    return Err(ikigai_core::Error::InvalidArgument {
+                        name: "mode".to_string(),
+                        detail: format!("expected fast or exact, not {mode}"),
+                    });
+                }
+            }
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("{graph}:{query}").into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("pair")
+                .verb(Verb::Source)
+                .verb(Verb::Meta)
+                .input(ArgSpec::new("graph").summary("the named graph to query"))
+                .input(ArgSpec::new("query").summary("the SPARQL SELECT"))
+                .input(
+                    ArgSpec::new("mode")
+                        .optional()
+                        .one_of(["fast", "exact"])
+                        .summary("how hard to try"),
+                ),
+        )
+    }
+
+    /// A Sink that treats an empty body as no body at all, as a store does: the
+    /// engine always sends `content`, so the refusal reaches a person who typed
+    /// `sink <iri>` with nothing after it.
+    fn store_endpoint() -> FnEndpoint {
+        FnEndpoint::new("store", |inv: &Invocation<'_>| {
+            match inv.inline_str("content") {
+                Ok(body) if !body.is_empty() => Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    b"stored".to_vec(),
+                )),
+                _ => Err(ikigai_core::Error::MissingArgument("content".to_string())),
+            }
+        })
+        .with_description(
+            Description::new("store")
+                .verb(Verb::Sink)
+                .verb(Verb::Meta)
+                .input(ArgSpec::new("content").summary("the Turtle to store")),
+        )
+    }
+
+    fn argument_help_engine() -> Engine {
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:test:needs"), needs_content_endpoint())
+            .bind(Exact::new("urn:test:pair"), pair_endpoint())
+            .bind(Exact::new("urn:test:store"), store_endpoint())
+            .bind(Exact::new("urn:test:three"), fixed_list("a\nb\nc"));
+        Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ))
+        .with_spawner(Arc::new(InlineSpawner))
+    }
+
+    /// The case ledger #1499 is about: the missing input is the one a pipe or a
+    /// positional value would fill, so the refusal says what it is and how to give it.
+    /// The typed error's own words stay FIRST and unchanged, so a script matching them
+    /// still matches.
+    #[test]
+    fn a_missing_pipe_target_names_its_summary_and_how_to_give_it() {
+        let err = output(argument_help_engine().eval("source urn:test:needs")).unwrap_err();
+        assert_eq!(
+            err,
+            "missing required argument `content`\n       \
+             `content`: the Turtle to read\n       \
+             pipe a value in or pass content=…"
+        );
+        assert!(err.starts_with(&ikigai_core::Error::MissingArgument("content".into()).to_string()));
+    }
+
+    /// A missing input that a value would NOT fill (two required inputs are unnamed, so a
+    /// value would be ambiguous) gets its summary and no pipe hint: the hint would send
+    /// the person to an "accepts multiple arguments" refusal.
+    #[test]
+    fn a_missing_argument_that_is_not_the_pipe_target_gets_its_summary_only() {
+        let err = output(argument_help_engine().eval("source urn:test:pair")).unwrap_err();
+        assert_eq!(
+            err,
+            "missing required argument `graph`\n       \
+             `graph`: the named graph to query"
+        );
+    }
+
+    /// An invalid value names the input and, for an enumeration, what it accepts. Never
+    /// the pipe hint: the argument WAS given.
+    #[test]
+    fn an_invalid_argument_names_its_summary_and_accepted_values() {
+        let err =
+            output(argument_help_engine().eval("source urn:test:pair graph=g query=q mode=slow"))
+                .unwrap_err();
+        assert_eq!(
+            err,
+            "invalid argument `mode`: expected fast or exact, not slow\n       \
+             `mode`: how hard to try (one of: fast, exact)"
+        );
+    }
+
+    /// A sink's piped or trailing value always lands in `content`, so a missing
+    /// `content` on a Sink is the pipe's.
+    #[test]
+    fn a_sink_missing_its_content_names_the_pipe() {
+        let err = output(argument_help_engine().eval("sink urn:test:store")).unwrap_err();
+        assert_eq!(
+            err,
+            "missing required argument `content`\n       \
+             `content`: the Turtle to store\n       \
+             pipe a value in or pass content=…"
+        );
+    }
+
+    /// The fan-out path renders its branch errors after the join, and gets the same help.
+    #[test]
+    fn a_fanned_out_branch_gets_the_argument_help_too() {
+        let err = output(
+            argument_help_engine().eval("source urn:test:three .. urn:test:pair graph=g mode=slow"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "invalid argument `mode`: expected fast or exact, not slow\n       \
+             `mode`: how hard to try (one of: fast, exact)"
+        );
+    }
+
+    /// No JSON Meta renderer means no contract to read: the refusal is the typed error's
+    /// own words, byte for byte, and asking for the contract on the error path leaves no
+    /// contract note behind (the line itself never needed one).
+    #[test]
+    fn without_a_json_contract_a_missing_argument_is_the_bare_message() {
+        let space =
+            EndpointSpace::new().bind(Exact::new("urn:test:needs"), needs_content_endpoint());
+        let engine = Engine::new(Kernel::new(Arc::new(space)));
+        let err = output(engine.eval("source urn:test:needs")).unwrap_err();
+        assert_eq!(
+            err,
+            ikigai_core::Error::MissingArgument("content".into()).to_string()
+        );
+        assert!(engine.last_contract_notes().is_empty());
+    }
+
     fn output(action: Action) -> Result<String, String> {
         match action {
             Action::Output(entry) => entry.result,
@@ -4068,13 +4390,22 @@ mod tests {
             || true,
         );
         assert_eq!(run("source urn:test:lenient").unwrap(), "note=none");
-        // A required argument with no value is refused, as it is at the prompt.
-        assert!(run("source urn:test:upper").is_err());
         assert_eq!(
             metas.load(Ordering::SeqCst),
             0,
             "no contract for stdin's sake"
         );
+        // A required argument with no value is refused, as it is at the prompt. The refusal
+        // reads the contract AFTER it failed, for its argument help (ledger #1499) — not for
+        // stdin's sake, and the prompt reads it the same way, so a scripted line still makes
+        // no row an interactive one would not.
+        assert!(run("source urn:test:upper").is_err());
+        assert_eq!(
+            metas.load(Ordering::SeqCst),
+            1,
+            "one contract, for the refusal's help"
+        );
+        metas.store(0, Ordering::SeqCst);
         // A stage with arguments still fetches the contract (it needs it to name them), but
         // an empty stdin fills nothing there either.
         assert_eq!(
