@@ -17,7 +17,12 @@ its own crate for the browser build to reuse unchanged.
   a differently-named argument, several arguments, or only a grammar binding. A
   `key=value` word names a declared argument; positional or piped text fills the one
   argument left unnamed. The contract is fetched through `issue`, so it works the
-  same against a remote kernel.
+  same against a remote kernel. When the fetch FAILS (a kernel with no Meta renderer,
+  a refusal, an answer that is not a JSON description), routing falls back to the
+  conventional `in`, as it always did, and since 0.1.62 the line says so:
+  `Engine::last_contract_notes` names each target and the reason, and the CLI prints
+  `[contract unavailable for …]` on stderr. A target that does not resolve has no
+  contract to read and is not noted; its own request reports that.
 - **A pipeline grammar**, parsed by one recursive-descent parser:
 
   | connector | meaning |

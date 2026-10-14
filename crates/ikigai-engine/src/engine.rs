@@ -366,6 +366,10 @@ pub struct Engine {
     /// asked for ten and got one" is the fact an operator most needs, and from outside
     /// the process a serialized fan-out and a slow server look identical.
     fan_out: RefCell<Option<FanOut>>,
+    /// The targets whose contract this line could not READ, for
+    /// [`last_contract_notes`](Self::last_contract_notes) (ledger #98). Argument routing
+    /// fails open without a contract, so this is the only place that says it happened.
+    contract_notes: RefCell<Vec<ContractNote>>,
     /// A one-shot piped-stdin payload for a batch (`-c`) run. When the CLI is fed content on a
     /// non-TTY stdin (`… | ikigai -c 'sink <iri>'`), the first content-less `sink` uses this as
     /// its `content` — so a secret can be piped in and never touch the command line (argv/`ps`)
@@ -508,6 +512,7 @@ impl Engine {
             spawner: None,
             width_routing: false,
             fan_out: RefCell::new(None),
+            contract_notes: RefCell::new(Vec::new()),
             lisp_buffer: RefCell::new(None),
             piped_input: RefCell::new(None),
             as_of_doors: None,
@@ -679,6 +684,35 @@ impl Engine {
     fn reset_line_stats(&self) {
         self.cache.set(CacheStats::default());
         *self.fan_out.borrow_mut() = None;
+        self.contract_notes.borrow_mut().clear();
+    }
+
+    /// The targets whose argument contract the last evaluated line could NOT read, one per
+    /// target, with the reason (ledger #98). Empty when every contract it needed was read,
+    /// or none was needed.
+    ///
+    /// The engine routes a piped or positional value, and recognizes `key=value` words, by
+    /// the target's contract (`Meta as=application/json`). When that fetch FAILS — a kernel
+    /// with no Meta renderer, a refusal, an answer that is not a JSON description — routing
+    /// fails OPEN: the value goes to the conventional `in` and an undeclared `key=value`
+    /// stays positional text. That is kept (a kernel without contracts still works), but it
+    /// is no longer silent: a front end shows these notes beside the line's answer.
+    ///
+    /// A target that does not RESOLVE has no contract to read (absent, not unavailable) and
+    /// is not noted: the line's own request names that failure.
+    pub fn last_contract_notes(&self) -> Vec<ContractNote> {
+        self.contract_notes.borrow().clone()
+    }
+
+    /// Record that `target`'s contract could not be read, once per target per line.
+    fn note_contract_unavailable(&self, target: &Iri, reason: String) {
+        let mut notes = self.contract_notes.borrow_mut();
+        if notes.iter().all(|note| note.target != target.as_str()) {
+            notes.push(ContractNote {
+                target: target.as_str().to_string(),
+                reason,
+            });
+        }
     }
 
     /// Record a fan-out, keeping the widest of the line (ties to the first). A line can
@@ -2080,7 +2114,9 @@ impl Engine {
     }
 
     /// Fetch a target's structured self-description via a `Meta` request rendered
-    /// as `application/json`. `None` if it doesn't resolve or isn't JSON-renderable.
+    /// as `application/json`. `None` if it doesn't resolve or isn't JSON-renderable; the
+    /// second case is UNAVAILABLE rather than absent, and is recorded as a
+    /// [`ContractNote`] for the line (ledger #98).
     pub(crate) async fn describe_struct(&self, iri: &Iri) -> Option<Description> {
         let request = Request::new(Verb::Meta, iri.clone())
             .with_arg("as", ArgRef::Inline(b"application/json".to_vec()));
@@ -2091,12 +2127,35 @@ impl Engine {
         let capability = self.capability.borrow().clone();
         // In the line's chain: a corridor may bind the target differently from the root, and
         // the contract that routes arguments must be the one the resolution will reach.
-        let (representation, _) = self
+        let answer = self
             .resolver
             .issue_as_async_in(request, &capability, None, self.line_scope())
-            .await
-            .ok()?;
-        serde_json::from_slice(&representation.bytes).ok()
+            .await;
+        let representation = match answer {
+            Ok((representation, _)) => representation,
+            // Nothing resolves there: no contract to read. The request this contract was
+            // for fails the same way, and says so itself.
+            Err(ikigai_core::Error::Unresolved(_) | ikigai_core::Error::NotFound(_)) => {
+                return None
+            }
+            Err(e) => {
+                self.note_contract_unavailable(iri, e.to_string());
+                return None;
+            }
+        };
+        match serde_json::from_slice(&representation.bytes) {
+            Ok(description) => Some(description),
+            Err(e) => {
+                self.note_contract_unavailable(
+                    iri,
+                    format!(
+                        "its Meta answer is not a JSON description ({}): {e}",
+                        representation.repr_type.media_type
+                    ),
+                );
+                None
+            }
+        }
     }
 
     /// Issue a request, record how the resolver's cache served it, and decode the
@@ -2989,10 +3048,6 @@ fn split_first_word(s: &str) -> (&str, &str) {
     }
 }
 
-/// Expand a `cap` scope word: `net-<host>` is shorthand for the full
-/// `urn:cap:net:<host>` network scope; anything else is taken verbatim (so a full
-/// `urn:cap:…` scope still works). Lets `cap net-example.com` narrow a session to
-/// one host without typing the whole scope.
 /// The text a panic carried, when it carried text (`panic!("…")` gives a `&str` or a
 /// `String`); anything else is named as such.
 fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
@@ -3002,6 +3057,27 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
         text.clone()
     } else {
         "a non-text panic payload".to_string()
+    }
+}
+
+/// A target whose argument contract a line could not read (ledger #98), from
+/// [`Engine::last_contract_notes`]. Its `Display` is the one-line note a front end shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContractNote {
+    /// The target whose `Meta as=application/json` failed.
+    pub target: String,
+    /// Why, as the kernel or the parser said it.
+    pub reason: String,
+}
+
+impl std::fmt::Display for ContractNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "contract unavailable for {}: {} — arguments were routed without it (a piped or \
+             positional value went to `in`; an undeclared key=value stayed text)",
+            self.target, self.reason
+        )
     }
 }
 
@@ -3022,6 +3098,10 @@ fn is_cap_scope(scope: &str) -> bool {
         .is_some_and(|rest| !rest.is_empty() && !rest.contains(char::is_whitespace))
 }
 
+/// Expand a `cap` scope word: `net-<host>` is shorthand for the full
+/// `urn:cap:net:<host>` network scope; anything else is taken verbatim (so a full
+/// `urn:cap:…` scope still works). Lets `cap net-example.com` narrow a session to
+/// one host without typing the whole scope.
 fn expand_cap_shorthand(word: &str) -> String {
     match word.strip_prefix("net-") {
         Some(host) if !host.is_empty() => format!("urn:cap:net:{host}"),
@@ -6048,6 +6128,51 @@ mod tests {
             output(greet_engine().eval("source urn:demo:greet Hello name=World")).unwrap(),
             "Hello, World"
         );
+    }
+
+    /// ledger #98: a contract fetch that FAILS is no longer silent. On a kernel with no Meta
+    /// renderer the value still routes to `in` exactly as before (kept: such a kernel still
+    /// works), and the line now carries a note naming the target and why. A contract that is
+    /// read, or a target that does not resolve (absent, not unavailable), notes nothing.
+    #[test]
+    fn an_unavailable_contract_is_noted_and_routing_is_unchanged() {
+        let echo_in = FnEndpoint::new("echo-in", |inv: &Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                inv.inline_str("in").unwrap_or("-").as_bytes().to_vec(),
+            ))
+        });
+        let space = EndpointSpace::new().bind(Exact::new("urn:test:echo-in"), echo_in);
+        // No Meta renderer: the contract cannot be read.
+        let engine = Engine::new(Kernel::new(Arc::new(space)));
+        assert_eq!(
+            output(engine.eval("source urn:test:echo-in hello")).unwrap(),
+            "hello",
+            "the value still routes to `in`"
+        );
+        let notes = engine.last_contract_notes();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0].target, "urn:test:echo-in");
+        assert!(notes[0].reason.contains("Meta renderer"), "{notes:?}");
+        let shown = notes[0].to_string();
+        assert!(
+            shown.starts_with("contract unavailable for urn:test:echo-in")
+                && shown.contains("`in`"),
+            "{shown}"
+        );
+
+        // The notes describe ONE line: the next line starts clean.
+        engine.eval("cap");
+        assert!(engine.last_contract_notes().is_empty());
+
+        // Absent is not unavailable: an unresolved target notes nothing (its request errs).
+        assert!(output(engine.eval("source urn:test:nothing hello")).is_err());
+        assert!(engine.last_contract_notes().is_empty());
+
+        // A contract that is read notes nothing.
+        let greet = greet_engine();
+        output(greet.eval("source urn:test:upper world | urn:demo:greet greeting=Hi")).unwrap();
+        assert!(greet.last_contract_notes().is_empty());
     }
 
     #[test]
