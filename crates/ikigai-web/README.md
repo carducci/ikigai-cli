@@ -29,7 +29,7 @@ edge.
 
 ### Provenance on a write
 
-A mutating request (`PUT`/`POST`/`DELETE`) reaches the endpoint with three arguments
+A mutating request (`PUT`/`POST`/`PATCH`/`DELETE`) reaches the endpoint with three arguments
 the transport owns, all **read off the connection, never the payload**: `received`
 (RFC 3339, UTC), `client` (the socket peer, or the trusted proxy's rightmost
 `X-Forwarded-For` hop), and — when the host wires a `PrincipalFn` into
@@ -164,7 +164,9 @@ and a delete of one of them says nothing about the others.
 `PATCH` is read-modify-write through a **content-type registry**: the request
 `Content-Type` selects a patch strategy (RFC 7386 JSON Merge Patch today) that
 transforms the current representation before it is Sunk. An unknown patch type is
-`415`.
+`415`. The Sink a `PATCH` issues is stamped like every other write: it carries `received`,
+`client` and `principal` (above), so a patched resource records who wrote it and when. (Before
+0.1.62 it carried none of the three, and a patched resource was written anonymously.)
 
 ## Server push
 
