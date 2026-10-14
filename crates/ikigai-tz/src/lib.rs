@@ -59,11 +59,11 @@ fn text(body: String) -> Representation {
     )
 }
 
-/// Parse an IANA zone name from a required argument.
+/// Parse an IANA zone name from a required argument. `inline_str`'s own error is kept:
+/// absent is `MissingArgument`, but present-and-unreadable (not inline, not UTF-8) is an
+/// `InvalidArgument` naming it, never reported as missing (ledger #1001).
 fn zone_arg(inv: &Invocation<'_>, name: &'static str) -> Result<Tz> {
-    let raw = inv
-        .inline_str(name)
-        .map_err(|_| Error::MissingArgument(name.to_string()))?;
+    let raw = inv.inline_str(name)?;
     parse_zone(raw.trim(), name)
 }
 
@@ -371,6 +371,23 @@ mod tests {
             "2026-07-21T12:00:00-04:00",
             &[("to", "Mars/Olympus")]
         ));
+    }
+
+    /// ledger #1001: a zone argument that is PRESENT but unreadable (not UTF-8) is an
+    /// invalid argument naming it, as core's `inline_str` says, never "missing".
+    #[test]
+    fn a_present_but_unreadable_zone_is_invalid_not_missing() {
+        let kernel = Kernel::new(Arc::new(space()));
+        let request = Request::new(Verb::Source, Iri::parse("urn:tz:convert").unwrap())
+            .with_arg("in", ArgRef::Inline(b"2026-07-21T12:00:00Z".to_vec()))
+            .with_arg("to", ArgRef::Inline(vec![0xff, 0xfe]));
+        match block_on(kernel.issue(request, &Capability::root())) {
+            Err(Error::InvalidArgument { name, detail }) => {
+                assert_eq!(name, "to");
+                assert!(detail.contains("UTF-8"), "{detail}");
+            }
+            other => panic!("expected InvalidArgument for `to`, got {other:?}"),
+        }
     }
 
     #[test]
