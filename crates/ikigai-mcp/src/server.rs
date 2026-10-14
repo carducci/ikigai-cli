@@ -547,11 +547,20 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
     // endpoint IRI template ({name} → value); an Argument-source input becomes a
     // request argument.
     let mut req_args: Vec<(String, String)> = Vec::new();
+    // Bindings whose value carries IRI structure (RFC 3986's gen-delims): such a value can
+    // turn the row's template into ANOTHER endpoint's IRI, so the target is checked below to
+    // still reach this tool's endpoint (ledger #86). Delimiters themselves are legitimate,
+    // since `urn:file:{path}` and `urn:repo:{repo}:file:{path}` take `/` and `:`; what is
+    // refused is a call answered by an endpoint the tool does not name.
+    let mut structural: Vec<&str> = Vec::new();
     for input in &action.inputs {
         let Some(value) = arguments.get(&input.name).and_then(crate::scalar) else {
             continue;
         };
         if input.source == ikigai_core::InputSource::Binding {
+            if value.contains([':', '/', '?', '#', '[', ']', '@']) {
+                structural.push(&input.name);
+            }
             target = target.replace(&format!("{{{}}}", input.name), &value);
         } else {
             req_args.push((input.name.clone(), value));
@@ -595,20 +604,30 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
     let Ok(target_iri) = Iri::parse(&target) else {
         return tool_error(format!("target `{target}` is not a valid IRI"));
     };
-    if !dropped.is_empty() {
+    if !dropped.is_empty() || !structural.is_empty() {
         let reached = kernel.describe(&target_iri).map(|d| d.id);
         if reached.as_deref() != Some(description.id.as_str()) {
-            let names = dropped
-                .iter()
-                .map(|n| format!("`{n}`"))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let names = |names: &[&str]| {
+                names
+                    .iter()
+                    .map(|n| format!("`{n}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let which = match reached {
+                Some(other) => format!("names a different endpoint (`{other}`)"),
+                None => "names nothing".to_string(),
+            };
+            if !dropped.is_empty() {
+                let names = names(&dropped);
+                return tool_error(format!(
+                    "{names} omitted: without it `{pattern}` becomes `{target}`, which {which}; give {names}"
+                ));
+            }
             return tool_error(format!(
-                "{names} omitted: without it `{pattern}` becomes `{target}`, which {}; give {names}",
-                match reached {
-                    Some(other) => format!("names a different endpoint (`{other}`)"),
-                    None => "names nothing".to_string(),
-                }
+                "{}: the value makes `{target}`, which {which}, not `{id}`'s; a value of this tool \
+                 cannot address another endpoint",
+                names(&structural)
             ));
         }
     }
@@ -1495,6 +1514,56 @@ mod tests {
         assert!(
             !text.contains("v=-"),
             "never answered by another endpoint: {text}"
+        );
+    }
+
+    /// ledger #86: a binding value is substituted into the row's template as it is, so a
+    /// value carrying IRI structure (`alice:private`) can make the target a DIFFERENT
+    /// endpoint's IRI, and a call to one tool was answered by another. Refused by name,
+    /// exactly like a dropped segment that reaches another endpoint.
+    #[test]
+    fn a_binding_value_that_reaches_another_endpoint_is_refused() {
+        let user = reporting("user", "name", ArgSpec::new("name").binding());
+        let private = reporting("private", "name", ArgSpec::new("unused").optional());
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:demo:user:alice:private"), private)
+            .bind(
+                ikigai_core::UriTemplate::parse("urn:demo:user:{name}").unwrap(),
+                user,
+            );
+        let k = Kernel::new(Arc::new(space));
+        let resp = call_tool(&k, "user__sink", json!({ "name": "alice:private" }));
+        assert_eq!(resp["isError"], true, "{resp}");
+        let text = resp["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("`name`") && text.contains("`private`"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("name=-"),
+            "never answered by another endpoint: {text}"
+        );
+        // A plain value reaches the tool's own endpoint as before.
+        let resp = call_tool(&k, "user__sink", json!({ "name": "alice" }));
+        assert_eq!(resp["content"][0]["text"], "urn:demo:user:alice name=alice");
+    }
+
+    /// …and the guard is about WHICH endpoint answers, not about the characters: a value with
+    /// `/` and `:` that the tool's own template carries (a file path, an IRI) still works,
+    /// as `urn:file:{path}` and `urn:repo:{repo}:file:{path}` need it to.
+    #[test]
+    fn a_binding_value_with_delimiters_that_stays_on_its_endpoint_is_carried() {
+        let file = reporting("file", "path", ArgSpec::new("path").binding());
+        let space = EndpointSpace::new().bind(
+            ikigai_core::UriTemplate::parse("urn:demo:file:{path}").unwrap(),
+            file,
+        );
+        let k = Kernel::new(Arc::new(space));
+        let resp = call_tool(&k, "file__sink", json!({ "path": "docs/a:b.md" }));
+        assert_eq!(resp["isError"], false, "{resp}");
+        assert_eq!(
+            resp["content"][0]["text"],
+            "urn:demo:file:docs/a:b.md path=docs/a:b.md"
         );
     }
 

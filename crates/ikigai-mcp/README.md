@@ -78,7 +78,12 @@ forbids.
 - **`tools/call`** — reverse the name to `(endpoint, verb)`, route Binding
   inputs into the IRI and Argument inputs as request args, **validate** the JSON
   arguments against the typed contract (a non-conforming call returns a SHACL
-  report the model repairs from — never a protocol error), then invoke.
+  report the model repairs from — never a protocol error), then invoke. A
+  Binding value is substituted as given (a file path keeps its `/`, an IRI its
+  `:`), but a call must reach the tool's OWN endpoint: a value that turns the
+  target into another endpoint's IRI (`alice:private` under `urn:x:user:{name}`,
+  when `urn:x:user:alice:private` is bound elsewhere) is refused naming the
+  argument (0.1.62+; before, the other endpoint answered).
 - **Protocol errors per JSON-RPC 2.0 §5.1** — a line that is not JSON gets
   `-32700 Parse error` under `"id": null`; JSON that is not a valid Request (no
   `"jsonrpc": "2.0"`, no `method`, an `id` that is not a string, number or null, a
