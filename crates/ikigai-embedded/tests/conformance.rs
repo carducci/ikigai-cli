@@ -4,13 +4,13 @@
 //!
 //! `ikigai-embedded` binds about thirty endpoints of its own and inherits a hundred more
 //! from twenty-odd published module crates, each with its own repo and its own adoption of
-//! this same suite. No inherited finding is this workspace's to FIX — they are walked,
-//! attributed to the crate that owns them, and left; they drop on their own as each module's
-//! release lands on crates.io. What IS this workspace's is [`OWN`], and the assertion is
-//! that **no finding names an id in it**. [`the_walked_catalog_is_classified`] holds the two
-//! tables to the actual catalog, so an endpoint added later fails one test or the other and
-//! whoever added it has to classify it, type its inputs, and decide whether the walk may
-//! fire it.
+//! this same suite. No inherited endpoint is this workspace's to FIX, so since conformance
+//! 0.8.0 each walk is scoped with `Suite::own` to [`OWN`]: an inherited endpoint is listed on
+//! the report's `inherited:` line and not walked at all, and its record is its own repo's
+//! conformance test. What IS this workspace's is [`OWN`], and the assertion is that **the
+//! report is clean**. [`the_walked_catalog_is_classified`] holds the two tables to the actual
+//! catalog, so an endpoint added later fails one test or the other and whoever added it has
+//! to classify it, type its inputs, and decide whether the walk may fire it.
 //!
 //! Two kernels, because this crate composes two and they are different compositions:
 //!
@@ -34,22 +34,26 @@
 //! six outbound HTTP verbs, an SMTP sender, a Zoom scheduler, the macOS EventKit calendar,
 //! a Keychain with a Touch ID prompt, mDNS multicast, a job scheduler and a Steel evaluator.
 //!
-//! So the opt-out list in [`suite`] was written from the CATALOG, before this file ever
+//! So the opt-out list in [`root_suite`] was written from the CATALOG, before this file ever
 //! ran an invoking check — not from reading the first report. Every entry says which of the
 //! five hazards it is: **spawns a process**, **reaches the network**, **sends a message**,
 //! **touches the platform**, or **evaluates code**. The description-only checks (ARGSPECS,
-//! NAMES, REQUIRES-VERB) still run over every one of them, and that is where nearly all of
-//! the inherited findings are anyway.
+//! NAMES, REQUIRES-VERB) still run over every one of them. Most of those seams belong to
+//! crates this host composes (the subprocess seam, the HTTP verbs, inference, EventKit, the
+//! Keychain, Zoom); since the walk is scoped with `Suite::own` they are inherited and never
+//! fired, and the opt-outs left are for hazards this workspace owns.
 //!
 //! ## Hermetic, and the three things that leak if it is not
 //!
 //! `HOME` and `XDG_CONFIG_HOME` are redirected and [`ikigai_embedded::set_file_root`] is
 //! called before any kernel is built, because:
 //!
-//! * the file module is jailed to `file_root()`, and the walk FIRES its Sink and Delete;
+//! * our decision links and client records read keys and files under `file_root()`, and the
+//!   walk FIRES the hermetic intake Sinks, which write there;
 //! * `urn:orgfile:{path}` is jailed to whatever `calendar.json` names as `org_dir` — and
 //!   with no config at all that is the empty path, which is the process's own working
-//!   directory. A walk that fired a Sink there would write into the checkout;
+//!   directory. The file module is inherited and not walked now, but a host built without
+//!   that config is not the host this test means to describe;
 //! * `browse.root` and the a11y layering read the config home, so a walk against the real
 //!   one is about the machine it ran on rather than about the code.
 //!
@@ -58,13 +62,13 @@
 //!
 //! ## Fixtures
 //!
-//! Real Turtle for the `urn:rdf:*` trio, real queries for the four `sparql-*` reads, a real
-//! JSON-LD document AND a context for the three `jsonld-*` operators, a seeded stylesheet and
-//! document (named by IRI) for `xslt-transform`, urlencoded submissions for the two public
-//! intake Sinks, and `path` / `name` / `token` / `action` bindings for the template-bound
-//! entries. Without them those endpoints report "did not resolve with the minimal inputs",
-//! which reads as a caching finding (conformance PENDING #33) and means the walk failed to
-//! CALL rather than that the endpoint failed to conform.
+//! Urlencoded submissions for the two public intake Sinks, a real plan for the three plan
+//! resources, real IANA zones for `tz-convert`, an address for `contactblock-link`, and
+//! `name` / `token` / `action` bindings for the template-bound entries. Without them those
+//! endpoints report "did not resolve with the minimal inputs", which reads as a caching
+//! finding (conformance PENDING #33) and means the walk failed to CALL rather than that the
+//! endpoint failed to conform. (The fixtures for other crates' endpoints, Turtle, SPARQL,
+//! JSON-LD and XSLT among them, went when the walk was scoped to [`OWN`].)
 //!
 //! ⚠ **A fixture is a claim, and 0.2.0 is the first version that audits it.** Under the 0.1.0
 //! pin this file carried six fixtures that bought nothing — three whose ids the walk never
@@ -77,7 +81,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use ikigai_conformance::{rdf, Check, Fixture, Report, Suite};
+use ikigai_conformance::{rdf, Check, Fixture, Suite};
 use ikigai_core::{Kernel, Verb};
 
 // ---------------------------------------------------------------------------
@@ -359,11 +363,9 @@ fn fixture_home() -> &'static Path {
 ///   they fail at the first line of `invoke` and nothing downstream is ever reached.
 /// * `contact-block.key` — the PKCS8 PEM signing half, so `urn:contactblock:link` can mint.
 /// * `clients/conformance.json` — so `urn:client:{token}` resolves for the bound fixture.
-/// * `conformance.txt` / `conformance.xsl` — the two documents the `file` and
-///   `xslt-transform` fixtures name. `urn:xslt:transform`'s `stylesheet` is a resolvable
-///   resource IRI, not inline markup: passing the stylesheet BY VALUE failed at
-///   `Iri::parse` with "invalid IRI code point '<'", so that endpoint was never probed at
-///   all while its fixture sat in the report looking like coverage.
+///
+/// (The `file` and `xslt-transform` documents this used to seed went with their fixtures:
+/// both endpoints are inherited since the walk is scoped with `Suite::own`.)
 ///
 /// A FIXED key (`[9u8; 32]`), not a generated one: the walk only needs the file to parse,
 /// and a deterministic fixture is one less thing that differs between runs.
@@ -393,9 +395,6 @@ fn seed_workspace(root: &Path) {
         r#"{"id":"conformance","name":"Conformance Fixture"}"#,
     )
     .expect("client record");
-    std::fs::write(root.join("conformance.txt"), "a fixture document\n").expect("file fixture");
-    std::fs::write(root.join("conformance.xsl"), XSL).expect("stylesheet fixture");
-    std::fs::write(root.join("conformance.xml"), "<doc/>").expect("xml fixture");
 }
 
 fn root_kernel() -> Kernel {
@@ -411,47 +410,6 @@ fn http_kernel() -> Kernel {
 // ---------------------------------------------------------------------------
 // The suite.
 // ---------------------------------------------------------------------------
-
-/// A graph small enough to read and real enough to parse — the `content` every `urn:rdf:*`
-/// fixture hands over.
-///
-/// ⚠ `http://`, not the `urn:` everything here is named with: `ikigai-rdf`'s sniff tells an
-/// IRI from an XML element tag by looking for `://` in the first `<…>` token, so a document
-/// whose first subject is `<urn:demo:a>` is sniffed as RDF/XML and fails to parse. Recorded
-/// for ikigai-rdf rather than worked around silently (the same note ikigai-dev-server #10
-/// made).
-const TURTLE: &str = "<http://example.org/a> <http://purl.org/dc/terms/title> \"demo\" .\n";
-
-/// A JSON-LD document with an actual node, not `{}`.
-///
-/// `{}` expands to zero triples, which makes every RDF check on the `jsonld-*` operators
-/// pass without seeing anything — a report that reads as coverage and is not (conformance
-/// PENDING #26, which the suite's own README example has).
-const JSON_LD: &str = r#"{"@context":{"title":"http://purl.org/dc/terms/title"},"@id":"http://example.org/a","title":"demo"}"#;
-
-/// The context `urn:jsonld:compact` compacts against — the same term [`JSON_LD`] carries, so
-/// the round trip has something to shorten. A bare context value; the module also accepts a
-/// `{"@context": …}` document.
-const JSON_LD_CONTEXT: &str = r#"{"title":"http://purl.org/dc/terms/title"}"#;
-
-/// One endpoint space with one door, as an `.arrangement` file holds it.
-const ARRANGEMENT_SEXPR: &str = "(endpoints (door \"urn:demo:a\" demo))\n";
-
-/// The same arrangement as the Turtle core writes for it (`Topology::to_turtle`), so the two
-/// `sexpr-arrangement-*` transreptors each get a document they accept.
-const ARRANGEMENT_TURTLE: &str = "\
-@prefix ik: <https://ikigai-rs.dev/ns#> .
-@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
-<urn:ikigai:space:_:1> a ik:EndpointSpace ;
-    ik:pattern \"urn:demo:a\" ;
-    ik:doors <urn:ikigai:space:_:1:doors:1> .
-<urn:ikigai:space:_:1:doors:1> rdf:first <urn:ikigai:space:_:1:door:1> ;
-    rdf:rest rdf:nil .
-<urn:ikigai:space:_:1:door:1> a ik:Door ;
-    ik:pattern \"urn:demo:a\" ;
-    ik:matchKind \"exact\" ;
-    ik:endpointName \"demo\" .
-";
 
 /// A plan that is safe to fire under root: one pure step, and nothing it reads touches the
 /// network, a process or the platform — so the walk RUNS `urn:plan:eval` rather than
@@ -470,89 +428,36 @@ const PLAN: &str = "\
     ik:value \"conformance\" .
 ";
 
-/// An identity stylesheet — enough for `xslt-transform` to have a real transform to run.
-const XSL: &str = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="xml"/><xsl:template match="/"><ok/></xsl:template></xsl:stylesheet>"#;
-
 /// ★ **A `Suite` is a statement about the MANIFOLD it walks — so there are three of them.**
 ///
-/// This crate composes two kernels, and they are not the same catalog: sixty-six ids are on
-/// the REPL root only (the whole personal/Lisp/repo/LLM surface), six are on the HTTP door
-/// only (`foaf`, the passkey trio, `calendar-request`, `contact-block`), and forty are on
-/// both. One shared builder therefore carried, on every run, a pile of declarations that
-/// could not apply to the kernel being walked — a `sparql-select` fixture over a door with no
-/// SPARQL, a `foaf` opt-out over a root that does not bind it.
+/// This crate composes two kernels, and they are not the same catalog: the personal, Lisp,
+/// repo and LLM surface is on the REPL root only, six ids are on the HTTP door only (`foaf`,
+/// the passkey trio, `calendar-request`, `contact-block`), and the rest are on both. One
+/// shared builder therefore carried, on every run, declarations that could not apply to the
+/// kernel being walked, and DECLARATIONS reports every one of those. So [`base`] is what is
+/// true of both manifolds, and [`root_suite`] and [`door_suite`] add what is true of one.
+/// (Same shape and same conclusion as ikigai-module #17.) Moving an endpoint between the two
+/// compositions has to move its declarations too, and `the_walked_catalog_is_classified`
+/// fails first if it does not.
 ///
-/// Conformance 0.1.0 printed those as `opted out:` and `fixture:` lines, indistinguishable
-/// from the ones that did something: a report that reads as coverage and is not. 0.2.0's
-/// DECLARATIONS check reports them, and the fix is to split the builder rather than to change
-/// any id — [`base`] is what is true of both manifolds, [`root_suite`] and [`door_suite`] add
-/// what is true of one. (Same shape and same conclusion as ikigai-module #17.)
-///
-/// The split is also a claim a diff can see: moving an endpoint between the two compositions
-/// now has to move its declarations too, and `the_walked_catalog_is_classified` fails first if
-/// it does not.
+/// ★ **Since conformance 0.8.0 the walk is scoped to [`OWN`] with `Suite::own`** ([`conforms`]
+/// adds one `own` per OWN id the kernel binds). Every [`INHERITED`] endpoint is listed on the
+/// report's `inherited:` line and is NOT walked: no check reads it and no probe fires it.
+/// That replaced two things this file used to carry by hand. One was the partition in
+/// `conforms` that tolerated every inherited finding and failed only on ours. The other was
+/// about thirty hazard opt-outs (`urn:system:exec`, the six HTTP verbs, the `gh` facades,
+/// the inference endpoints, EventKit, the Keychain, Zoom) and a dozen fixtures for other
+/// crates' endpoints, which only existed so that walking a dependency would neither fire
+/// a hazard nor fail to call it. Each module's record is its own repo's conformance test.
+/// The opt-outs that remain below are for endpoints this workspace OWNS.
 fn base() -> Suite {
     Suite::new()
         // ---- fired, with inputs that work ----------------------------------------
-        .fixture(
-            Fixture::new("rdf-union", Verb::Source)
-                .arg("content", TURTLE)
-                .arg("with", TURTLE),
-        )
-        .fixture(
-            Fixture::new("rdf-diff", Verb::Source)
-                .arg("content", TURTLE)
-                .arg("with", TURTLE)
-                .arg("mode", "added"),
-        )
-        .fixture(
-            Fixture::new("rdf-transrept", Verb::Source)
-                .arg("content", TURTLE)
-                .arg("as", "application/n-triples"),
-        )
-        .fixture(Fixture::new("jsonld-expand", Verb::Source).arg("content", JSON_LD))
-        .fixture(Fixture::new("jsonld-flatten", Verb::Source).arg("content", JSON_LD))
-        // ⚠ `context` is REQUIRED and was missing until 2026-09-12, so the walk supplied its
-        // own sample `x` and the endpoint failed at `bad context IRI` — `urn:jsonld:compact`
-        // has never actually been probed here. Inline JSON is accepted (the module tells an
-        // inline context from a resource reference by its first character).
-        .fixture(
-            Fixture::new("jsonld-compact", Verb::Source)
-                .arg("content", JSON_LD)
-                .arg("context", JSON_LD_CONTEXT),
-        )
-        // ⚠ BY IRI, not by value — BOTH of them. `src` and `stylesheet` are each "a
-        // resolvable resource IRI", so the inline markup this used to pass for `stylesheet`
-        // failed at `Iri::parse` ("invalid IRI code point '<'") and the walk's own sample
-        // `x` for the undeclared-by-the-fixture `src` failed the same way. `urn:xslt:transform`
-        // has therefore never been probed here at all — a fixture in the report that bought
-        // nothing. Both documents are seeded into the hermetic workspace by `seed_workspace`.
-        //
-        // ⚠ What firing it revealed, for ikigai-xslt rather than for here: under NO grants it
-        // now refuses with `Denied` because reading a `urn:file:` stylesheet needs
-        // `urn:cap:fs:read:*`, which the endpoint does not declare. That floor is inherited
-        // from whatever the `src`/`stylesheet` IRIs resolve THROUGH, so it is parameterized —
-        // the wildcard form the recipe describes. Reported up, not worked around.
-        .fixture(
-            Fixture::new("xslt-transform", Verb::Source)
-                .arg("src", "urn:file:conformance.xml")
-                .arg("stylesheet", "urn:file:conformance.xsl")
-                // `as` was declared REQUIRED through ikigai-xslt 0.1.1, so the walk supplied
-                // it whatever we did — and its sample `x` came back as the served media type
-                // verbatim, unvalidated (one for ikigai-xslt, reported up). 0.1.2 makes `as`
-                // optional and takes the media type from the stylesheet's `xsl:output` when it
-                // is absent; the fixture keeps supplying a real one, because the point of the
-                // arg here is to probe the negotiated face rather than the default.
-                .arg("as", "text/html"),
-        )
-        // Bindings are per ENTRY and a binding-only fixture's verb is ignored
-        // (conformance PENDING #2): one binding per template variable is all the walk reads.
-        .fixture(Fixture::new("file", Verb::Source).binding("path", "conformance.txt"))
-        .fixture(Fixture::new("space", Verb::Source).binding("name", "conformance"))
         // Take reads `content` as the id to take since ledger #877 (the engine puts the value
         // of `delete urn:space:q <id>` there), so the walk's sample `x` now names a tuple that
         // does not exist. An EMPTY `content` is what the engine sends on a bare delete: the
         // work-queue pop, which is exactly what this walk exercised before ledger #877.
+        .fixture(Fixture::new("space", Verb::Source).binding("name", "conformance"))
         .fixture(Fixture::new("space", Verb::Delete).arg("content", ""))
         .fixture(Fixture::new("client", Verb::Source).binding("token", "conformance"))
         // ★ The two public intake Sinks, FIRED — and the reason a fixture is right here
@@ -596,23 +501,14 @@ fn base() -> Suite {
         .pure("tz-convert")
         // ⚠ A STATED DEVIATION, not a claim of purity. `urn:time:now` and `urn:tz:now` read
         // the kernel's CLOCK, so by the wave's rule 3 they are not pure functions of their
-        // inputs. They are `cacheable_until(next minute)` — `Expiry::At` — and 0.2.0 still has
-        // no declaration for that: `pure` is the only spelling that says "an empty thread set
-        // is correct here", and it is correct here for a reason the suite cannot express,
-        // namely that a clock is not a resource and no `depends_on` could name it. The expiry
-        // itself is pinned by hand in `a_clock_derived_result_expires_rather_than_threading`
-        // below, so the declaration covers nothing that test does not check. Reported as
-        // conformance PENDING #86/#123 (`Suite::cacheable_until`), which ikigai-web-demo #57
-        // also wanted.
+        // inputs. They are `cacheable_until(next minute)` — `Expiry::At` — and since
+        // conformance 0.6.1 an `At` deadline is a bound, but `pure` is still the declaration
+        // this file has used for "an empty thread set is correct here", for a reason the suite
+        // cannot express: a clock is not a resource and no `depends_on` could name it. The
+        // expiry itself is pinned by hand in `a_clock_derived_result_expires_rather_than_threading`
+        // below, so the declaration covers nothing that test does not check.
         .pure("clock-now")
         .pure("tz-now")
-        // ---- NOT fired, and which hazard each one is -----------------------------
-        //
-        // ★ Written from the catalog BEFORE the first invoking run. See the module docs.
-        //
-        // Reaches the network. All six HTTP verbs are backed by a REAL transport here
-        // (`ureq`), so the walk would issue live requests to whatever the sample `url`
-        // happens to be. Bound on BOTH compositions, so they live in the base.
         // ★ THE SECOND REAL VOCABULARY GAP, in a repo that cannot fix it — `urn:host:health`
         // next door is the first. Declaring `urn:host:posture`'s `text/turtle` face brings
         // it under VOCABULARY, which finds fifteen `ik:` terms `ikigai-vocab` does not
@@ -634,63 +530,31 @@ fn base() -> Suite {
              fix is vocabulary.ttl in ikigai-core plus a /ns deploy. The exact undefined set \
              is pinned by hand below.",
         )
-        .opt_out("httpGet", None, "outbound HTTP over a real transport")
-        .opt_out("httpHead", None, "outbound HTTP over a real transport")
-        .opt_out("httpPost", None, "outbound HTTP over a real transport")
-        .opt_out("httpPut", None, "outbound HTTP over a real transport")
-        .opt_out("httpPatch", None, "outbound HTTP over a real transport")
-        .opt_out("httpDelete", None, "outbound HTTP over a real transport")
 }
 
-/// [`base`] plus everything bound only on the REPL/TUI root — which is where every one of
-/// this host's five hazards actually lives.
+/// [`base`] plus everything of OURS bound only on the REPL/TUI root — which is where nearly
+/// every one of this host's hazards lives.
 fn root_suite() -> Suite {
     base()
         // ---- fired, with inputs that work ----------------------------------------
-        .fixture(Fixture::new("sniff", Verb::Source).arg("content", TURTLE))
-        .fixture(Fixture::new("transrept-auto", Verb::Source).arg("content", TURTLE))
-        .fixture(
-            Fixture::new("sparql-select", Verb::Source)
-                .arg("query", "SELECT * WHERE { ?s ?p ?o } LIMIT 1"),
-        )
-        .fixture(Fixture::new("sparql-ask", Verb::Source).arg("query", "ASK { ?s ?p ?o }"))
-        .fixture(
-            Fixture::new("sparql-describe", Verb::Source).arg("query", "DESCRIBE <urn:demo:a>"),
-        )
-        .fixture(
-            Fixture::new("sparql-construct", Verb::Source)
-                .arg("query", "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o } LIMIT 1"),
-        )
         // An address, because the endpoint refuses anything that is not one before it mints.
         .fixture(
             Fixture::new("contactblock-link", Verb::Source).arg("email", "someone@example.org"),
-        )
-        // The arrangement surfaces (ikigai-sexpr 0.1.4, ikigai-diagram 0.1.0): one real
-        // arrangement each way, and a picture of this host's own declaration BY NAME — `of`
-        // names a resource, and piping Turtle into it is refused by design.
-        //
-        // ⚠ NOT `of=urn:kernel:topology`, though that is the README's example: the walk fires
-        // under no grants, the sub-read of the topology is refused for want of
-        // `urn:cap:kernel:inspect`, and ENFORCED reports `diagram-arrangement` as enforcing a
-        // scope it does not declare. It enforces nothing — `of` is read under the caller's
-        // capability, whatever that read needs — and the suite cannot tell a pass-through
-        // denial from an undeclared gate. `urn:iki:host:arrangement` needs no grant.
-        .fixture(
-            Fixture::new("sexpr-arrangement-to-rdf", Verb::Source)
-                .arg("content", ARRANGEMENT_SEXPR),
-        )
-        .fixture(
-            Fixture::new("sexpr-arrangement-from-rdf", Verb::Source)
-                .arg("content", ARRANGEMENT_TURTLE),
-        )
-        .fixture(
-            Fixture::new("diagram-arrangement", Verb::Source)
-                .arg("of", "urn:iki:host:arrangement"),
         )
         // The plan resources, over a real plan: one pure step, so evaluating it is a read.
         .fixture(Fixture::new("plan-eval", Verb::Source).arg("in", PLAN))
         .fixture(Fixture::new("plan-validate", Verb::Source).arg("in", PLAN))
         .fixture(Fixture::new("plan-requires", Verb::Source).arg("in", PLAN))
+        // ---- declared -------------------------------------------------------------
+        // `urn:iki:host:arrangement` serves the arrangement this host was BUILT from: the
+        // `Dump` is captured once, when the kernel is constructed, and the endpoint only
+        // re-renders it (Turtle, or the `.arrangement` s-expression by `as=`). Nothing can
+        // change it for the life of the kernel, because a different arrangement is a
+        // different kernel. So an empty thread set is correct, exactly as for the compiled-in
+        // documents in [`base`]. Conformance 0.5.0's purity rule reported it as "cached with
+        // no thread but its own name", which is what kept this crate's pin at 0.2.0 until
+        // the wave of 2026-10-14.
+        .pure("host-arrangement")
         // ---- waived, per check, with the exception pinned by hand -----------------
         // ★ A REAL VOCABULARY GAP, in a repo that cannot fix it. Declaring `urn:host:health`'s
         // `text/turtle` face (it was served and unannounced) brought it under VOCABULARY,
@@ -705,50 +569,23 @@ fn root_suite() -> Suite {
         .opt_out_check(
             "kernel-health",
             Check::Vocabulary,
-            "ik:Health / ik:verdict / ik:uptimeSeconds / ik:staleJobs are undefined in              ikigai-vocab (at the pin AND at HEAD); the fix is vocabulary.ttl in ikigai-core              plus a /ns deploy. The exact undefined set is pinned by hand below.",
+            "ik:Health / ik:verdict / ik:uptimeSeconds / ik:staleJobs are undefined in \
+             ikigai-vocab (at the pin AND at HEAD); the fix is vocabulary.ttl in ikigai-core \
+             plus a /ns deploy. The exact undefined set is pinned by hand below.",
         )
         // ---- NOT fired, and which hazard each one is -----------------------------
         //
-        // Spawns a process.
-        .opt_out("system-exec", None, "spawns a subprocess")
-        .opt_out("eval", None, "evaluates arbitrary Steel code")
-        // Runs git/gh against the invoking working tree, which this test does not own — and
-        // CI checkouts are shallow, so what these read differs between machines.
-        .opt_out("repo-status", None, "runs git in the invoking working tree")
-        .opt_out("repo-log", None, "runs git in the invoking working tree")
-        .opt_out("repo-branch", None, "runs git in the invoking working tree")
-        .opt_out("repo-list", None, "enumerates repositories on the machine")
-        .opt_out(
-            "repo-pr-checks",
-            None,
-            "shells out to `gh`: network and auth",
-        )
-        .opt_out("repo-pr-view", None, "shells out to `gh`: network and auth")
-        .opt_out("repo-pr-list", None, "shells out to `gh`: network and auth")
-        .opt_out("repo-pr-diff", None, "shells out to `gh`: network and auth")
-        .opt_out("repo-pr-files", None, "shells out to `gh`: network and auth")
+        // ★ Written from the catalog BEFORE the first invoking run. See the module docs.
+        // Every id here is OURS; the hazards of the crates this host composes (a subprocess
+        // seam, outbound HTTP, inference, EventKit, the Keychain, Zoom) are inherited and
+        // not walked at all (see [`base`]).
+        //
         // Reaches the network.
-        .opt_out("llm-ask", None, "POSTs to a live inference server")
-        .opt_out("llm-ollama-ask", None, "POSTs to a live inference server")
-        .opt_out("llm-ollama-up", None, "probes a live inference server")
-        .opt_out(
-            "llm-ollama-installed",
-            None,
-            "queries a live inference server",
-        )
-        .opt_out("llm-ollama-model", None, "queries a live inference server")
-        .opt_out("llm-models", None, "may discover over the network")
-        .opt_out("llm-select", None, "may discover over the network")
         .opt_out("peer-list", None, "mDNS multicast on the local network")
         // Sends a message to a person or a third party. These are not reversible by
         // deleting a file afterwards, which is what makes them a different class from the
         // hermetic Sinks the walk is welcome to fire.
         .opt_out("send", None, "submits real mail over SMTP")
-        .opt_out(
-            "urn:meeting:zoom:schedule",
-            None,
-            "creates a real Zoom meeting through the provider API",
-        )
         .opt_out(
             "decide-accept",
             None,
@@ -760,32 +597,7 @@ fn root_suite() -> Suite {
             "mints a durable client credential, and `send=` emails it",
         )
         // Touches the platform. EventKit is macOS-gated and TCC-prompted (an agent shell is
-        // silently denied), and the calendar Sink and Delete write the USER'S real calendar.
-        .opt_out(
-            "contacts",
-            None,
-            "reads the macOS contact store (EventKit/TCC)",
-        )
-        .opt_out(
-            "calendar",
-            None,
-            "reads and WRITES the macOS calendar (EventKit/TCC)",
-        )
-        .opt_out(
-            "calendars",
-            None,
-            "reads and writes the macOS calendar set (EventKit/TCC)",
-        )
-        .opt_out(
-            "calendar-config",
-            None,
-            "reads the macOS calendar set (EventKit/TCC)",
-        )
-        .opt_out(
-            "availability",
-            None,
-            "reads the macOS calendar (EventKit/TCC)",
-        )
+        // silently denied), and these write the USER'S real calendar.
         .opt_out(
             "view-derive",
             None,
@@ -801,40 +613,6 @@ fn root_suite() -> Suite {
             None,
             "writes the derived calendar through EventKit",
         )
-        .opt_out(
-            "urn:secret",
-            None,
-            "macOS Keychain, behind a Touch ID prompt",
-        )
-        // ★ **A hazard waiver keyed on an endpoint ID does not survive the module splitting
-        // that endpoint** — and the failure is silent in the direction that matters.
-        //
-        // Through ikigai-secret 0.1.5, `unlock` and `type=`/`into=` rode on the
-        // `urn:secret:{name}` template, so the one waiver above covered them. 0.1.6 binds
-        // `urn:secret:unlock` and `urn:secret:generate` as their OWN endpoints ahead of the
-        // template — a strictly better contract, and the right change in that repo — and the
-        // waiver stopped reaching them without anything saying so. The 0.1.6 walk therefore
-        // FIRED both against the real Keychain: `secret-unlock` was probed and served eight
-        // bytes, and `secret-generate` reached `keychain write` and came back "The
-        // authorization was canceled by the user" — i.e. it got as far as a Touch ID prompt on
-        // a developer's machine, in a test.
-        //
-        // Nothing in the suite could have warned: an id that is not in any table is a
-        // classification failure, but an id that IS classified and simply not opted out is
-        // indistinguishable from one the walk is welcome to fire. The general lesson for this
-        // file, recorded because it will happen again on the next module that splits a
-        // template: **re-read the hazard list whenever a module pin moves, not only when this
-        // host binds something new.**
-        .opt_out(
-            "secret-unlock",
-            None,
-            "macOS Keychain, behind a Touch ID prompt",
-        )
-        .opt_out(
-            "secret-generate",
-            None,
-            "mints a real key into the macOS Keychain, behind a Touch ID prompt",
-        )
         // Mutates process-global state the rest of the binary shares: the job registry is a
         // static, so a walk that schedules or cancels is not confined to its own kernel.
         .opt_out(
@@ -849,7 +627,15 @@ fn root_suite() -> Suite {
         )
         // Ours, and it reaches the platform through a sub-resolution the manifold cannot
         // show: minting a link reads `urn:secret:booking-decide`, which on this machine is
-        // the macOS Keychain behind a Touch ID prompt. The same reason `urn:secret` is out.
+        // the macOS Keychain behind a Touch ID prompt.
+        //
+        // ★ **A hazard waiver keyed on an endpoint ID does not survive the module splitting
+        // that endpoint**, and the failure is silent in the direction that matters: when
+        // ikigai-secret 0.1.6 bound `urn:secret:unlock` and `urn:secret:generate` as their own
+        // endpoints, the waiver on `urn:secret` stopped reaching them, and the walk fired both
+        // against the real Keychain, as far as a Touch ID prompt. Those are inherited now and
+        // not walked; the lesson stands for every id below: **re-read the hazard list whenever
+        // a pin moves, not only when this host binds something new.**
         .opt_out(
             "decide-link",
             None,
@@ -865,6 +651,57 @@ fn door_suite() -> Suite {
     base()
         // A binding-only fixture: `urn:calendar-request:{action}` cannot be formed without it.
         .fixture(Fixture::new("calendar-request", Verb::Source).binding("action", "decline"))
+        // ★ The two emailed decision links, and why REQUIRED and AUTHORITY are WAIVED on
+        // them rather than "fixed" (conformance 0.8.0 found both on the HTTP door).
+        //
+        // REQUIRED: `id`/`exp`/`t` (`email`/`exp`/`t` for the block link) are declared
+        // required, and a call without one resolves. Two reasons, both deliberate. The fields
+        // have TWO channels, a named argument or the urlencoded form body a browser POSTs as
+        // `content` (`decide::param`), so the honest contract is "exactly one of", which an
+        // ArgSpec cannot say; marking them optional would tell the manifold a link works
+        // without them, which it does not. And a link missing a field is answered with the
+        // SAME "that link didn't work" page as an expired, forged or used one, so a prober
+        // learns nothing from which kind of bad link it sent. A typed refusal for one kind
+        // would be the first oracle.
+        //
+        // AUTHORITY: the Sink's authority is the Ed25519-signed, expiring token in the link
+        // (plus the passkey second factor once one is enrolled), checked BEFORE anything is
+        // recorded. A call without a valid token records nothing and answers that same page,
+        // which the walk reads as "mutated under no grants" because it cannot see the space
+        // the decision would have been written to. `a_forged_or_expired_token_records_nothing`
+        // in `src/decide.rs` and `src/contactblock.rs` pins that the write did not happen.
+        // There is no kernel capability to declare: the link is opened by an anonymous
+        // browser on purpose.
+        .opt_out_check(
+            "calendar-request",
+            Check::Required,
+            "id/exp/t arrive as named arguments OR in the form body (`content`), an \
+             exactly-one-of intake an ArgSpec cannot state; a link missing one answers the \
+             same uniform bad-link page as an expired or forged one, so there is no oracle",
+        )
+        .opt_out_check(
+            "calendar-request",
+            Check::Authority,
+            "authority is the signed, expiring link token (plus passkey once enrolled), \
+             verified before anything is recorded; without a valid token the Sink records \
+             nothing and answers the bad-link page (pinned by \
+             a_forged_or_expired_token_records_nothing in src/decide.rs)",
+        )
+        .opt_out_check(
+            "contact-block",
+            Check::Required,
+            "email/exp/t arrive as named arguments OR in the form body (`content`), an \
+             exactly-one-of intake an ArgSpec cannot state; a link missing one answers the \
+             same uniform bad-link page as an expired or forged one, so there is no oracle",
+        )
+        .opt_out_check(
+            "contact-block",
+            Check::Authority,
+            "authority is the signed, expiring link token (plus passkey once enrolled), \
+             verified before anything is recorded; without a valid token the Sink records \
+             nothing and answers the bad-link page (pinned by \
+             a_forged_or_expired_token_records_nothing in src/contactblock.rs)",
+        )
         // Ours, and it fetches: every face of `urn:iki:foaf` starts with a `urn:httpGet` of
         // `src=`. Its capability floor is pinned by hand instead, in
         // `foaf::tests::without_a_net_grant_the_door_refuses` — which is the check `opt_out`
@@ -922,16 +759,14 @@ fn owners() -> BTreeMap<&'static str, &'static str> {
     OWN.iter().chain(INHERITED).copied().collect()
 }
 
-/// The findings, tallied by the crate that owns the endpoint each names.
-fn by_owner(report: &Report) -> BTreeMap<&'static str, usize> {
-    let owners = owners();
-    let mut tally: BTreeMap<&'static str, usize> = BTreeMap::new();
-    for finding in &report.findings {
-        if let Some(owner) = owners.get(finding.endpoint.as_str()) {
-            *tally.entry(*owner).or_default() += 1;
-        }
-    }
-    tally
+/// The ids of `table` that `kernel` binds.
+fn bound_from(kernel: &Kernel, table: &[(&'static str, &'static str)]) -> BTreeSet<String> {
+    let bound: BTreeSet<String> = walked(kernel).into_values().collect();
+    table
+        .iter()
+        .map(|(id, _)| id.to_string())
+        .filter(|id| bound.contains(id))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -940,15 +775,25 @@ fn by_owner(report: &Report) -> BTreeMap<&'static str, usize> {
 
 /// **Every endpoint either belongs to this workspace or names the crate it came from.**
 ///
-/// The classification is what makes `conforms` meaningful: without it, "no finding names an
-/// id in `OWN`" is satisfiable by leaving an id out of `OWN`. This test closes that by
-/// requiring the union to cover the catalog exactly — an endpoint added to a member crate
-/// fails here until it is listed, and a module crate that grows one fails here too, which is
-/// the notification a dependency bump otherwise does not give.
+/// The classification is what makes `conforms` meaningful: it scopes each walk to [`OWN`]
+/// with `Suite::own`, so "the report is clean" is satisfiable by leaving an id out of `OWN`.
+/// This test closes that by requiring the union to cover the catalog exactly, with no id in
+/// both tables — an endpoint added to a member crate fails here until it is listed, and a
+/// module crate that grows one fails here too, which is the notification a dependency bump
+/// otherwise does not give.
 #[test]
 fn the_walked_catalog_is_classified() {
     let known: BTreeSet<&str> = owners().keys().copied().collect();
     let own: BTreeSet<&str> = OWN.iter().map(|(id, _)| *id).collect();
+    let both: Vec<&str> = INHERITED
+        .iter()
+        .map(|(id, _)| *id)
+        .filter(|id| own.contains(id))
+        .collect();
+    assert!(
+        both.is_empty(),
+        "these ids are in BOTH OWN and INHERITED; an endpoint has one owner: {both:?}"
+    );
 
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for kernel in [root_kernel(), http_kernel()] {
@@ -977,16 +822,16 @@ fn the_walked_catalog_is_classified() {
     );
 }
 
-/// ★ **The suite over both compositions: nothing unattributed, and nothing of ours.**
+/// ★ **The suite over both compositions, scoped to what this workspace owns.**
 ///
-/// The inherited count is printed rather than pinned. It drops on its own as each module's
-/// own adoption reaches crates.io, and pinning it would turn another crate's improvement
-/// into a failure here.
+/// Each walk declares one `Suite::own` per [`OWN`] id its kernel binds, so every [`INHERITED`]
+/// endpoint is reported as inherited and not walked (see [`base`]). The report must be clean,
+/// and both halves of the scope are pinned against the classification: the walk reached
+/// exactly our ids on that kernel, and the inherited list is exactly the other crates' ids
+/// on it. A module whose new release grows an endpoint therefore turns
+/// `the_walked_catalog_is_classified` red, never this report silently longer.
 #[test]
 fn conforms() {
-    let mut ours: Vec<String> = Vec::new();
-    let own: BTreeSet<&str> = OWN.iter().map(|(id, _)| *id).collect();
-
     // Each composition gets the suite written FOR it — see `base` for why one shared
     // builder is a statement about a manifold that is only half true of either kernel.
     for (label, kernel, suite) in [
@@ -1001,29 +846,20 @@ fn conforms() {
             door_suite(),
         ),
     ] {
+        let ours = bound_from(&kernel, OWN);
+        let theirs = bound_from(&kernel, INHERITED);
+        let suite = ours.iter().fold(suite, |suite, id| suite.own(id.as_str()));
         let report = suite.run_blocking(&kernel);
-        // Which run produced a report is not printed by 0.2.0 (PENDING #138), so the header
-        // is this file's own.
+        // The report does not say which kernel it walked, so the header is this file's own.
         eprintln!("--- {label} ---\n{report}");
-        eprintln!("findings by owning crate: {:?}", by_owner(&report));
 
-        let owners = owners();
-        let unattributed: Vec<String> = report
-            .findings
-            .iter()
-            .filter(|f| !owners.contains_key(f.endpoint.as_str()))
-            .map(|f| format!("{} {}", f.endpoint, f.check.label()))
-            .collect();
-        assert!(
-            unattributed.is_empty(),
-            "every finding must name a classified endpoint; these do not: {unattributed:?}"
-        );
-        ours.extend(
-            report
-                .findings
-                .iter()
-                .filter(|f| own.contains(f.endpoint.as_str()))
-                .map(|f| format!("[{label}] {} {} {}", f.endpoint, f.check.label(), f.detail)),
+        assert!(report.is_clean(), "{label}:\n{report}");
+        let walked: BTreeSet<String> = report.walked.iter().cloned().collect();
+        assert_eq!(walked, ours, "{label}: the walk reached exactly our ids");
+        let inherited: BTreeSet<String> = report.declared.inherited.iter().cloned().collect();
+        assert_eq!(
+            inherited, theirs,
+            "{label}: everything else is inherited, and nothing more"
         );
         assert_eq!(
             report.checks.skipped().count(),
@@ -1031,12 +867,6 @@ fn conforms() {
             "every check runs over a composing host: {report}"
         );
     }
-
-    assert!(
-        ours.is_empty(),
-        "findings against endpoints this workspace owns:\n{}",
-        ours.join("\n")
-    );
 }
 
 /// ★ **A clock-derived result EXPIRES rather than threading — and the HTTP door has a clock.**
@@ -1055,7 +885,7 @@ fn conforms() {
 ///    `http_space()`, whose `Cache-Control: max-age` deadlines are exactly that expiry, so
 ///    the FOAF face re-fetched its source on every single hit. The symptom the suite printed
 ///    was two lines about `clock-now` and `tz-now`; the cost was on `urn:httpGet`, which is
-///    opted out of the walk and could not have reported it itself.
+///    inherited (not walked) and could not have reported it itself.
 #[test]
 fn a_clock_derived_result_expires_rather_than_threading() {
     use ikigai_core::{Expiry, Iri, Request, Verb};

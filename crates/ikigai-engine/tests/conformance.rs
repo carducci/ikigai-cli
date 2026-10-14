@@ -9,8 +9,10 @@
 //! - the plan space itself, the space under test;
 //! - `ikigai_shacl::space()`, because `urn:plan:validate` (and `urn:plan:eval`, which
 //!   validates first) is a sub-request to `urn:shacl:validate`. It is ANOTHER module's door,
-//!   held to the recipe by its own conformance test in ikigai-shacl, so this walk opts it
-//!   out rather than re-judging it;
+//!   held to the recipe by its own conformance test in ikigai-shacl, so the walk is scoped
+//!   with `Suite::own` to the plan doors and the stub: `shacl-validate` is INHERITED, listed
+//!   on the report's `inherited:` line and not walked at all (an opt-out still ran the static
+//!   checks over it). The inherited list is pinned exactly below;
 //! - one stub step target, `urn:t:hello`, declared here and held to the recipe like the
 //!   plan doors: the plan every fixture passes is one `Source` of it;
 //! - a JSON Meta renderer, because `urn:plan:requires` reads each step's contract with a
@@ -86,25 +88,29 @@ fn conforms() {
         .iter()
         .fold(Suite::new(), |suite, id| {
             suite
+                .own(*id)
                 .fixture(Fixture::new(*id, Verb::Source).arg("in", PLAN))
                 .cacheable(*id)
         })
+        .own("hello")
         .pure("hello")
         .cacheable("hello")
-        .opt_out(
-            "shacl-validate",
-            None,
-            "ikigai-shacl's door, bound only because urn:plan:validate composes it; \
-             held to the recipe by ikigai-shacl's own conformance test",
-        )
         .self_named_space("engine:plan", ikigai_engine::plan_space::space);
     let report = suite.run_blocking(&kernel);
-    assert!(report.is_clean(), "{report}");
-    // The three plan doors, `shacl-validate` and the stub: a fourth plan door bound without
-    // a fixture and a `cacheable` line changes this count.
+    report.assert_clean();
+    // The three plan doors and the stub are walked; a fourth plan door bound without a
+    // fixture, a `cacheable` line and an `own` changes one of these.
     assert_eq!(
-        report.endpoints, 5,
-        "every door in the kernel is accounted for: {report}"
+        &*report.walked,
+        ["plan-eval", "plan-validate", "plan-requires", "hello"],
+        "every door this crate owns is walked: {report}"
+    );
+    // ikigai-shacl's door, bound only because `urn:plan:validate` composes it, and nothing
+    // else: a dependency that gains a door here turns this red instead of joining silently.
+    assert_eq!(
+        report.declared.inherited,
+        ["shacl-validate"],
+        "only ikigai-shacl's door is inherited: {report}"
     );
     assert_eq!(
         ikigai_core::space_iri("engine:plan").as_str(),
