@@ -22,11 +22,13 @@ use std::sync::{Arc, Mutex};
 
 use futures::executor::block_on;
 use futures::future::join_all;
+use futures::FutureExt;
 use ikigai_core::{
     ArgRef, BoxFuture, Capability, Description, Expiry, FixedClock, InputSource, Iri, Provenance,
     ReprType, Representation, Request, Scope, Space, Spawner, Thread, TraceEvent, Tracer, Verb,
 };
 use ikigai_resolve::{CacheStatus, Resolver};
+use std::panic::AssertUnwindSafe;
 
 use crate::fanout::{self, FanOut};
 use crate::suggest;
@@ -1249,7 +1251,7 @@ impl Engine {
                     }
                     None => request,
                 };
-                spawner.spawn(Box::pin(async move {
+                let branch = async move {
                     // Each fanned-out branch/item inherits the same upstream provenance.
                     let mut result = resolver
                         .issue_as_async_in(request, &capability, Some(prov.clone()), scope.clone())
@@ -1263,7 +1265,23 @@ impl Engine {
                                 .await;
                         }
                     }
-                    *slot.lock().expect("branch slot") = Some(result);
+                    result
+                };
+                spawner.spawn(Box::pin(async move {
+                    // A branch that PANICS (an endpoint bug) is that branch's error, not
+                    // the whole invocation's panic (ledger #85): an inline spawner would
+                    // unwind through the join, and a pool's handle resumes the unwind
+                    // when joined. Caught here, inside the task, the slot always fills.
+                    let result = AssertUnwindSafe(branch)
+                        .catch_unwind()
+                        .await
+                        .unwrap_or_else(|panic| {
+                            Err(ikigai_core::Error::Endpoint(format!(
+                                "the branch panicked: {}",
+                                panic_message(panic.as_ref())
+                            )))
+                        });
+                    *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(result);
                 }))
             })
             .collect();
@@ -1271,12 +1289,18 @@ impl Engine {
 
         let mut outputs = Vec::with_capacity(slots.len());
         let mut stats = self.cache.get();
-        for slot in slots {
-            let (representation, status) = slot
-                .lock()
-                .expect("branch slot")
-                .take()
-                .expect("spawned branch completed")
+        for (at, slot) in slots.into_iter().enumerate() {
+            // A slot is only ever written whole, so a poisoned lock still holds a whole
+            // value; an EMPTY slot means the spawner never ran the branch at all.
+            let filled = slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+            let (representation, status) = filled
+                .ok_or_else(|| {
+                    format!(
+                        "branch {} of the fan-out never ran: the spawner returned without \
+                         running it",
+                        at + 1
+                    )
+                })?
                 .map_err(|e| describe(&*self.resolver, &e))?;
             stats.record(status);
             outputs.push(Staged::from(representation));
@@ -2969,6 +2993,18 @@ fn split_first_word(s: &str) -> (&str, &str) {
 /// `urn:cap:net:<host>` network scope; anything else is taken verbatim (so a full
 /// `urn:cap:…` scope still works). Lets `cap net-example.com` narrow a session to
 /// one host without typing the whole scope.
+/// The text a panic carried, when it carried text (`panic!("…")` gives a `&str` or a
+/// `String`); anything else is named as such.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = panic.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = panic.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "a non-text panic payload".to_string()
+    }
+}
+
 /// A capability in words: `root (full authority)`, `empty (no scopes granted)`, or its
 /// scopes joined by `, `.
 fn summarize(capability: &Capability) -> String {
@@ -3130,6 +3166,62 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, "A\nB\nb\na");
+    }
+
+    /// ledger #85: one branch of a fan-out that PANICS (an endpoint bug) becomes that
+    /// branch's error, never a panic of the whole invocation — the engine and its session
+    /// survive, and the next line runs.
+    #[test]
+    fn a_panicking_branch_is_that_branchs_error() {
+        let list = FnEndpoint::new("list", |_: &Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"a\nb".to_vec(),
+            ))
+        });
+        let boom = FnEndpoint::new("boom", |inv: &Invocation<'_>| {
+            if inv.inline_str("in").ok() == Some("b") {
+                panic!("an endpoint bug");
+            }
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"ok".to_vec(),
+            ))
+        });
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:test:list"), list)
+            .bind(Exact::new("urn:test:boom"), boom)
+            .bind(Exact::new("urn:test:upper"), builtins::to_upper());
+        let engine =
+            Engine::new(Kernel::new(Arc::new(space))).with_spawner(Arc::new(InlineSpawner));
+        let err = output(engine.eval("source urn:test:list .. urn:test:boom")).unwrap_err();
+        assert!(
+            err.contains("panicked") && err.contains("an endpoint bug"),
+            "{err}"
+        );
+        // The session is intact.
+        assert_eq!(
+            output(engine.eval("source urn:test:list .. urn:test:upper")).unwrap(),
+            "A\nB"
+        );
+    }
+
+    /// …and a spawner that never runs a branch (drops the task) leaves its slot empty: an
+    /// error naming the branch, not a panic.
+    #[test]
+    fn a_branch_the_spawner_never_ran_is_an_error() {
+        struct Dropping;
+        impl ikigai_core::Spawner for Dropping {
+            fn spawn(&self, _task: ikigai_core::BoxFuture<()>) -> ikigai_core::BoxFuture<()> {
+                Box::pin(async {})
+            }
+            fn width(&self) -> Option<usize> {
+                Some(2)
+            }
+        }
+        let engine = parallel_engine().with_spawner(Arc::new(Dropping));
+        let err = output(engine.eval("source urn:test:list .. urn:test:upper")).unwrap_err();
+        assert!(err.contains("never ran"), "{err}");
     }
 
     #[test]
