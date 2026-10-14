@@ -141,7 +141,8 @@ commands:
   :load <uri> [cap=<scope>]  read a script resource and evaluate it as Lisp (cap= narrows first)
   cache <iri> [args]         report whether resolving it would hit the cache (no resolve)
   cap [scope…]               show the session capability, narrow it to `scope`s, or `cap reset`
-                             (`net-<host>` is shorthand for the `urn:cap:net:<host>` scope);
+                             (`net-<host>` is shorthand for the `urn:cap:net:<host>` scope;
+                             a word that is not a `urn:cap:` scope or a profile is refused);
                              narrowing is REVERSIBLE: `cap reset` widens back to the identity
   cap seal [scope…]          hand-off: narrow to `scope`s (or keep the current capability) and
                              make it the session's FLOOR, one-way — `cap reset`, `logout` and
@@ -1035,12 +1036,12 @@ impl Engine {
         let iri = parse_target(uri)?;
 
         // Narrow just for this load, if asked, saving the prior capability to restore.
-        let saved = cap.map(|scope| {
+        // A bad scope word is refused before anything narrows (ledger #105).
+        let scopes = cap
+            .map(|scope| self.cap_scopes(scope, scope.split(',')))
+            .transpose()?;
+        let saved = scopes.map(|scopes| {
             let prev = self.capability.borrow().clone();
-            let scopes: Vec<String> = match self.profiles.borrow().get(scope) {
-                Some(scopes) => scopes.clone(),
-                None => scope.split(',').map(expand_cap_shorthand).collect(),
-            };
             let narrowed = self.capability.borrow().attenuate(scopes);
             *self.capability.borrow_mut() = narrowed;
             prev
@@ -1783,12 +1784,12 @@ impl Engine {
         if word == "seal" {
             let scopes = scopes.trim();
             if !scopes.is_empty() {
-                self.narrow(scopes);
+                self.narrow(scopes)?;
             }
             self.seal();
             return Ok(format!("sealed — {}", self.describe_capability()));
         }
-        self.narrow(rest);
+        self.narrow(rest)?;
         Ok(format!("narrowed — {}", self.describe_capability()))
     }
 
@@ -1796,14 +1797,47 @@ impl Engine {
     /// scopes; otherwise each word is a scope, with a `net-<host>` shorthand for
     /// `urn:cap:net:<host>` so a session can be narrowed to one host without typing the
     /// full scope (e.g. `cap seal net-example.com` before handing outbound HTTP to an
-    /// agent).
-    fn narrow(&self, words: &str) {
-        let scopes: Vec<String> = match self.profiles.borrow().get(words) {
-            Some(scopes) => scopes.clone(),
-            None => words.split_whitespace().map(expand_cap_shorthand).collect(),
-        };
+    /// agent). A word that is none of those is refused and nothing narrows.
+    fn narrow(&self, words: &str) -> Result<(), String> {
+        let scopes = self.cap_scopes(words, words.split_whitespace())?;
         let narrowed = self.capability.borrow().attenuate(scopes);
         *self.capability.borrow_mut() = narrowed;
+        Ok(())
+    }
+
+    /// The scopes a `cap` argument names: `whole` as a registered profile name, else each
+    /// of `words` through the `net-<host>` shorthand. Every resulting scope must be a
+    /// `urn:cap:` IRI; the first word that is not is REFUSED by name (ledger #105), since a
+    /// scope that is not one grants nothing, and accepting it turned a misspelling into a
+    /// silent no-op grant whose denial surfaced later, somewhere else.
+    fn cap_scopes<'w>(
+        &self,
+        whole: &str,
+        words: impl Iterator<Item = &'w str>,
+    ) -> Result<Vec<String>, String> {
+        let profiles = self.profiles.borrow();
+        if let Some(scopes) = profiles.get(whole) {
+            return Ok(scopes.clone());
+        }
+        words
+            .map(|word| {
+                let scope = expand_cap_shorthand(word);
+                if is_cap_scope(&scope) {
+                    return Ok(scope);
+                }
+                let mut names: Vec<&str> = profiles.keys().map(String::as_str).collect();
+                names.sort_unstable();
+                let profiles = if names.is_empty() {
+                    String::new()
+                } else {
+                    format!(", or a profile ({})", names.join(", "))
+                };
+                Err(format!(
+                    "`{word}` is not a capability scope: a scope is a `urn:cap:` IRI, \
+                     `net-<host>` (for `urn:cap:net:<host>`){profiles}"
+                ))
+            })
+            .collect()
     }
 
     /// A one-line summary of the session capability — and, once sealed, of its floor.
@@ -2943,6 +2977,13 @@ fn summarize(capability: &Capability) -> String {
         Some(scopes) if scopes.is_empty() => "empty (no scopes granted)".to_string(),
         Some(scopes) => scopes.iter().cloned().collect::<Vec<_>>().join(", "),
     }
+}
+
+/// A scope a capability can hold: a `urn:cap:` IRI with something after the prefix.
+fn is_cap_scope(scope: &str) -> bool {
+    scope
+        .strip_prefix("urn:cap:")
+        .is_some_and(|rest| !rest.is_empty() && !rest.contains(char::is_whitespace))
 }
 
 fn expand_cap_shorthand(word: &str) -> String {
@@ -4550,6 +4591,46 @@ mod tests {
             "urn:cap:fs:read:/x"
         );
         assert_eq!(expand_cap_shorthand("net-"), "net-");
+    }
+
+    /// ledger #105: a word that is not a `urn:cap:` scope after profile and shorthand
+    /// expansion is REFUSED, by name, and the capability is left as it was. Before, a typo
+    /// became a scope that grants nothing, and the failure surfaced later as a denial
+    /// somewhere else that looked like a capability bug.
+    #[test]
+    fn cap_refuses_a_word_that_is_not_a_capability_scope() {
+        let engine = cal_engine(Capability::root());
+        engine.define_cap_profile("freebusy", ["urn:cap:demo:cal:read:freebusy"]);
+
+        let err = output(engine.eval("cap urn:cap:demo:cal:read:detail tyop")).unwrap_err();
+        assert!(err.contains("`tyop`"), "the word is named: {err}");
+        assert!(err.contains("urn:cap:"), "says what a scope is: {err}");
+        assert!(
+            err.contains("freebusy"),
+            "names the registered profiles: {err}"
+        );
+        assert!(engine.capability().is_root(), "nothing was narrowed");
+
+        // `cap seal` with a bad word neither narrows nor seals.
+        let err = output(engine.eval("cap seal net-"))
+            .expect_err("`net-` with no host expands to nothing");
+        assert!(err.contains("`net-`"), "{err}");
+        assert!(!engine.is_sealed() && engine.capability().is_root());
+
+        // `:load … cap=` takes the same scope grammar (and `ikigai --cap` becomes it).
+        let err = output(engine.eval(":load urn:demo:cal cap=urn:cap:x,typo")).unwrap_err();
+        assert!(err.contains("`typo`"), "{err}");
+        assert!(engine.capability().is_root());
+
+        // The accepted forms are unchanged: a profile, the shorthand, a full scope.
+        for ok in [
+            "cap freebusy",
+            "cap net-example.com",
+            "cap urn:cap:demo:cal:read:detail",
+        ] {
+            output(engine.eval(ok)).unwrap_or_else(|e| panic!("{ok}: {e}"));
+            engine.eval("cap reset");
+        }
     }
 
     #[test]
