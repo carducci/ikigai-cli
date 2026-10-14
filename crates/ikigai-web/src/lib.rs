@@ -1330,9 +1330,11 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
     }
 
     // PATCH is read-modify-write: the request Content-Type selects a patch strategy from
-    // the registry, which transforms the current representation before it is Sunk.
+    // the registry, which transforms the current representation before it is Sunk. The
+    // Sink it issues is THIS request — stamped above with `received`, `client` and
+    // `principal` like any other write — with only its content replaced (ledger #520).
     if req.method == "PATCH" {
-        return apply_patch(config, kernel, &iri, &cap, req).await;
+        return apply_patch(config, kernel, request, &cap, req).await;
     }
 
     match kernel.issue(request, &cap).await {
@@ -1462,13 +1464,20 @@ fn patch_strategy(content_type: &str) -> Option<PatchStrategy> {
 /// PATCH = read-modify-write. Select a strategy by `Content-Type` (unknown → 415), Source
 /// the current representation (absent → 404, denied → 403), apply the patch (malformed →
 /// 422), and Sink the result — returning it with a fresh `ETag` for chained updates.
+///
+/// `sink` is the request the edge built for this PATCH: the Sink of the target, already
+/// carrying the provenance every write carries (`received`, `client`, `principal`) and
+/// the forwarded query. Only `content` and `content-type` are replaced, by the patched
+/// document and its current media type, so a patched resource records who wrote it and
+/// when exactly as a `PUT` does.
 async fn apply_patch(
     config: &EdgeConfig,
     kernel: &Kernel,
-    iri: &Iri,
+    sink: Request,
     cap: &Capability,
     req: &HttpRequest,
 ) -> Resp {
+    let iri = &sink.target;
     let ct = req
         .header("content-type")
         .unwrap_or("")
@@ -1497,12 +1506,10 @@ async fn apply_patch(
         Ok(bytes) => bytes,
         Err(detail) => return Resp::text(422, "Unprocessable Content", &detail),
     };
-    let sink = Request::new(Verb::Sink, iri.clone())
-        .with_arg("content", ArgRef::Inline(patched))
-        .with_arg(
-            "content-type",
-            ArgRef::Inline(media_type_of(&current).into_bytes()),
-        );
+    let sink = sink.with_arg("content", ArgRef::Inline(patched)).with_arg(
+        "content-type",
+        ArgRef::Inline(media_type_of(&current).into_bytes()),
+    );
     match kernel.issue(sink, cap).await {
         Ok(repr) if repr.bytes.is_empty() => Resp::status(204, "No Content"),
         Ok(repr) => {
@@ -3114,6 +3121,32 @@ mod tests {
             }
         })
         .with_description(Description::new("jdoc").verb(Verb::Source).verb(Verb::Sink));
+        // A JSON doc whose Sink echoes the provenance it was handed beside the patched body,
+        // so a PATCH test can see what its read-modify-write wrote with (ledger #520).
+        let jprov = FnEndpoint::new("jprov", |inv: &Invocation<'_>| {
+            if inv.request.verb == Verb::Source {
+                return Ok(Representation::new(
+                    ReprType::new("application/json"),
+                    br#"{"a":1}"#.to_vec(),
+                ));
+            }
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!(
+                    "received={} client={} principal={} content={}",
+                    inv.inline_str("received").unwrap_or("-"),
+                    inv.inline_str("client").unwrap_or("-"),
+                    inv.inline_str("principal").unwrap_or("-"),
+                    inv.inline_str("content").unwrap_or("-"),
+                )
+                .into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("jprov")
+                .verb(Verb::Source)
+                .verb(Verb::Sink),
+        );
         // An availability-shaped resource: GET reads it, POST books against it, with declared
         // inputs (the `?description` → OpenAPI source).
         let booking = FnEndpoint::new("booking", |_inv: &Invocation<'_>| {
@@ -3293,7 +3326,8 @@ mod tests {
             .bind(Exact::new("urn:test:vanishing"), vanishing)
             .bind(Exact::new("urn:test:ghost"), ghost)
             .bind(Exact::new("urn:test:tuples"), tuples)
-            .bind(Exact::new("urn:test:jdoc"), jdoc);
+            .bind(Exact::new("urn:test:jdoc"), jdoc)
+            .bind(Exact::new("urn:test:jprov"), jprov);
         Arc::new(Kernel::new(Arc::new(space)))
     }
 
@@ -4115,6 +4149,23 @@ mod tests {
             resp.contains("ETag: "),
             "PATCH should return a fresh ETag, got: {resp}"
         );
+    }
+
+    /// ledger #520: PATCH is a mutating verb, so its Sink carries the provenance a PUT/POST
+    /// carries — `received`, `client`, and the door's `principal` — not an anonymous write.
+    #[tokio::test]
+    async fn a_patch_is_stamped_like_any_other_write() {
+        let addr = start_with(naming_door()).await;
+        let resp = roundtrip(addr, &merge_patch("/test/jprov", r#"{"b":2}"#)).await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
+        assert!(
+            resp.contains("received=20")
+                && resp.contains("client=127.0.0.1")
+                && resp.contains("principal=p"),
+            "a patched resource must be written with its provenance: {resp}"
+        );
+        // The merged document is still what is written, not the patch body.
+        assert!(resp.ends_with(r#"content={"a":1,"b":2}"#), "got: {resp}");
     }
 
     #[tokio::test]
