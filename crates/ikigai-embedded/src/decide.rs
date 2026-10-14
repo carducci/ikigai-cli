@@ -183,7 +183,7 @@ pub(crate) fn urlencode(value: &str) -> String {
 ///
 /// Over bytes, not `&str` offsets: slicing a `&str` at a computed offset panics when a `%`
 /// precedes a multibyte character — the same defect `ikigai-intake` documents.
-fn percent_decode(input: &str) -> String {
+pub(crate) fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;

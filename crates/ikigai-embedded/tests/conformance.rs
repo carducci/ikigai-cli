@@ -105,7 +105,9 @@ const OWN: &[(&str, &str)] = &[
     ("client-issue", "ikigai-embedded"),
     ("clock-now", "ikigai-embedded"),
     ("contact-block", "ikigai-embedded"),
+    ("contact-label", "ikigai-embedded"),
     ("contactblock-link", "ikigai-embedded"),
+    ("contactlabel-link", "ikigai-embedded"),
     ("control", "ikigai-embedded"),
     ("decide-accept", "ikigai-embedded"),
     ("decide-link", "ikigai-embedded"),
@@ -431,8 +433,9 @@ const PLAN: &str = "\
 /// ★ **A `Suite` is a statement about the MANIFOLD it walks — so there are three of them.**
 ///
 /// This crate composes two kernels, and they are not the same catalog: the personal, Lisp,
-/// repo and LLM surface is on the REPL root only, six ids are on the HTTP door only (`foaf`,
-/// the passkey trio, `calendar-request`, `contact-block`), and the rest are on both. One
+/// repo and LLM surface is on the REPL root only, seven ids are on the HTTP door only (`foaf`,
+/// the passkey trio, `calendar-request`, `contact-block`, `contact-label`), and the rest are on
+/// both. One
 /// shared builder therefore carried, on every run, declarations that could not apply to the
 /// kernel being walked, and DECLARATIONS reports every one of those. So [`base`] is what is
 /// true of both manifolds, and [`root_suite`] and [`door_suite`] add what is true of one.
@@ -541,6 +544,13 @@ fn root_suite() -> Suite {
         .fixture(
             Fixture::new("contactblock-link", Verb::Source).arg("email", "someone@example.org"),
         )
+        // A label from the closed set and an enquiry to name (the tuple's text; the link
+        // carries only its id), because the endpoint refuses anything else before it mints.
+        .fixture(
+            Fixture::new("contactlabel-link", Verb::Source)
+                .arg("label", "ham")
+                .arg("enquiry", "((message \"a fixture enquiry\"))"),
+        )
         // The plan resources, over a real plan: one pure step, so evaluating it is a read.
         .fixture(Fixture::new("plan-eval", Verb::Source).arg("in", PLAN))
         .fixture(Fixture::new("plan-validate", Verb::Source).arg("in", PLAN))
@@ -643,7 +653,7 @@ fn root_suite() -> Suite {
         )
 }
 
-/// [`base`] plus the six resources bound only on the public HTTP door.
+/// [`base`] plus the seven resources bound only on the public HTTP door.
 ///
 /// A short list, and that is the door's whole point: it is the SUBSET, and
 /// `the_http_door_serves_no_owner_only_resource` states the other half as a red line.
@@ -701,6 +711,23 @@ fn door_suite() -> Suite {
              verified before anything is recorded; without a valid token the Sink records \
              nothing and answers the bad-link page (pinned by \
              a_forged_or_expired_token_records_nothing in src/contactblock.rs)",
+        )
+        // The label link (ledger #1513) is the block link's shape exactly, for the same two
+        // reasons.
+        .opt_out_check(
+            "contact-label",
+            Check::Required,
+            "id/label/exp/t arrive as named arguments OR in the form body (`content`), an \
+             exactly-one-of intake an ArgSpec cannot state; a link missing one answers the \
+             same uniform bad-link page as an expired or forged one, so there is no oracle",
+        )
+        .opt_out_check(
+            "contact-label",
+            Check::Authority,
+            "authority is the signed, expiring link token (plus passkey once enrolled), \
+             verified before anything is recorded; without a valid token the Sink records \
+             nothing and answers the bad-link page (pinned by \
+             every_bad_label_link_records_nothing in src/contactblock.rs)",
         )
         // Ours, and it fetches: every face of `urn:iki:foaf` starts with a `urn:httpGet` of
         // `src=`. Its capability floor is pinned by hand instead, in
