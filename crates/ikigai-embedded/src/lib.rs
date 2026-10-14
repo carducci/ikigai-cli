@@ -1658,6 +1658,17 @@ fn served_space(nature: &'static str) -> EndpointSpace {
                 key_path: contactblock::public_key_path(),
             },
         )
+        // The emailed spam-filter label links ("not spam", "spam after all"): /contact-label.
+        // The block link's shape exactly, and the same public key: GET shows, POST RECORDS a
+        // label into the same contact-blocks airlock. It never touches the model — training is
+        // the daemon's apply reactor, under `urn:cap:bayes:train:contact`, which this
+        // internet-facing ceiling never holds (ledger #1513).
+        .bind(
+            Exact::new("urn:contact-label"),
+            contactblock::ContactLabel {
+                key_path: contactblock::public_key_path(),
+            },
+        )
         // The passkey second factor's PUBLIC face: `urn:passkey:challenge` mints a login
         // challenge, `urn:passkey:register` shows the enrolment page and stores a credential
         // (only while a window opened at the box is live). Both read/verify against the edge's
@@ -4470,10 +4481,12 @@ pub struct Program {
 ///   authority.
 /// - `urn:contact:handle` (`contact-handler.scm`): the reactive `contact` space fires it on
 ///   each dropped enquiry, and it emails the enquiry on via `urn:email:send`.
-/// - `urn:contactblock:apply` (`contactblock-apply.scm`): the public `urn:contact-block` link
-///   RECORDS a verified block into `urn:space:contact-blocks`; the reactive `contact-blocks`
-///   space fires this on each drop, under that space's authority (`urn:cap:decisions:write`),
-///   and it writes the block into the edge-local `urn:decisions`. Keeping the write here — off
+/// - `urn:contactblock:apply` (`contactblock-apply.scm`): the public `urn:contact-block` and
+///   `urn:contact-label` links RECORD a verified block or label into `urn:space:contact-blocks`;
+///   the reactive `contact-blocks` space fires this on each drop, under that space's authority
+///   (`urn:cap:decisions:write`, and since ledger #1513 `urn:cap:space:read:contact` and
+///   `urn:cap:bayes:train:contact`), and it writes the block into the edge-local
+///   `urn:decisions` and trains the spam filter on the enquiry the drop names. Keeping the write here — off
 ///   the internet-facing HTTP ceiling — is the whole point of the airlock.
 /// - `urn:booking:confirm` (`confirm.scm`): the human step. It reads the confirmations space,
 ///   and on approval writes the calendar and emails the requester. NO space fires it — it is
@@ -4759,6 +4772,12 @@ fn root_members() -> Vec<Arc<dyn Space>> {
             .bind(
                 Exact::new("urn:contactblock:link"),
                 contactblock::ContactBlockLink::default(),
+            )
+            // And its sibling, the spam-filter label link: same key, same grant, same reason to
+            // live only here (ledger #1513).
+            .bind(
+                Exact::new("urn:contactlabel:link"),
+                contactblock::ContactLabelLink::default(),
             )
             // Opening a passkey enrollment window is a deliberate act at the box: cap-gated
             // (`urn:cap:passkey:enroll`) and bound here, off the public face, so only
@@ -10807,5 +10826,124 @@ mod manifold_identity_948 {
         assert_eq!(targets.len(), 1, "{targets:?}");
         c.contract.clear();
         assert_eq!(alias_targets(&[c], &Default::default()).len(), 1);
+    }
+}
+
+/// Ledger #1513, end to end on the daemon's side: the enquiry a label link names is the very
+/// tuple the reactor handed the handler. The handler holds the tuple's BYTES, never its id, and
+/// the minter computes the id from what it is handed, so this is the test that the bytes survive
+/// the trip — reactor → Lisp program `(input)` → `invoke` → minter — unchanged, and that the
+/// apply side can read that tuple back by the id under the one-space grant and nothing wider.
+#[cfg(test)]
+mod contact_label_tests {
+    use super::*;
+    use ed25519_dalek::pkcs8::{spki::der::pem::LineEnding, EncodePrivateKey};
+    use futures::executor::block_on;
+    use ikigai_core::{Capability, Kernel, Request};
+
+    /// What `contact-handler.scm` does to mint a "not spam" link, and nothing else.
+    const MINT: &str =
+        "(invoke 'source \"urn:contactlabel:link\" \"label\" \"ham\" \"enquiry\" (input))";
+
+    #[test]
+    fn a_label_link_names_the_tuple_the_reactor_handled_and_only_its_space_can_be_read() {
+        let base =
+            std::env::temp_dir().join(format!("ikigai-contact-label-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let spaces = base.join("spaces");
+        let config = base.join("config");
+        std::fs::create_dir_all(spaces.join("contact")).unwrap();
+        std::fs::create_dir_all(config.join(SPACE_AUTHORITY_DIR)).unwrap();
+        std::fs::write(spaces.join("contact").join("handler"), "urn:test:mint\n").unwrap();
+        std::fs::write(
+            config.join(SPACE_AUTHORITY_DIR).join("contact"),
+            format!("urn:cap:lisp\n{}\n", contactblock::CAP_CONTACTBLOCK_MINT),
+        )
+        .unwrap();
+        let key_path = base.join("contact-block.key");
+        let key = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        std::fs::write(
+            &key_path,
+            key.to_pkcs8_pem(LineEnding::LF).unwrap().as_str(),
+        )
+        .unwrap();
+        let kernel = Arc::new(Kernel::new(Arc::new(
+            ikigai_intray::space(spaces.clone())
+                .bind(
+                    Exact::new("urn:test:mint"),
+                    ikigai_lisp::program("mint", MINT),
+                )
+                .bind(
+                    Exact::new("urn:contactlabel:link"),
+                    contactblock::ContactLabelLink { key_path },
+                ),
+        )));
+        let reactor = space_reactor(
+            spaces.clone(),
+            Arc::clone(&kernel) as Arc<dyn ikigai_resolve::Resolver>,
+            Some(config),
+        );
+
+        // An enquiry with the characters a byte-changing hop would trip on: escaped quotes, a
+        // backslash, an escaped newline, non-ASCII text, and a trailing newline.
+        let enquiry = "((name \"Zoë \\\"Z\\\" Ørsted\") (email \"zoe@example.invalid\") \
+                       (message \"línea uno\\nline \\\\ two — 日本\"))\n";
+        let dropped = block_on(
+            kernel.issue(
+                Request::new(Verb::Sink, Iri::parse("urn:space:contact").unwrap())
+                    .with_arg("content", ArgRef::Inline(enquiry.as_bytes().to_vec())),
+                &Capability::scoped(vec![ikigai_intray::CAP_OUT.to_string()]),
+            ),
+        )
+        .unwrap();
+        let id = String::from_utf8(dropped.bytes).unwrap();
+        assert_eq!(id, ikigai_intray::tuple_id(enquiry.as_bytes()));
+        assert_eq!(
+            reactor.process("contact", &id),
+            ikigai_intray::Outcome::Handled
+        );
+
+        let url = std::fs::read_to_string(
+            spaces
+                .join("contact")
+                .join("outbox")
+                .join(format!("{id}.out")),
+        )
+        .unwrap();
+        assert!(
+            url.contains(&format!("?id={id}&label=ham&")),
+            "the link names the handled tuple: {url}"
+        );
+
+        // The apply side's read: that tuple, by the id in the link, under the one-space grant.
+        let read = |space: &str, cap: &Capability| {
+            block_on(
+                kernel.issue(
+                    Request::new(Verb::Source, Iri::parse(space).unwrap())
+                        .with_arg("tuple", ArgRef::Inline(id.clone().into_bytes()))
+                        .with_arg("state", ArgRef::Inline(b"outbox".to_vec())),
+                    cap,
+                ),
+            )
+        };
+        let grant = Capability::scoped(vec![ikigai_intray::cap_read_space("contact")]);
+        assert_eq!(
+            read("urn:space:contact", &grant).unwrap().bytes,
+            enquiry.as_bytes()
+        );
+        assert!(matches!(
+            read("urn:space:contact-blocks", &grant),
+            Err(Error::Denied(_))
+        ));
+        // And without it, the apply reactor's other grants read nothing.
+        let without = Capability::scoped(vec![
+            "urn:cap:lisp".to_string(),
+            "urn:cap:decisions:write".to_string(),
+            "urn:cap:bayes:train:contact".to_string(),
+        ]);
+        assert!(matches!(
+            read("urn:space:contact", &without),
+            Err(Error::Denied(_))
+        ));
     }
 }

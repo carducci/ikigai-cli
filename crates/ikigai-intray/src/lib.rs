@@ -63,8 +63,35 @@ const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
 /// `out` (dropping a tuple) requires this capability — the gate a stranger drops under.
 pub const CAP_OUT: &str = "urn:cap:space:out";
-/// `rd` (reading the space, non-destructively) requires this capability.
+/// `rd` (reading the space, non-destructively) requires this capability, or the one space's
+/// own [`cap_read_space`] grant.
 pub const CAP_READ: &str = "urn:cap:space:read";
+
+/// What `rd` DECLARES: the whole read family, `urn:cap:space:read*`. The kernel's floor reads a
+/// trailing `*` as "holds any grant under this prefix" (the `CAP_READ_ANY` of ikigai-store,
+/// for the same reason), so it is satisfied by the broad [`CAP_READ`] and by every per-space
+/// [`cap_read_space`], and by nothing in the `out`/`take` families. `urn:cap:space:read:*`
+/// would miss the broad token (no trailing colon on it). Which space a per-space grant opens
+/// is the module's own check, made in `invoke` against the `{name}` being read.
+pub const CAP_READ_ANY: &str = "urn:cap:space:read*";
+
+/// The grant that reads ONE space: `urn:cap:space:read:{name}` (ledger #1513). A holder can
+/// list, match and read every stage of that space and of no other; the broad [`CAP_READ`]
+/// still reads them all. The parameter goes LAST, as in every per-name grant in the system
+/// (`urn:cap:bayes:read:{model}`, `urn:cap:ledger:read:{name}`), and it is matched EXACTLY,
+/// like every other grant: `urn:cap:space:read:contact` does not read `contact-blocks`.
+///
+/// ```
+/// use ikigai_intray::cap_read_space;
+/// assert_eq!(cap_read_space("contact"), "urn:cap:space:read:contact");
+/// ```
+///
+/// What it is for: a reactor that must read one tuple of a NEIGHBORING space (the edge's
+/// contact-blocks reactor reads the enquiry a "not spam" click names, out of the contact
+/// space's outbox) without holding the read of every space on the host.
+pub fn cap_read_space(name: &str) -> String {
+    format!("{CAP_READ}:{name}")
+}
 /// `take` (removing a tuple) requires this capability — strictly more authority than read,
 /// so a reader can observe the space without being able to consume from it.
 pub const CAP_TAKE: &str = "urn:cap:space:take";
@@ -115,6 +142,19 @@ pub fn space_with_budget(root: PathBuf, budget: EvaluationBudget) -> EndpointSpa
         UriTemplate::parse(SPACE_TEMPLATE).expect("SPACE_TEMPLATE is a valid template"),
         SpaceEndpoint::new(root).with_evaluation_budget(budget),
     )
+}
+
+/// The id a tuple has in every space: its content address, the lowercase hex of its BLAKE3
+/// hash (64 characters). `out` names a drop by it and every stage files it under it, so a
+/// tuple's id can be computed from its bytes alone, by anyone holding them.
+///
+/// ```
+/// let id = ikigai_intray::tuple_id(b"((message \"hello\"))");
+/// assert_eq!(id.len(), 64);
+/// assert!(id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+/// ```
+pub fn tuple_id(content: &[u8]) -> String {
+    blake3::hash(content).to_hex().to_string()
 }
 
 /// Whether `id` can be a tuple id: it is joined as `<id>.tuple` (and `.err`, `.out`) under a
@@ -641,7 +681,7 @@ impl Endpoint for SpaceEndpoint {
                 let content = inv
                     .inline_arg("content")
                     .map_err(|_| Error::MissingArgument("content".to_string()))?;
-                let id = blake3::hash(content).to_hex().to_string();
+                let id = tuple_id(content);
                 std::fs::create_dir_all(&inbox)
                     .map_err(|e| Error::Endpoint(format!("space `{name}`: create inbox: {e}")))?;
                 // Atomic appearance: write to a staging file, then rename it into the inbox.
@@ -673,8 +713,12 @@ impl Endpoint for SpaceEndpoint {
             // rd: read the space — one tuple (`tuple=<id>`), the ids matching a `match=<ASK>`
             // template, or all ids. Non-destructive.
             Verb::Source => {
-                if !inv.capability.allows(CAP_READ) {
-                    return Err(Error::Denied(format!("reading a space needs `{CAP_READ}`")));
+                if !inv.capability.allows(CAP_READ) && !inv.capability.allows(&cap_read_space(name))
+                {
+                    return Err(Error::Denied(format!(
+                        "reading space `{name}` needs `{CAP_READ}` or `{}`",
+                        cap_read_space(name)
+                    )));
                 }
                 self.requeue_stale_claims(name);
                 // `state=` selects which stage of the machine to read: the live `inbox`
@@ -880,7 +924,8 @@ impl Endpoint for SpaceEndpoint {
                     // answers the tuple's own bytes, which the space never interprets.
                     .output("text/plain; charset=utf-8")
                     .output("application/octet-stream")
-                    .requires(CAP_READ),
+                    // The FAMILY: the broad read or one space's own (ledger #1513).
+                    .requires(CAP_READ_ANY),
             )
             .action(
                 ActionSpec::new(Verb::Sink)
@@ -2073,6 +2118,96 @@ mod tests {
             ),
         );
         assert!(matches!(r, Err(Error::NotFound(_))), "got: {r:?}");
+    }
+
+    /// A per-space read grant (ledger #1513) reads exactly its own space: one handled tuple by
+    /// id out of the outbox, and nothing in any other space, a name it only prefixes included.
+    #[test]
+    fn a_per_space_read_grant_reads_its_own_space_and_no_other() {
+        let root = std::env::temp_dir()
+            .join("ikigai-intray-test")
+            .join("space-per-read");
+        let _ = std::fs::remove_dir_all(&root);
+        let k = Kernel::new(Arc::new(space(root.clone())));
+        // A handled enquiry, where a reactor leaves one: `<root>/contact/outbox/<id>.tuple`.
+        let enquiry = b"((name \"A Visitor\") (message \"hello\"))";
+        let id = tuple_id(enquiry);
+        let outbox = root.join("contact").join("outbox");
+        std::fs::create_dir_all(&outbox).unwrap();
+        std::fs::write(outbox.join(format!("{id}.tuple")), enquiry).unwrap();
+        // Something in the neighbors, so a refusal is a refusal and not an empty space.
+        let dropper = Capability::scoped(vec![CAP_OUT.to_string()]);
+        out(&k, &dropper, "urn:space:people", b"((name \"someone\"))");
+        out(
+            &k,
+            &dropper,
+            "urn:space:contact-blocks",
+            b"((label \"ham\"))",
+        );
+
+        let narrow = Capability::scoped(vec![cap_read_space("contact")]);
+        let read = |space: &str, args: &[(&str, &str)], cap: &Capability| {
+            let mut r = Request::new(Verb::Source, iri(space));
+            for (n, v) in args {
+                r = r.with_arg(*n, ArgRef::Inline(v.as_bytes().to_vec()));
+            }
+            block_on(k.issue(r, cap))
+        };
+        // The one tuple, by id, from the outbox: its own bytes.
+        let got = read(
+            "urn:space:contact",
+            &[("tuple", &id), ("state", "outbox")],
+            &narrow,
+        )
+        .expect("the per-space grant reads its own space");
+        assert_eq!(got.bytes, enquiry);
+        // A well-formed id that names nothing there is NotFound, not some other tuple.
+        let unknown = "0".repeat(64);
+        let miss = read(
+            "urn:space:contact",
+            &[("tuple", &unknown), ("state", "outbox")],
+            &narrow,
+        );
+        assert!(matches!(miss, Err(Error::NotFound(_))), "got: {miss:?}");
+        // Another space, and one whose name the granted one only prefixes, are refused.
+        for other in ["urn:space:people", "urn:space:contact-blocks"] {
+            let r = read(other, &[], &narrow);
+            assert!(matches!(r, Err(Error::Denied(_))), "{other}: got {r:?}");
+        }
+        // It is a READ grant: taking from the space it reads is still refused.
+        let take = block_on(
+            k.issue(
+                Request::new(Verb::Delete, iri("urn:space:contact"))
+                    .with_arg("tuple", ArgRef::Inline(id.clone().into_bytes())),
+                &narrow,
+            ),
+        );
+        assert!(matches!(take, Err(Error::Denied(_))), "got: {take:?}");
+        // The broad grant still reads every space.
+        let broad = Capability::scoped(vec![CAP_READ.to_string()]);
+        assert!(read("urn:space:people", &[], &broad).is_ok());
+    }
+
+    /// rd declares the read FAMILY, so the kernel's floor admits a per-space grant to the
+    /// module's own check, and keeps admitting the broad one.
+    #[test]
+    fn rd_declares_the_read_family() {
+        let d = SpaceEndpoint::new(std::env::temp_dir()).describe();
+        let rd = d
+            .action_specs()
+            .into_iter()
+            .find(|a| a.verb == Verb::Source)
+            .expect("rd is declared");
+        assert_eq!(rd.requires, vec![CAP_READ_ANY.to_string()]);
+        for held in [CAP_READ.to_string(), cap_read_space("contact")] {
+            assert!(
+                Capability::scoped(vec![held.clone()]).satisfies(CAP_READ_ANY),
+                "{held}"
+            );
+        }
+        for not_read in [CAP_OUT, CAP_TAKE] {
+            assert!(!Capability::scoped(vec![not_read.to_string()]).satisfies(CAP_READ_ANY));
+        }
     }
 
     #[test]

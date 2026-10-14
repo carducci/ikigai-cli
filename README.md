@@ -533,10 +533,38 @@ trains with:
 urn:cap:bayes:read:contact
 
 # ~/.config/ikigai/space-authority/contact-blocks   (a block or not-spam click trains)
+urn:cap:space:read:contact
 urn:cap:bayes:train:contact
 ```
 
 Each line is added beside the scopes the file already lists; the file is re-read on every tuple.
+
+**Teaching it from the enquiry email (shadow mode).** The contact handler scores every enquiry and
+still mails every one; the subject carries the verdict (`[spam 0.97]`, `[unsure 0.55]`,
+`[ham 0.03]`) and the body the strongest clues. Three signed links teach the model, each a GET
+that shows a confirm page and a POST that only drops a tuple into `urn:space:contact-blocks`:
+
+| link | minted by (edge daemon) | the click drops | the apply reactor |
+|---|---|---|---|
+| `/contact-block?email=…&id=…` | `urn:contactblock:link email= enquiry=` | `((block-email …) (enquiry …) (exp …))` | writes the block, trains `spam` |
+| `/contact-label?id=…&label=ham` | `urn:contactlabel:link label=ham enquiry=` | `((label "ham") (enquiry …) (exp …))` | trains `ham` |
+| `/contact-label?id=…&label=spam` | `urn:contactlabel:link label=spam enquiry=` | `((label "spam") (enquiry …) (exp …))` | trains `spam` |
+
+- **A link names its enquiry, never carries it.** `id` is the enquiry tuple's id in the contact
+  space (its content address, `ikigai_intray::tuple_id`); the minter is handed the tuple exactly as
+  the reactor handed it to the handler and computes the id. The apply reactor reads the text back
+  through the kernel, `source urn:space:contact tuple=<id> state=outbox`, under
+  `urn:cap:space:read:contact`: the one-space read grant (`urn:cap:space:read:{name}`, beside the
+  broad `urn:cap:space:read`), so it can read that space and no other.
+- **One key, two actions.** Both links are signed with `contact-block.key` and minted under
+  `urn:cap:contactblock:mint`. Each signed payload starts with its action (`contact-block|…`,
+  `contact-label|…`), so a block token never verifies as a label token or the reverse; a "not
+  spam" link edited to say `spam` is refused; every bad link answers the same "That link didn't
+  work" page. A block link minted before this change (it signed the bare `<email>|<exp>`) still
+  blocks for its week, and trains nothing.
+- **The public door gains nothing that touches the model.** `urn:contact-label` verifies a link
+  and drops a tuple, under the same ceiling as `urn:contact-block` (`urn:cap:space:out`).
+  Training is the apply reactor's, under its own authority file.
 
 ## The HTTP door
 
