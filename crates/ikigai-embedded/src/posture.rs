@@ -99,14 +99,12 @@ pub struct Posture {
     /// versus `http://…` distinguishes the transports more precisely than a label does, and
     /// it names the address as well as the kind.
     ///
-    /// ⚠ And the two WOULD have disagreed. `serve_ipc` passes `"Remote (IPC)"` to
-    /// [`trusted_kernel_with_mounts`](crate::trusted_kernel_with_mounts), which discards it
-    /// (`let _ = nature;`) and composes `root_space`, whose nature is hard-coded
-    /// `"Embedded (Native)"` — so an IPC door's `urn:host:info` says `Embedded (Native)`
-    /// today while the door is IPC. Reported up rather than fixed here: threading the
-    /// nature through `root_space` changes what the daemon Brian runs reports to every
-    /// client that reads it, which deserves its own item rather than riding on a new
-    /// resource.
+    /// ⚠ And the two WOULD have disagreed when this was written: `serve_ipc` passed
+    /// `"Remote (IPC)"` to [`trusted_kernel_with_mounts`](crate::trusted_kernel_with_mounts),
+    /// which discarded it and composed a root whose nature was hard-coded
+    /// `"Embedded (Native)"`. It was reported up rather than fixed beside a new resource, and
+    /// ledger #430 threaded the nature through, so an IPC door's `urn:host:info` now says
+    /// `Remote (IPC)`. One answer, in one place, is still the rule.
     pub door: String,
     /// The topology, and which of the three mount postures produced it.
     pub mounts: MountPosture,
