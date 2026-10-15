@@ -92,6 +92,11 @@ crossterm = "0.29.0"
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+# `build.rs` reads the lock this build resolved against and records the `ikigai-*` crates the
+# binary links, for `--version --verbose` (ledger #1338). The same parser the lockstep test uses.
+[build-dependencies]
+toml = "0.8"
+
 [dev-dependencies]
 # `block_on` for the one assertion the adapter cannot make: issuing the step's request at
 # the KERNEL, under the session's own capability, to see the TYPED `Denied` — the engine's

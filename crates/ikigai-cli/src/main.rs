@@ -171,6 +171,8 @@ usage:
   ikigai -h | --help           show this help
   ikigai -V | --version        print `ikigai <x.y.z>` on one line and exit — answered in
                                every mode, before anything is built or connected
+  ikigai --version --verbose   that line, then one `<crate> <x.y.z>` line per ikigai-* crate
+                               this binary links, read from the lock it was built from
 
 QUIC: --server-cert/--server-key name the server's identity, --client-cert/--client-key the client's
 inside the REPL: source, describe, help, quit (type `help` for details)";
@@ -234,6 +236,45 @@ fn build_transports() -> String {
 /// 0.1.18`, nothing else on the line, exit 0.
 const VERSION_LINE: &str = concat!("ikigai ", env!("CARGO_PKG_VERSION"));
 
+/// What `--version --verbose` prints after [`VERSION_LINE`]: one `<crate> <x.y.z>` line per
+/// `ikigai-*` crate this binary links, sorted, as `build.rs` read them from the lock this
+/// build resolved against (ledger #1338) — or one line beginning `unknown:` saying why it
+/// could not. `build.rs` states what the list can and cannot see.
+///
+/// A floor check reads it by contract instead of by the crates.io source paths that happen
+/// to be compiled into panic locations, which is what it replaces.
+const LINKED_CRATES: &str = include_str!(concat!(env!("OUT_DIR"), "/linked-ikigai.txt"));
+
+/// The command that installs a newer build of THIS binary (ledger #288), with the features it
+/// was built with, so following it does not silently drop `quic` or `web`. Named under an
+/// unresolved name, the error people hit first on a host older than the docs they follow.
+#[cfg(feature = "embedded")]
+fn upgrade_command() -> String {
+    let defaults = cfg!(feature = "embedded") && cfg!(feature = "ipc");
+    let mut features: Vec<&str> = Vec::new();
+    for (on, name) in [
+        // Off the defaults, name what this build kept of them (`embedded` always: this
+        // function is only built with it).
+        (!defaults, "embedded"),
+        (!defaults && cfg!(feature = "ipc"), "ipc"),
+        (cfg!(feature = "quic"), "quic"),
+        (cfg!(feature = "web"), "web"),
+        (cfg!(feature = "store"), "store"),
+    ] {
+        if on {
+            features.push(name);
+        }
+    }
+    let mut command = "cargo install --locked ikigai-cli".to_string();
+    if !defaults {
+        command.push_str(" --no-default-features");
+    }
+    if !features.is_empty() {
+        command.push_str(&format!(" --features {}", features.join(",")));
+    }
+    command
+}
+
 use ikigai_engine::Engine;
 
 /// Per-role certificate-path overrides for QUIC, shared by `serve` and `--connect`.
@@ -254,8 +295,11 @@ struct Certs {
 enum Mode {
     /// `-V` / `--version`: print `VERSION_LINE` to stdout and exit 0. A mode rather
     /// than an early `Ok(None)` because `Ok(None)` means "print the usage block",
-    /// and burying a version behind a screen of help is the failure this fixes.
-    Version,
+    /// and burying a version behind a screen of help is the failure this fixes. With
+    /// `--verbose` (`verbose`), the linked `ikigai-*` crates follow, one per line.
+    Version {
+        verbose: bool,
+    },
     Repl(ReplArgs),
     /// Headless: build the watched kernel (timers, watcher, the standing sync)
     /// and park — the launchd-agent face of the desktop machine. Carries any
@@ -785,6 +829,15 @@ fn version_requested<'a>(mut args: impl Iterator<Item = &'a str>) -> bool {
     args.any(|arg| arg == "-V" || arg == "--version")
 }
 
+/// `--version`: [`VERSION_LINE`], alone unless `verbose`, so a script reading one line is
+/// unaffected; `--verbose` adds [`LINKED_CRATES`] under it.
+fn print_version(verbose: bool) {
+    println!("{VERSION_LINE}");
+    if verbose {
+        print!("{LINKED_CRATES}");
+    }
+}
+
 /// Parse argv. `Ok(None)` means a usage request was handled and we should exit 0.
 ///
 /// `--config-home` is taken out FIRST and applied before any mode is parsed, because every
@@ -980,7 +1033,9 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
     // same way. A version flag that works in only one arm is worse than none,
     // because it gets trusted.
     if version_requested(args.iter().map(String::as_str)) {
-        return Ok(Some(Mode::Version));
+        return Ok(Some(Mode::Version {
+            verbose: args.iter().any(|arg| arg == "--verbose"),
+        }));
     }
     let mut argv = args.into_iter().peekable();
 
@@ -1582,7 +1637,7 @@ fn main() {
     // ikigai-lisp's bounds, from the config home's `lisp.*` keys, fixed once and before
     // anything can evaluate (ledger #920). A bad line stops every mode here rather than
     // reading as the default; `--version` alone answers whatever the config says.
-    if !matches!(mode, Mode::Version) {
+    if !matches!(mode, Mode::Version { .. }) {
         if let Err(e) = ikigai_embedded::lisp::configure() {
             eprintln!("ikigai: {e}");
             std::process::exit(2);
@@ -1608,7 +1663,7 @@ fn main() {
         // One line, stdout, exit 0. Nothing is built, nothing is connected: the
         // question "which build am I on?" is asked precisely when the host is
         // suspect, so answering it must not depend on the host working.
-        Mode::Version => println!("{VERSION_LINE}"),
+        Mode::Version { verbose } => print_version(verbose),
         Mode::Daemon { mounts } => {
             arm_local_root();
             arm_bayes(true);
@@ -2211,7 +2266,11 @@ fn build_engine(
                         // `as-of=<instant>`: this host's time doors, pinned per line (ledger
                         // #532). Only the in-process kernel gets them — a `--connect` engine
                         // has none and refuses `as-of=` rather than answering live.
-                        .with_as_of_doors(ikigai_embedded::time_doors()),
+                        .with_as_of_doors(ikigai_embedded::time_doors())
+                        // This process IS the kernel answering, so its build is the one an
+                        // unresolved name may predate (ledger #288). A `--connect` client
+                        // names none: the host it attaches to is another build.
+                        .with_host_build(VERSION_LINE, upgrade_command()),
                 ),
                 topology,
             ))
@@ -4476,8 +4535,8 @@ fn main() {
     // A build with no transport still has to say what it is — that is exactly the
     // host someone is interrogating. Same parser, same line, exit 0; everything
     // else on this build is still the message below.
-    if matches!(parse_args(), Ok(Some(Mode::Version))) {
-        println!("{VERSION_LINE}");
+    if let Ok(Some(Mode::Version { verbose })) = parse_args() {
+        print_version(verbose);
         return;
     }
     eprintln!(
@@ -5790,10 +5849,57 @@ mod version_flag_tests {
             vec!["--connect", "--version"],
         ] {
             assert!(
-                matches!(parse(&args), Ok(Some(Mode::Version))),
+                matches!(parse(&args), Ok(Some(Mode::Version { .. }))),
                 "the version flag must be answered in every arm, not just one: {args:?}"
             );
         }
+    }
+
+    /// `--verbose` beside the flag asks for the linked crates, in any order; the flag alone
+    /// stays the one line a script reads (ledger #1338).
+    #[test]
+    fn verbose_asks_for_the_linked_crates() {
+        for args in [
+            vec!["--version", "--verbose"],
+            vec!["--verbose", "-V"],
+            vec!["serve", "--version", "--verbose"],
+        ] {
+            assert!(
+                matches!(parse(&args), Ok(Some(Mode::Version { verbose: true }))),
+                "{args:?}"
+            );
+        }
+        assert!(matches!(
+            parse(&["--version"]),
+            Ok(Some(Mode::Version { verbose: false }))
+        ));
+    }
+
+    /// The upgrade an unresolved name suggests installs THIS build's features (ledger #288):
+    /// a `quic`/`web` host told to run a plain `cargo install` would lose its doors.
+    #[cfg(feature = "embedded")]
+    #[test]
+    fn the_upgrade_command_keeps_this_builds_features() {
+        let command = upgrade_command();
+        assert!(
+            command.starts_with("cargo install --locked ikigai-cli"),
+            "{command}"
+        );
+        for (on, feature) in [
+            (cfg!(feature = "quic"), "quic"),
+            (cfg!(feature = "web"), "web"),
+            (cfg!(feature = "store"), "store"),
+        ] {
+            let named = command
+                .split_once(" --features ")
+                .is_some_and(|(_, list)| list.split(',').any(|f| f == feature));
+            assert_eq!(named, on, "`{feature}` in {command}");
+        }
+        assert_eq!(
+            command.contains("--no-default-features"),
+            !cfg!(feature = "ipc"),
+            "{command}"
+        );
     }
 
     /// …and the scan changes nothing else: argv without the flag still parses to the
