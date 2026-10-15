@@ -390,15 +390,73 @@ fn corrupt_note(id: &str) -> String {
     )
 }
 
+/// Put `text` at `<dir>/<id>.<ext>` ATOMICALLY: written under a staging name of its own
+/// ([`staging_name`]) in `dir` itself, then renamed into place, so a reader finds the whole
+/// note or none, never an empty or half-written one. A staging file is never mistaken for a
+/// tuple or a note: readers look for `<id>.tuple`, `<id>.err` and `<id>.out` by name.
+///
+/// ★ ORDER (ledger #1595). A stage's note is placed BEFORE its tuple moves in (see
+/// `SpaceReactor::move_to_stage` and [`quarantine`]). The tuple used to move first and the
+/// note to follow, so a reader in between (`dead_letters`, the heartbeat's FAILING line,
+/// `rd state=error`) saw a fresh dead letter with "(no .err note)" or an empty one: 7 of
+/// 1,440 runs of gonk's trigger test under load.
+fn place_note(dir: &Path, id: &str, ext: &str, text: &str) -> std::io::Result<()> {
+    let tmp = dir.join(staging_name(id, &format!("{ext}-note")));
+    let placed = std::fs::write(&tmp, text)
+        .and_then(|()| std::fs::rename(&tmp, dir.join(format!("{id}.{ext}"))));
+    if placed.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    placed
+}
+
+/// Take back a note [`place_note`] placed for a tuple whose own move then failed, unless a
+/// tuple with that id already sits in `dir` (an earlier pass of the same bytes, which the
+/// note now describes): a note beside no tuple reads as a failure that never happened.
+fn withdraw_note(dir: &Path, id: &str, ext: &str) {
+    if !dir.join(format!("{id}.tuple")).exists() {
+        let _ = std::fs::remove_file(dir.join(format!("{id}.{ext}")));
+    }
+}
+
+// The test seam for ledger #1595: called on the thread that moved a tuple into a stage, the
+// moment the move lands, so a test can look at the stage exactly as a racing reader would.
+#[cfg(test)]
+type StagedHook = Box<dyn Fn(&Path, &str)>;
+#[cfg(test)]
+thread_local! {
+    static ON_STAGED: std::cell::RefCell<Option<StagedHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A tuple `id` has just landed in the stage `dir` (a no-op outside this crate's tests).
+fn staged(dir: &Path, id: &str) {
+    #[cfg(test)]
+    ON_STAGED.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(dir, id);
+        }
+    });
+    #[cfg(not(test))]
+    let _ = (dir, id);
+}
+
 /// Move a claimed file that failed [`hashes_to`] into the space's `error/` stage beside a
-/// note saying why, and return a reason naming where it went (or why it could not).
+/// note saying why, and return a reason naming where it went (or why it could not). The
+/// note goes first ([`place_note`]), so the quarantined file is never seen without it.
 fn quarantine(space_dir: &Path, id: &str, claimed: &Path) -> String {
     let error = space_dir.join("error");
-    let moved = std::fs::create_dir_all(&error)
-        .and_then(|()| std::fs::rename(claimed, error.join(format!("{id}.tuple"))));
+    let moved = std::fs::create_dir_all(&error).and_then(|()| {
+        let noted = place_note(&error, id, "err", &corrupt_note(id)).is_ok();
+        let moved = std::fs::rename(claimed, error.join(format!("{id}.tuple")));
+        if moved.is_err() && noted {
+            withdraw_note(&error, id, "err");
+        }
+        moved
+    });
     match moved {
         Ok(()) => {
-            let _ = std::fs::write(error.join(format!("{id}.err")), corrupt_note(id));
+            staged(&error, id);
             format!("tuple `{id}` does not hash to its id; it was moved to `error/`")
         }
         Err(e) => format!(
@@ -1693,43 +1751,55 @@ impl SpaceReactor {
         if let Err(e) = std::fs::create_dir_all(&dir) {
             return failed(format!("create `{stage}`: {e}"));
         }
-        if let Err(e) = std::fs::rename(claimed, dir.join(format!("{id}.tuple"))) {
-            return failed(format!("move to `{stage}`: {e}"));
-        }
-        match &result {
+        // ★ The note FIRST, atomically, and only then the tuple (ledger #1595): a reader that
+        // finds the tuple in its stage finds its whole note beside it. See [`place_note`].
+        let placed = match &result {
             // A dead-letter note alongside the tuple, so a failure is inspectable via
             // `rd state=error`.
             //
             // A note that cannot be written (disk full, permissions) leaves the tuple in
             // `error/` with no record of WHY, which is the one thing `rd state=error` exists
             // to show, so the reason goes to stderr instead of being dropped (ledger #1548).
-            Err(msg) => {
-                if let Err(e) = std::fs::write(dir.join(format!("{id}.err")), msg) {
+            // The tuple still moves.
+            Err(msg) => match place_note(&dir, id, "err", msg) {
+                Ok(()) => Some("err"),
+                Err(e) => {
                     eprintln!(
                         "ikigai-intray: space `{name}`: dead letter {id} has no .err note \
                          ({e}); it failed with: {msg}"
                     );
+                    None
                 }
-            }
+            },
             // The mirror image: what the handler ANSWERED, beside the handled tuple. This
             // is the difference between "a booking was processed" and knowing what was
             // decided and whether anyone was told. Empty answers write nothing. A note that
             // cannot be written is said on stderr, without the answer itself (which may be
             // long, and is the handler's to log), so its absence is not mistaken for silence.
-            Ok(said) if !said.trim().is_empty() => {
-                if let Err(e) = std::fs::write(dir.join(format!("{id}.out")), said) {
+            Ok(said) if !said.trim().is_empty() => match place_note(&dir, id, "out", said) {
+                Ok(()) => Some("out"),
+                Err(e) => {
                     eprintln!(
                         "ikigai-intray: space `{name}`: handled tuple {id} has no .out note \
                          ({e}); its answer was not recorded"
                     );
+                    None
                 }
-            }
+            },
             // Said nothing THIS pass: an answer left by an earlier pass must not stand in
-            // for it.
+            // for it, not even for the moment before the tuple moves in.
             Ok(_) => {
                 let _ = std::fs::remove_file(dir.join(format!("{id}.out")));
+                None
             }
+        };
+        if let Err(e) = std::fs::rename(claimed, dir.join(format!("{id}.tuple"))) {
+            if let Some(ext) = placed {
+                withdraw_note(&dir, id, ext);
+            }
+            return failed(format!("move to `{stage}`: {e}"));
         }
+        staged(&dir, id);
         // ★ A tuple's record describes its LAST pass, so it is in exactly one terminal stage.
         // The same bytes can be handled more than once — an identical drop after a pass has
         // settled is a NEW request (see the Sink arm) — and before this a success left the
@@ -1847,25 +1917,14 @@ impl SpaceReactor {
         // The watch is live: anything that lands from here on queues in `rx`. Catch up on
         // what was already waiting (including tuples missed while this was not running).
         let _ = self.sweep_interrupted();
-        for name in self.space_names() {
-            let _ = self.drain_inbox(&name);
-        }
+        self.catch_up();
         std::thread::spawn(move || {
             // Held to the end of this scope, keeping the watch alive; the loop runs until
             // the process exits.
             let _watcher = watcher;
             loop {
                 match rx.recv_timeout(SWEEP_EVERY) {
-                    Ok(Ok(event)) => {
-                        if event.kind.is_access() {
-                            continue; // a read doesn't add a tuple
-                        }
-                        for path in &event.paths {
-                            if let Some((name, id)) = inbox_tuple(&root, path) {
-                                self.process(&name, &id);
-                            }
-                        }
-                    }
+                    Ok(Ok(event)) => self.react_to_event(&root, &event),
                     Ok(Err(e)) => eprintln!(
                         "ikigai-intray: watch error under {}: {e}; a drop may have been \
                          missed (the next sweep catches up)",
@@ -1879,9 +1938,7 @@ impl SpaceReactor {
                                 r.tuple, r.space, r.outcome
                             );
                         }
-                        for name in self.space_names() {
-                            let _ = self.drain_inbox(&name);
-                        }
+                        self.catch_up();
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                         eprintln!(
@@ -1895,6 +1952,40 @@ impl SpaceReactor {
             }
         });
         Ok(())
+    }
+
+    /// What one watcher event does: each genuine drop it names ([`inbox_tuple`]) is
+    /// processed, and a RESCAN drains every space's inbox at once.
+    ///
+    /// ★ A rescan says events were DROPPED and names no tuple that landed: FSEvents reports
+    /// `MustScanSubDirs` (with `UserDropped`/`KernelDropped` when its queue overflowed) on a
+    /// directory, and inotify reports `IN_Q_OVERFLOW` with no path at all; `notify` delivers
+    /// both as an event flagged [`Flag::Rescan`](notify::event::Flag::Rescan). Its paths are
+    /// directories, never `<id>.tuple`, so it used to match nothing and a tuple whose create
+    /// event was lost waited for the next [`SWEEP_EVERY`] (ledger #1596). The served kernel's
+    /// workspace watch treats a rescan the same way, by cutting every file thread (ledger
+    /// #1534). Draining is safe to repeat: a tuple already claimed is `Skipped`.
+    fn react_to_event(&self, root: &Path, event: &notify::Event) {
+        if event.need_rescan() {
+            self.catch_up();
+            return;
+        }
+        if event.kind.is_access() {
+            return; // a read doesn't add a tuple
+        }
+        for path in &event.paths {
+            if let Some((name, id)) = inbox_tuple(root, path) {
+                self.process(&name, &id);
+            }
+        }
+    }
+
+    /// Drain every space's inbox (no recovery sweep): what the watch does once it is live,
+    /// on a rescan, and every [`SWEEP_EVERY`].
+    fn catch_up(&self) {
+        for name in self.space_names() {
+            let _ = self.drain_inbox(&name);
+        }
     }
 }
 
@@ -2733,6 +2824,141 @@ mod tests {
             .join("error")
             .join(format!("{id}.err"))
             .exists());
+    }
+
+    /// Run `act` with [`ON_STAGED`] set, and return what a reader racing each stage saw the
+    /// moment a tuple landed there: `(stage, the note beside it)`, `None` for no note.
+    fn racing_reader(act: impl FnOnce()) -> Vec<(String, Option<String>)> {
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let record = std::rc::Rc::clone(&seen);
+        ON_STAGED.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |dir: &Path, id: &str| {
+                let stage = dir.file_name().unwrap().to_str().unwrap().to_string();
+                let ext = if stage == "outbox" { "out" } else { "err" };
+                let note = std::fs::read_to_string(dir.join(format!("{id}.{ext}"))).ok();
+                record.borrow_mut().push((stage, note));
+            }));
+        });
+        act();
+        ON_STAGED.with(|hook| *hook.borrow_mut() = None);
+        let seen = seen.borrow().clone();
+        seen
+    }
+
+    /// Ledger #1595: a reader that finds a fresh dead letter in `error/` finds its whole
+    /// `.err` note beside it. The tuple used to move first and the note to follow, so
+    /// `dead_letters` (the heartbeat's FAILING line) and `rd state=error` read "(no .err
+    /// note)" in between. The seam fires the instant the tuple lands, which is exactly when
+    /// such a reader would look.
+    #[test]
+    fn a_dead_letter_is_never_staged_without_its_whole_note() {
+        let root = reactive_root("staged-err", "jobs", "urn:test:handler");
+        let k = Kernel::new(Arc::new(space(root.clone())));
+        let cap = Capability::scoped(vec![CAP_OUT.to_string()]);
+        out(&k, &cap, "urn:space:jobs", b"work");
+        let reactor = SpaceReactor::new(
+            root.clone(),
+            Arc::new(MockResolver::new(false)),
+            Capability::root(),
+        );
+        let mut outcome = Vec::new();
+        let seen = racing_reader(|| outcome = reactor.drain("jobs"));
+        let [(_, Outcome::Errored(reason))] = outcome.as_slice() else {
+            panic!("one dead letter: {outcome:?}");
+        };
+        assert_eq!(
+            seen,
+            vec![("error".to_string(), Some(reason.clone()))],
+            "the tuple reached `error/` before its note did"
+        );
+    }
+
+    /// The same order for a handled tuple: its `.out` (what the handler answered) is beside
+    /// it the moment it reaches `outbox/`.
+    #[test]
+    fn a_handled_tuple_is_never_staged_without_its_answer() {
+        let root = reactive_root("staged-out", "jobs", "urn:test:handler");
+        let k = Kernel::new(Arc::new(space(root.clone())));
+        let cap = Capability::scoped(vec![CAP_OUT.to_string()]);
+        out(&k, &cap, "urn:space:jobs", b"work");
+        let reactor = SpaceReactor::new(
+            root.clone(),
+            Arc::new(MockResolver::new(true)),
+            Capability::root(),
+        );
+        let seen = racing_reader(|| {
+            reactor.drain("jobs");
+        });
+        assert_eq!(seen, vec![("outbox".to_string(), Some("ok".to_string()))]);
+    }
+
+    /// And for a file a `take` quarantines because it does not hash to its id: the
+    /// `corrupt:` note is there before the file is.
+    #[test]
+    fn a_quarantined_file_is_never_staged_without_its_note() {
+        let root = std::env::temp_dir()
+            .join(format!("ikigai-intray-test-{}", std::process::id()))
+            .join("staged-quarantine");
+        let _ = std::fs::remove_dir_all(&root);
+        let k = Kernel::new(Arc::new(space(root.clone())));
+        let cap = Capability::scoped(vec![CAP_OUT.to_string(), CAP_TAKE.to_string()]);
+        let id = out(&k, &cap, "urn:space:q", b"payload");
+        // Torn: the inbox file no longer holds the bytes its name hashes.
+        std::fs::write(
+            root.join("q").join("inbox").join(format!("{id}.tuple")),
+            b"pay",
+        )
+        .unwrap();
+        let seen = racing_reader(|| {
+            let taken = block_on(
+                k.issue(
+                    Request::new(Verb::Delete, iri("urn:space:q"))
+                        .with_arg("tuple", ArgRef::Inline(id.clone().into_bytes())),
+                    &cap,
+                ),
+            );
+            assert!(taken.is_err(), "a torn tuple is not delivered: {taken:?}");
+        });
+        assert_eq!(seen, vec![("error".to_string(), Some(corrupt_note(&id)))]);
+    }
+
+    /// Ledger #1596: a RESCAN (events were dropped; it names a directory, or nothing) drains
+    /// every inbox at once. It used to match no tuple path and was ignored, so a tuple whose
+    /// create event was lost waited for the next [`SWEEP_EVERY`].
+    #[test]
+    fn a_rescan_drains_every_inbox_at_once() {
+        use notify::event::{EventKind, Flag};
+        use notify::Event;
+        let root = reactive_root("rescan", "jobs", "urn:test:handler");
+        let k = Kernel::new(Arc::new(space(root.clone())));
+        let cap = Capability::scoped(vec![CAP_OUT.to_string()]);
+        let mock = Arc::new(MockResolver::new(true));
+        let reactor = SpaceReactor::new(root.clone(), mock.clone(), Capability::root());
+        let handled = |id: &str| {
+            root.join("jobs")
+                .join("outbox")
+                .join(format!("{id}.tuple"))
+                .exists()
+        };
+
+        // FSEvents' form: MustScanSubDirs on a directory, which is no tuple's path.
+        let first = out(&k, &cap, "urn:space:jobs", b"first");
+        reactor.react_to_event(
+            &root,
+            &Event::new(EventKind::Other)
+                .set_flag(Flag::Rescan)
+                .add_path(root.join("jobs")),
+        );
+        assert!(
+            handled(&first),
+            "a rescan naming the space's directory drains its inbox"
+        );
+
+        // inotify's form: IN_Q_OVERFLOW carries no path at all.
+        let second = out(&k, &cap, "urn:space:jobs", b"second");
+        reactor.react_to_event(&root, &Event::new(EventKind::Other).set_flag(Flag::Rescan));
+        assert!(handled(&second), "a rescan with no path drains every inbox");
+        assert_eq!(mock.calls().len(), 2, "each tuple is handled once");
     }
 
     /// Leave `id` exactly as a reactor killed mid-pass leaves it: claimed into
