@@ -165,3 +165,44 @@ async fn an_answer_to_head_is_the_head_alone_with_gets_length() {
     assert_eq!(refusal(result).header, "X");
     assert!(wire.is_empty(), "{wire:?}");
 }
+
+/// Ledger #1594: the writer refuses a status line it cannot write correctly, and writes nothing:
+/// an interim `1xx` (never followed by the `Content-Length` and `Connection: close` it always
+/// sends), a code that is no status, and content on a `204` or a `304`, which carry none. The
+/// refusal names no header.
+#[tokio::test]
+async fn a_status_it_cannot_write_is_refused_and_nothing_is_written() {
+    let refused = [
+        Response::new(100, "", Vec::new()),
+        Response::new(101, "", Vec::new()),
+        Response::new(199, "text/plain", b"x".to_vec()),
+        Response::new(0, "text/plain", b"x".to_vec()),
+        Response::new(99, "text/plain", b"x".to_vec()),
+        Response::new(600, "text/plain", b"x".to_vec()),
+        Response::new(204, "text/plain", b"x".to_vec()),
+        Response::new(304, "application/json", b"{}".to_vec()),
+    ];
+    for response in refused {
+        let status = response.status;
+        assert!(response.check().is_err(), "{status}: check agrees");
+        let (result, wire) = write_one(response.clone()).await;
+        let why = refusal(result);
+        assert_eq!(why.header, "", "{status}: no header to name: {why}");
+        assert!(why.why.contains(&status.to_string()), "{status}: {why}");
+        assert!(wire.is_empty(), "{status}: nothing written: {wire:?}");
+        // The answer to a HEAD is refused the same way: the status line is wrong whatever
+        // the method.
+        let (result, wire) = written(|mut server| async move {
+            write_answer(&mut server, "HEAD", response, &EdgeConfig::default()).await
+        })
+        .await;
+        assert_eq!(refusal(result).header, "", "{status}");
+        assert!(wire.is_empty(), "{status}: {wire:?}");
+    }
+    // The edges of the range, and a 204 or 304 without content, are written.
+    for status in [200, 204, 304, 599] {
+        let (result, wire) = write_one(Response::new(status, "", Vec::new())).await;
+        result.unwrap_or_else(|e| panic!("{status}: {e}"));
+        assert!(wire.starts_with(&format!("HTTP/1.1 {status} ")), "{wire}");
+    }
+}

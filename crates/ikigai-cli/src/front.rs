@@ -69,7 +69,7 @@ use std::sync::Arc;
 
 use ikigai_core::{ArgRef, Error, Iri, Kernel, Request, Verb};
 use ikigai_web::{EdgeConfig, HttpRequest, Response};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 /// What the front serves and how it authenticates.
 pub struct Front {
@@ -461,11 +461,7 @@ async fn connection(
         _ => return Ok(()),
     };
     if !admitted {
-        // Written before any request is read, so a HEAD here still gets the 503's content
-        // (ikigai-web's own busy door peeks at the request line first; this one does not).
-        let busy =
-            refusal(503, "unavailable", "too many connections").with_header("Retry-After", "1");
-        return ikigai_web::write_response(&mut tls, busy, &config).await;
+        return refuse_over_cap(tls, &config).await;
     }
     let Some(req) = ikigai_web::read_request(&mut tls, Some(peer.ip()), &config).await? else {
         return Ok(());
@@ -485,6 +481,18 @@ async fn connection(
     };
     ikigai_web::write_answer(&mut tls, &method, answer, &config).await?;
     tls.shutdown().await
+}
+
+/// A connection past the cap, once TLS is up: the front's JSON `503` with `Retry-After`,
+/// answered by ikigai-web's busy door. It reads the request line first, under the header
+/// deadline, so a `HEAD` gets the head alone (ledger #1594: this front used to write its `503`
+/// before reading anything, content and all), and then closes lingering so the client reads it.
+async fn refuse_over_cap<S: AsyncRead + AsyncWrite + Unpin>(
+    sock: S,
+    config: &EdgeConfig,
+) -> std::io::Result<()> {
+    let busy = refusal(503, "unavailable", "too many connections").with_header("Retry-After", "1");
+    ikigai_web::refuse_busy(sock, busy, config).await
 }
 
 #[cfg(test)]
@@ -511,6 +519,43 @@ mod tests {
             .iter()
             .find(|(k, _)| k == name)
             .map(|(_, v)| std::str::from_utf8(v).unwrap())
+    }
+
+    /// Ledger #1594: a connection past the cap is answered after its request line is read, so
+    /// a `HEAD` hears the `503`'s head alone and a `GET` its JSON. The front used to write the
+    /// `503` before reading anything, so a `HEAD` got the content too.
+    #[test]
+    fn a_busy_answer_to_head_is_the_head_alone() {
+        use tokio::io::AsyncReadExt;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for method in ["HEAD", "GET"] {
+                let (mut client, server) = tokio::io::duplex(8192);
+                let request = format!("{method} /layers/me HTTP/1.1\r\nHost: h\r\n\r\n");
+                client.write_all(request.as_bytes()).await.unwrap();
+                client.shutdown().await.unwrap();
+                refuse_over_cap(server, &EdgeConfig::default())
+                    .await
+                    .unwrap();
+                let mut out = String::new();
+                client.read_to_string(&mut out).await.unwrap();
+                assert!(out.starts_with("HTTP/1.1 503 "), "{method}: {out}");
+                assert!(out.contains("\r\nRetry-After: 1\r\n"), "{method}: {out}");
+                assert!(
+                    out.contains(&format!("\r\nContent-Type: {JSON}\r\n")),
+                    "{out}"
+                );
+                let (_, content) = out.split_once("\r\n\r\n").unwrap();
+                if method == "HEAD" {
+                    assert_eq!(content, "", "a HEAD gets the head alone: {out:?}");
+                } else {
+                    assert!(content.contains(r#""kind":"unavailable""#), "{out}");
+                }
+            }
+        });
     }
 
     #[test]

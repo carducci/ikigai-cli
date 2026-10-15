@@ -119,7 +119,8 @@ impl EndpointHeader {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeaderRefusal {
     /// The header's name as the endpoint wrote it (empty when the envelope itself is
-    /// malformed).
+    /// malformed, or when a door's [`Response`](crate::Response) is refused for its status
+    /// line: a status outside `200..=599`, or content on a `204` or `304`).
     pub header: String,
     /// What is wrong with it.
     pub why: String,

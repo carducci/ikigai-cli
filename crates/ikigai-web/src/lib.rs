@@ -808,7 +808,15 @@ pub async fn serve_with_listener(
             // Over the cap: answer 503 without handling the request, on its own task so a
             // client that will not take the answer cannot stall the accept loop.
             Err(_) => {
-                tokio::spawn(async move { refuse_busy(sock, &shared.config).await });
+                tokio::spawn(async move {
+                    let busy = Response::new(
+                        503,
+                        "text/plain; charset=utf-8",
+                        b"too many connections".to_vec(),
+                    )
+                    .with_header("Retry-After", "1");
+                    let _ = refuse_busy(sock, busy, &shared.config).await;
+                });
             }
         }
     }
@@ -837,7 +845,9 @@ pub async fn accept_next(listener: &TcpListener) -> std::io::Result<(TcpStream, 
     }
 }
 
-/// Answer a connection past the cap: `503` with `Retry-After`, then a LINGERING close.
+/// Answer a connection past the cap with `busy` (a `503` with `Retry-After`, in the door's own
+/// format), then close it LINGERING. Every door this crate serves answers its busy connections
+/// this way, over TCP or over TLS once the handshake is done (the layers front, ledger #1594).
 ///
 /// The request is never parsed, but it has usually arrived, and closing a socket with unread
 /// bytes in its receive buffer sends a reset — which on most stacks destroys the `503` before
@@ -848,7 +858,36 @@ pub async fn accept_next(listener: &TcpListener) -> std::io::Result<(TcpStream, 
 /// The first line is read BEFORE the answer, under the same deadline as the drain, so a `HEAD`
 /// is answered with the head alone like every other refusal (ledger #117). A client that
 /// sends nothing is answered when the deadline passes, as a request this door never saw.
-async fn refuse_busy(mut sock: TcpStream, config: &EdgeConfig) {
+///
+/// `busy` is written by [`write_answer`], so it passes [`Response::check`] first: a refused
+/// response writes nothing and returns that error, as does a write that fails or outlasts
+/// [`EdgeConfig::write_timeout`]. Once the answer is written the result is `Ok`, however the
+/// drain ends.
+///
+/// ```
+/// use ikigai_web::{refuse_busy, EdgeConfig, Response};
+/// use tokio::io::{AsyncReadExt, AsyncWriteExt};
+///
+/// # #[tokio::main]
+/// # async fn main() {
+/// let (mut client, server) = tokio::io::duplex(4096);
+/// client.write_all(b"HEAD /x HTTP/1.1\r\nHost: h\r\n\r\n").await.unwrap();
+/// client.shutdown().await.unwrap();
+/// let busy = Response::new(503, "application/json", br#"{"kind":"unavailable"}"#.to_vec())
+///     .with_header("Retry-After", "1");
+/// refuse_busy(server, busy, &EdgeConfig::default()).await.unwrap();
+/// let mut out = String::new();
+/// client.read_to_string(&mut out).await.unwrap();
+/// assert!(out.starts_with("HTTP/1.1 503 Service Unavailable\r\n"), "{out}");
+/// assert!(out.contains("\r\nRetry-After: 1\r\n"), "{out}");
+/// assert!(out.ends_with("\r\n\r\n"), "a HEAD gets the head alone: {out:?}");
+/// # }
+/// ```
+pub async fn refuse_busy<S: AsyncRead + AsyncWrite + Unpin>(
+    mut sock: S,
+    busy: Response,
+    config: &EdgeConfig,
+) -> std::io::Result<()> {
     let deadline = tokio::time::Instant::now() + config.header_timeout;
     let mut seen = Vec::new();
     let first_line = async {
@@ -861,18 +900,8 @@ async fn refuse_busy(mut sock: TcpStream, config: &EdgeConfig) {
         }
     };
     let _ = tokio::time::timeout_at(deadline, first_line).await;
-    let mut busy = Resp::text(503, "Service Unavailable", "too many connections");
-    busy.headers
-        .push(("Retry-After".to_string(), "1".to_string()));
-    if is_head(&seen) {
-        busy = busy.into_head();
-    }
-    if write_within(&mut sock, busy, config.write_timeout)
-        .await
-        .is_err()
-    {
-        return;
-    }
+    let method = if is_head(&seen) { "HEAD" } else { "" };
+    write_answer(&mut sock, method, busy, config).await?;
     let _ = sock.shutdown().await;
     let drain = async {
         let mut tmp = [0u8; 1024];
@@ -885,6 +914,7 @@ async fn refuse_busy(mut sock: TcpStream, config: &EdgeConfig) {
         }
     };
     let _ = tokio::time::timeout_at(deadline, drain).await;
+    Ok(())
 }
 
 /// The response the adapter builds before writing it to the socket.
@@ -2309,6 +2339,12 @@ fn reason_phrase(status: u16) -> &'static str {
 /// headers (`Keep-Alive`, `Proxy-Connection`, `TE`, `Trailer`, `Upgrade`). Any other name is
 /// the door's to set (`Allow`, `WWW-Authenticate`, `Retry-After`, `Cache-Control`, …).
 ///
+/// The status line is checked too (ledger #1594), and its refusal names no header (`header`
+/// is empty): the status is a final one, `200..=599`, since a `1xx` is interim and is never
+/// followed by the `Content-Length` and `Connection: close` this writer always sends, and a
+/// code outside `100..=599` is no status at all; and a `204` or a `304` carries no content
+/// (RFC 9110 §15.3.5, §15.4.5), so one with a body is refused rather than written with it.
+///
 /// ```
 /// use ikigai_web::Response;
 ///
@@ -2321,6 +2357,12 @@ fn reason_phrase(status: u16) -> &'static str {
 ///
 /// let framing = Response::new(200, "text/plain", Vec::new()).with_header("Content-Length", "0");
 /// assert_eq!(framing.check().unwrap_err().header, "Content-Length");
+///
+/// let interim = Response::new(101, "", Vec::new());
+/// assert_eq!(interim.check().unwrap_err().header, "");
+/// assert!(Response::new(600, "text/plain", Vec::new()).check().is_err());
+/// assert!(Response::new(204, "", b"x".to_vec()).check().is_err());
+/// assert!(Response::new(304, "", Vec::new()).check().is_ok());
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Response {
@@ -2349,9 +2391,30 @@ impl Response {
     }
 
     /// Whether [`write_response`] will write this response: `Err` names the first header it
-    /// would refuse and why (see [`Response`] for the rules). A door that wants to answer
-    /// something rather than drop the connection checks first and writes its own `500`.
+    /// would refuse and why, or no header when it is the status line it refuses (see
+    /// [`Response`] for the rules). A door that wants to answer something rather than drop the
+    /// connection checks first and writes its own `500`.
     pub fn check(&self) -> Result<(), HeaderRefusal> {
+        if !(200..=599).contains(&self.status) {
+            return Err(HeaderRefusal::new(
+                "",
+                format!(
+                    "status {} is not a final status (200..=599); this writer sends one \
+                     complete answer per connection",
+                    self.status
+                ),
+            ));
+        }
+        if matches!(self.status, 204 | 304) && !self.body.is_empty() {
+            return Err(HeaderRefusal::new(
+                "",
+                format!(
+                    "a {} carries no content, and this one has {} bytes",
+                    self.status,
+                    self.body.len()
+                ),
+            ));
+        }
         if !self.content_type.is_empty() {
             entity::check_value("Content-Type", &self.content_type)?;
         }
