@@ -90,6 +90,7 @@ use ikigai_core::{
     ActionSpec, ArgRef, ArgSpec, Description, Endpoint, Error, Invocation, Iri, ReprType,
     Representation, Request, Result, Verb,
 };
+use ikigai_intake::html_escape;
 
 /// Mint a block or label link. Held by the edge daemon (where the enquiry email is composed).
 pub const CAP_CONTACTBLOCK_MINT: &str = "urn:cap:contactblock:mint";
@@ -475,16 +476,23 @@ fn bad_link() -> Representation {
     )
 }
 
-/// The form both link pages post back to themselves, with the passkey glue.
+/// The form both link pages post back to themselves, with the passkey glue. Values and the
+/// button are escaped (ledger #1516); the names are this module's own literals.
 fn confirm_form(fields: &[(&str, &str)], button: &str) -> String {
     let hidden: String = fields
         .iter()
-        .map(|(name, value)| format!("<input type=hidden name={name} value=\"{value}\">"))
+        .map(|(name, value)| {
+            format!(
+                "<input type=hidden name={name} value=\"{}\">",
+                html_escape(value)
+            )
+        })
         .collect();
     format!(
         "<form method=\"post\" id=\"act\">{hidden}\
-         <button style=\"font:inherit;padding:.6rem 1.2rem\">{button}</button>\
-         </form>"
+         <button style=\"font:inherit;padding:.6rem 1.2rem\">{}</button>\
+         </form>",
+        html_escape(button)
     )
 }
 
@@ -530,10 +538,11 @@ impl Endpoint for ContactBlock {
                 Ok(page(
                     "Block this sender?",
                     &format!(
-                        "<p>Future enquiries from <code>{email}</code> will be dropped, \
+                        "<p>Future enquiries from <code>{shown}</code> will be dropped, \
                          silently.{teaches}</p>{form}\
                          <p style=\"color:#666\">They are told nothing; from their side the form \
                          still accepts. You can undo this on the box.</p>{js}",
+                        shown = html_escape(&email),
                         form = confirm_form(&fields, "Block"),
                         js = crate::passkey::DECISION_PASSKEY_JS,
                     ),
@@ -564,8 +573,9 @@ impl Endpoint for ContactBlock {
                 Ok(page(
                     "Blocked",
                     &format!(
-                        "<p>Enquiries from <code>{email}</code> will be dropped once the edge \
-                         picks this up — usually at once.</p>"
+                        "<p>Enquiries from <code>{}</code> will be dropped once the edge \
+                         picks this up — usually at once.</p>",
+                        html_escape(&email)
                     ),
                 ))
             }
@@ -692,7 +702,8 @@ impl Endpoint for ContactLabel {
                  higher. It does not block the sender: the block link does that.",
             )
         };
-        let short = &enquiry[..12];
+        // Escaped anyway, so the page does not depend on the gate above (ledger #1516).
+        let short = html_escape(&enquiry[..12]);
 
         match inv.request.verb {
             Verb::Source => {
@@ -1161,6 +1172,56 @@ mod endpoint_tests {
                 (k.to_string(), crate::decide::percent_decode(v))
             })
             .collect()
+    }
+
+    /// Ledger #1516: the address is VISITOR text (whatever the contact form accepted) and it is
+    /// signed, not sanitized, so a `<`, `&` or `'` in it reaches the page. It must render as text,
+    /// on the GET, in the GET's hidden field, and on the POST's confirmation, while the drop
+    /// still carries the address byte for byte. (`"` and `\` never get this far: `email_shaped`
+    /// refuses them before the signature check.)
+    #[test]
+    fn markup_in_a_signed_address_renders_as_text() {
+        let w = world("markup");
+        let hostile = "<b>x</b>&amp;y'@spam.example";
+        assert!(
+            email_shaped(hostile),
+            "the gate admits it, so the page must cope"
+        );
+        let escaped = "&lt;b&gt;x&lt;/b&gt;&amp;amp;y&#39;@spam.example";
+        let exp = now_secs() + 600;
+        let token = mint_block(hostile, "", exp, &w.key);
+
+        let get = w.call(Verb::Source, hostile, exp, &token);
+        assert!(get.contains("Block this sender?"), "{get}");
+        assert!(!get.contains("<b>"), "markup rendered: {get}");
+        assert!(get.contains(&format!("<code>{escaped}</code>")), "{get}");
+        assert!(
+            get.contains(&format!("name=email value=\"{escaped}\"")),
+            "the hidden field: {get}"
+        );
+
+        let post = w.post_block(hostile, exp, &token);
+        assert!(post.contains("Blocked"), "{post}");
+        assert!(!post.contains("<b>"), "markup rendered: {post}");
+        assert!(post.contains(&format!("<code>{escaped}</code>")), "{post}");
+        assert_eq!(
+            crate::decide::field(&w.dropped()[0], "block-email").as_deref(),
+            Some(hostile),
+            "the drop keeps the address exactly"
+        );
+    }
+
+    /// The confirm form escapes its values and its button: a `"` cannot close the attribute.
+    #[test]
+    fn the_confirm_form_escapes_its_values() {
+        let form = confirm_form(&[("t", "a\"><script>x</script>&")], "Go & <b>");
+        assert!(!form.contains("<script>"), "{form}");
+        assert!(!form.contains("<b>"), "{form}");
+        assert!(
+            form.contains("name=t value=\"a&quot;&gt;&lt;script&gt;x&lt;/script&gt;&amp;\""),
+            "{form}"
+        );
+        assert!(form.contains(">Go &amp; &lt;b&gt;</button>"), "{form}");
     }
 
     #[test]
