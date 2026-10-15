@@ -79,17 +79,10 @@ fn exhaust_and_recover() {
     ));
     // Everything this process holds before the door exists; the door adds its listener.
     let baseline = open_fds();
-    let door = {
-        let path = path.clone();
-        std::thread::spawn(move || ikigai_ipc::serve(kernel, &path))
-    };
-    // The bind happens on the door's thread; wait for it to answer.
-    for _ in 0..200 {
-        if ikigai_ipc::connect(&path).is_ok() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    // Bound here, so the door is listening before its thread starts and needs no poll
+    // (ledger #1051).
+    let listener = ikigai_ipc::bind(&path).expect("bind the door");
+    let door = std::thread::spawn(move || ikigai_ipc::serve_on(kernel, listener));
     assert_serves(&path, "control");
 
     // ★ Wait for the door to let go of every connection made so far (ledger #803, #870). The
