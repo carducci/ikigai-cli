@@ -153,28 +153,24 @@ ikigai -c 'sink urn:iki:store:update INSERT DATA { GRAPH <urn:demo:g> { <urn:dem
 echo 'INSERT DATA { <urn:a> <urn:b> 42 }' | ikigai -c 'sink urn:iki:store:update'
 ```
 
-⚠ **Engine behaviors to know before you write your first update**, none of them
-this module's and both silent:
+⚠ **Two engine behaviors to know before you write your first update.** Neither is this
+module's: the REPL's `help` states both, under `quoting:` and `stdin`, and that is where they
+are kept current (`ikigai -c help`, or `help` at the prompt).
 
-* On `sink`, the text after the IRI is taken **verbatim** — quotes included. So
-  `sink urn:iki:store:update "INSERT DATA { … }"` sends a body that literally begins with
-  a double quote, and the store rejects it as not-a-SPARQL-update. Leave the quotes off,
-  or name the body with `content="…"` (which does strip the quotes, and is the form to
-  reach for with any structured body).
-* A `sink` with no remainder **reads piped stdin** — that is how a secret gets in without
-  reaching the command line. The reader is installed only when stdin is *not* a terminal
-  (`main.rs` checks `is_terminal`), so an interactive one-shot is unaffected. In a
-  NON-interactive context whose stdin is an open pipe nobody writes — a supervisor, a CI
-  step, an agent harness — `ikigai -c 'sink urn:X'` waits 2 s for the first byte, then
-  sends the sink with NO content and says so on stderr (ledger #1088); a sink that
-  requires `content` then refuses rather than writing an empty body. A producer slower
-  than that to say anything loses the race. Redirect `< /dev/null` in scripts to skip
-  the wait.
-* A `source` reads piped stdin only when it would otherwise fail for want of it: one
-  REQUIRED argument left unnamed and no value given (ledger #1166). So a query never has
-  to be quoted onto the command line:
-  `cat q.rq | ikigai -c 'source urn:iki:store:graph-select graph=urn:iki:ledger:graph:default'`.
-  And when it is, quote with `"…"`: the engine does not treat `'…'` as quotes, so a `;`,
+* On `sink`, the text after the IRI is taken **verbatim**, with ONE exception (ledger
+  #1069): a remainder that is a single quoted token is unquoted, by the same rules as
+  `content="…"`. So `sink urn:iki:store:update "INSERT DATA { <urn:a> <urn:b> 42 }"` sends the
+  update without its quotes. But a quoted body with an unescaped `"` inside it (any SPARQL or
+  Turtle string literal) is not one token, so it is sent byte for byte, outer quotes and all,
+  and the store reports "not a SPARQL update", which names the wrong problem. Leave the outer
+  quotes off (the second example above), name the body with `content="…"`, or pipe it in.
+* A `sink` with no remainder **reads piped stdin** in a `-c` batch, which is how a secret gets
+  in without reaching the command line, and a `source` reads it for a single unfilled REQUIRED
+  argument (so a query never has to be quoted onto the command line:
+  `cat q.rq | ikigai -c 'source urn:iki:store:graph-select graph=urn:iki:ledger:graph:default'`).
+  Where stdin is a pipe nobody writes (a supervisor, a CI step, an agent harness), the read
+  waits 2 s for a first byte and then goes without it; redirect `< /dev/null` in scripts.
+  When a query IS quoted, use `"…"`: the engine does not treat `'…'` as quotes, so a `;`,
   `|`, `(` or `)` inside single quotes still splits the line.
 
 ## Typing at the ledger
@@ -211,7 +207,8 @@ and never the sugar, so a tool reading the manifold expands the `ledger` argumen
 declared default rather than looking for the short name.
 
 ⚠ The engine behaviors in the section above apply here unchanged: the text after the
-IRI is **verbatim**, quotes included, and a `sink` with no remainder reads piped stdin.
+IRI is **verbatim** unless it is one quoted token, and a `sink` with no remainder reads
+piped stdin (`help`, under `quoting:` and `stdin`).
 
 ### Loading a batch
 

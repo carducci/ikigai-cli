@@ -175,6 +175,56 @@ usage:
 QUIC: --server-cert/--server-key name the server's identity, --client-cert/--client-key the client's
 inside the REPL: source, describe, help, quit (type `help` for details)";
 
+/// The closing lines of `--help`: which transports THIS binary was built with and which it
+/// lacks (ledger #109). [`USAGE`] describes every transport the source knows, so on a build
+/// without `quic` it advertised `quic://` and the binary then refused it with "needs the
+/// `quic` feature" (a store-only install on plasma silently dropped quic and web this way).
+/// Read from `cfg!`, so the line is true of the binary that prints it.
+#[cfg(feature = "embedded")]
+fn build_transports() -> String {
+    let mut has = Vec::new();
+    let mut lacks = Vec::new();
+    let mut note = |present: bool, what: &str, rebuild: &str| {
+        if present {
+            has.push(what.to_string());
+        } else {
+            lacks.push(format!("{what} ({rebuild})"));
+        }
+    };
+    note(
+        cfg!(all(feature = "ipc", unix)),
+        "Unix socket",
+        "needs the `ipc` feature on a Unix platform",
+    );
+    note(
+        cfg!(feature = "quic"),
+        "quic://",
+        "needs the `quic` feature",
+    );
+    note(
+        cfg!(feature = "web"),
+        "serve --http",
+        "needs the `web` feature",
+    );
+    note(
+        cfg!(all(feature = "quic", feature = "web")),
+        "--layers-https",
+        "needs `quic` and `web`",
+    );
+    let list = |items: &[String]| {
+        if items.is_empty() {
+            "nothing".to_string()
+        } else {
+            items.join(", ")
+        }
+    };
+    format!(
+        "this build: has {}\n            lacks {}",
+        list(&has),
+        list(&lacks)
+    )
+}
+
 /// The single line `-V`/`--version` prints. ONE version string for the whole binary:
 /// the same spelling as the REPL banner (`repl.rs`), the no-transport message below,
 /// and the MCP server's `version` field — so a script comparing a host against a
@@ -1520,11 +1570,11 @@ fn main() {
     let mode = match parse_args() {
         Ok(Some(mode)) => mode,
         Ok(None) => {
-            println!("{USAGE}");
+            println!("{USAGE}\n\n{}", build_transports());
             return;
         }
         Err(e) => {
-            eprintln!("ikigai: {e}\n\n{USAGE}");
+            eprintln!("ikigai: {e}\n\n{USAGE}\n\n{}", build_transports());
             std::process::exit(2);
         }
     };
