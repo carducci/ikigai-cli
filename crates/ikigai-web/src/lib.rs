@@ -2299,6 +2299,29 @@ fn reason_phrase(status: u16) -> &'static str {
 /// content type (empty for none), extra headers and a body. `Content-Length` and
 /// `Connection: close` are always written; one request is served per connection, as the edge
 /// serves them.
+///
+/// The writer checks every header before it writes a byte ([`Response::check`], ledger #1593):
+/// a name is an RFC 9110 `token`; a value, the content type's included, is at most
+/// [`MAX_HEADER_VALUE`] bytes of visible ASCII, space and tab, the same check an endpoint's
+/// headers pass, so no CR, LF or NUL can end a line and start a header of its own; and the
+/// headers the writer owns are refused from the list: `Content-Length`, `Content-Type`
+/// (written from `content_type`), `Connection`, `Transfer-Encoding` and the other hop-by-hop
+/// headers (`Keep-Alive`, `Proxy-Connection`, `TE`, `Trailer`, `Upgrade`). Any other name is
+/// the door's to set (`Allow`, `WWW-Authenticate`, `Retry-After`, `Cache-Control`, …).
+///
+/// ```
+/// use ikigai_web::Response;
+///
+/// let ok = Response::new(405, "application/json", b"{}".to_vec()).with_header("Allow", "GET, HEAD");
+/// assert_eq!(ok.check(), Ok(()));
+///
+/// let smuggled = Response::new(200, "text/plain", Vec::new())
+///     .with_header("X-Note", "hi\r\nSet-Cookie: stolen=1");
+/// assert_eq!(smuggled.check().unwrap_err().header, "X-Note");
+///
+/// let framing = Response::new(200, "text/plain", Vec::new()).with_header("Content-Length", "0");
+/// assert_eq!(framing.check().unwrap_err().header, "Content-Length");
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Response {
     pub status: u16,
@@ -2318,26 +2341,99 @@ impl Response {
         }
     }
 
-    /// One more header.
+    /// One more header. Nothing is checked here (the fields are public, so a check here could
+    /// be walked around); [`write_response`] checks every header before it writes.
     pub fn with_header(mut self, name: &str, value: &str) -> Response {
         self.headers.push((name.to_string(), value.to_string()));
         self
+    }
+
+    /// Whether [`write_response`] will write this response: `Err` names the first header it
+    /// would refuse and why (see [`Response`] for the rules). A door that wants to answer
+    /// something rather than drop the connection checks first and writes its own `500`.
+    pub fn check(&self) -> Result<(), HeaderRefusal> {
+        if !self.content_type.is_empty() {
+            entity::check_value("Content-Type", &self.content_type)?;
+        }
+        self.headers
+            .iter()
+            .try_for_each(|(name, value)| entity::check_door_header(name, value))
     }
 }
 
 /// Write `response` to `sock` within [`EdgeConfig::write_timeout`], then flush. The other half
 /// of [`read_request`]: the head is formatted exactly as the edge formats its own answers.
+///
+/// A response [`Response::check`] refuses is NOT written: not one byte reaches `sock`, and the
+/// result is an [`InvalidInput`](std::io::ErrorKind::InvalidInput) error whose inner error is
+/// the [`HeaderRefusal`]. An `Err`, not a panic and not a `500` written in its place, because
+/// the bad header is the calling door's own bug: a panic would take the connection's task with
+/// it and say nothing to the client, and a `500` written here would be in this crate's format,
+/// not the door's (the layers front answers JSON), and would hide the bug from the door that
+/// must fix it. The caller decides what the client hears; [`Response::check`] lets it decide
+/// before writing.
+///
+/// This writes the content whatever the method was. A door answering a `HEAD` writes with
+/// [`write_answer`].
 pub async fn write_response<S: AsyncWrite + Unpin>(
     sock: &mut S,
     response: Response,
     config: &EdgeConfig,
 ) -> std::io::Result<()> {
+    write_checked(sock, response, false, config).await
+}
+
+/// Write `response` as the answer to a request whose method was `method`: exactly as
+/// [`write_response`] does, the same checks included, except that the answer to a `HEAD` is
+/// the head alone. Its status and headers are GET's, `Content-Length` is the length of the
+/// content GET would carry, and no content follows (RFC 9110 §9.3.2), the way the routed
+/// adapter answers every `HEAD`, a refusal's included.
+///
+/// ```
+/// use ikigai_web::{write_answer, EdgeConfig, Response};
+/// use tokio::io::AsyncReadExt;
+///
+/// # #[tokio::main]
+/// # async fn main() {
+/// let (mut client, mut server) = tokio::io::duplex(4096);
+/// let answer = Response::new(200, "application/json", br#"{"ok":true}"#.to_vec());
+/// write_answer(&mut server, "HEAD", answer, &EdgeConfig::default()).await.unwrap();
+/// drop(server);
+/// let mut out = String::new();
+/// client.read_to_string(&mut out).await.unwrap();
+/// assert!(out.contains("\r\nContent-Length: 11\r\n"), "{out}");
+/// assert!(out.ends_with("\r\n\r\n"), "the head alone: {out:?}");
+/// # }
+/// ```
+pub async fn write_answer<S: AsyncWrite + Unpin>(
+    sock: &mut S,
+    method: &str,
+    response: Response,
+    config: &EdgeConfig,
+) -> std::io::Result<()> {
+    write_checked(sock, response, method == "HEAD", config).await
+}
+
+/// Check `response` ([`Response::check`]) and write it, the head alone when `head_only`.
+async fn write_checked<S: AsyncWrite + Unpin>(
+    sock: &mut S,
+    response: Response,
+    head_only: bool,
+    config: &EdgeConfig,
+) -> std::io::Result<()> {
+    if let Err(refusal) = response.check() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            refusal,
+        ));
+    }
     let resp = Resp {
         content_type: response.content_type,
         body: response.body,
         headers: response.headers,
         ..Resp::status(response.status, reason_phrase(response.status))
     };
+    let resp = if head_only { resp.into_head() } else { resp };
     write_within(sock, resp, config.write_timeout).await
 }
 
