@@ -3231,7 +3231,7 @@ mod describe_timeout {
 }
 
 /// ledger #1092: a peer that RESTARTS under a standing client. The server is run on a
-/// runtime the test owns, and "crashes" by `shutdown_background`, which drops its endpoint
+/// runtime the test owns, and "crashes" by [`Server::crash`], which drops its endpoint
 /// driver mid-connection: nothing sends a close frame, exactly like a SIGTERMed or
 /// launchd-restarted `ikigai serve`. The replacement binds the same address.
 #[cfg(test)]
@@ -3240,14 +3240,42 @@ mod restart {
     use ikigai_core::{builtins, EndpointSpace, Exact, Verb};
     use tokio::runtime::Runtime;
 
+    /// A server on a runtime the test owns, and every connection it accepted.
+    struct Server {
+        runtime: Runtime,
+        connections: Arc<std::sync::Mutex<Vec<quinn::Connection>>>,
+    }
+
+    impl Server {
+        /// Crash the server so that it says NOTHING to its clients, and return once it is
+        /// gone (its socket released).
+        ///
+        /// ★ `shutdown_background` alone does not guarantee the silence (ledger #1535). It
+        /// drops the runtime's tasks in no particular order and returns at once, and the task
+        /// serving a connection holds that connection's last handle: dropping the last handle
+        /// CLOSES the connection (quinn's implicit close), and when the connection's driver
+        /// is still being polled it SENDS that close frame. The client then sees a closed
+        /// connection, redials inside the same call and answers, so "the dead connection
+        /// answers nothing" failed on Linux CI with `Some(entries)`. So the handles are held
+        /// across the shutdown, which waits for every task to be dropped, and are released
+        /// only after it: by then no driver is left to send anything, and the last handle's
+        /// drop releases the socket, as a killed process's would.
+        fn crash(self) {
+            let held = std::mem::take(&mut *self.connections.lock().unwrap());
+            self.runtime
+                .shutdown_timeout(std::time::Duration::from_secs(10));
+            drop(held);
+        }
+    }
+
     /// A server answering `urn:test:upper` at `addr`, under `endpoint_config`, on a runtime
-    /// the caller owns (drop it with `shutdown_background` to crash the server).
+    /// the caller owns ([`Server::crash`] crashes it).
     fn serve_on(
         addr: SocketAddr,
         server_id: &Identity,
         client_id: &Identity,
         endpoint_config: quinn::EndpointConfig,
-    ) -> Runtime {
+    ) -> Server {
         let config = server_config(
             server_id,
             std::slice::from_ref(&client_id.cert_pem),
@@ -3255,9 +3283,10 @@ mod restart {
         )
         .unwrap();
         let rt = Runtime::new().unwrap();
-        // `shutdown_background` releases the crashed server's socket on its own schedule, so
-        // the replacement may find the port still held for a moment (macOS CI did): retry the
-        // bind, boundedly, rather than racing it.
+        // A crashed server's socket was once released on its own schedule (`shutdown_background`
+        // returned at once), so the replacement could find the port still held for a moment
+        // (macOS CI did). `crash` now returns after the release, and the bind is still retried,
+        // boundedly, rather than raced.
         let mut tries = 0;
         let endpoint = loop {
             match rt.block_on(async {
@@ -3274,11 +3303,15 @@ mod restart {
         let kernel = Arc::new(Kernel::new(Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
         )));
+        let connections = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let held = Arc::clone(&connections);
         rt.spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
                 let kernel = Arc::clone(&kernel);
+                let held = Arc::clone(&held);
                 tokio::spawn(async move {
                     if let Ok(connection) = incoming.await {
+                        held.lock().unwrap().push(connection.clone());
                         let session = Session {
                             capability: Capability::root(),
                             file_segment: String::new(),
@@ -3289,7 +3322,10 @@ mod restart {
                 });
             }
         });
-        rt
+        Server {
+            runtime: rt,
+            connections,
+        }
     }
 
     fn free_udp_addr() -> SocketAddr {
@@ -3317,7 +3353,7 @@ mod restart {
         let (answer, _) = client.issue(upper("one")).unwrap();
         assert_eq!(answer.bytes, b"ONE");
 
-        first.shutdown_background();
+        first.crash();
         let _second = serve_on(addr, &server_id, &client_id, endpoint_config(&server_id));
 
         let start = std::time::Instant::now();
@@ -3355,7 +3391,7 @@ mod restart {
             "the first enumeration answers"
         );
 
-        first.shutdown_background();
+        first.crash();
         let _second = serve_on(
             addr,
             &server_id,
