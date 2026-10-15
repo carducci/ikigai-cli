@@ -9,21 +9,21 @@
 //!
 //! The lock alone over-reports. It is one resolve for the whole workspace: every member's
 //! dev-dependencies are in it, and every optional dependency some feature could turn on. So
-//! the walk starts at this package and follows, for each workspace member it reaches, only
-//! the NORMAL dependencies its manifest declares (never `[dev-dependencies]` or
-//! `[build-dependencies]`, neither of which is linked), and an optional one only when a
-//! feature this build enabled turns it on, features followed through the members the way
-//! Cargo unifies them. A crate from a registry is followed by its edges in the lock, which
-//! lists only the dependencies its resolve activated.
+//! the walk starts at this package and follows, for each workspace member and each `ikigai-*`
+//! crate from a registry, only the NORMAL dependencies its manifest declares (never
+//! `[dev-dependencies]` or `[build-dependencies]`, neither of which is linked), and an
+//! optional one only when an enabled feature turns it on, features followed the way Cargo
+//! unifies them. A registry crate's manifest is the published one Cargo unpacked under its
+//! home. Any other registry crate is followed by its edges in the lock.
 //!
 //! What it cannot see, stated so nobody reads more into the list than it says:
 //!
 //! - a target-specific dependency (`[target.'cfg(…)'.dependencies]`) is counted on every
 //!   target. No `ikigai-*` crate is target-gated in this workspace today;
-//! - a registry crate's edges in the lock are taken whole: an optional dependency the
-//!   WORKSPACE resolve activated but this binary's features did not is counted, and so is a
-//!   build-dependency, because the lock records neither which consumer activated an edge nor
-//!   its kind;
+//! - a crate followed by its lock edges has them taken whole (the lock records neither which
+//!   consumer activated an edge nor its kind). That is every non-`ikigai-*` registry crate,
+//!   which matters only if one depends on an `ikigai-*` crate, and an `ikigai-*` one whose
+//!   manifest is not under the cargo home (vendored sources), which then over-reports;
 //! - `cargo install` WITHOUT `--locked` resolves afresh and ignores the packaged lock, so the
 //!   lock read here may not be the resolve that compiled. Install with `--locked` (every
 //!   runbook here does) and the two are the same lock.
@@ -106,28 +106,41 @@ fn linked(manifest_dir: &Path) -> Result<BTreeSet<(String, String)>, String> {
         .ok_or_else(|| format!("{this} {this_version} is not in {}", lock_path.display()))?;
     let start_features = enabled_features(members.get(&this));
 
-    // A member is revisited whenever its feature set grows, which is Cargo's unification;
-    // a registry crate is visited once, since its edges in the lock do not depend on it.
+    // A crate walked by its manifest is revisited whenever its feature set grows, which is
+    // Cargo's unification; a crate walked by its lock edges is visited once, since those edges
+    // do not depend on what was asked of it.
+    let registry_manifests = RegistryManifests::new();
     let mut member_features: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
     let mut seen_registry: BTreeSet<usize> = BTreeSet::new();
     let mut work: Vec<(usize, BTreeSet<String>)> = vec![(start, start_features)];
     while let Some((at, requested)) = work.pop() {
         let package = &packages[at];
-        if !package.path {
+        let manifest = if package.path {
+            match members.get(&package.name) {
+                Some(manifest) => Some(manifest.clone()),
+                None => return Err(format!("no manifest found for member {}", package.name)),
+            }
+        } else if package.name.starts_with("ikigai-") {
+            // An `ikigai-*` crate from a registry is walked by its PUBLISHED manifest, like a
+            // member: in a packaged build (what `cargo install` compiles) every sibling is one,
+            // and its lock edges list each optional dependency the resolve could turn on.
+            registry_manifests.get(&package.name, &package.version)
+        } else {
+            None
+        };
+        let Some(manifest) = manifest else {
             if seen_registry.insert(at) {
                 for dep in &package.dependencies {
                     for to in lock_targets(&packages, dep) {
-                        // A registry crate reaching a path package is a `[patch]`: what it
-                        // asks of it is unknown here, so it gets its default features.
+                        // What a crate walked by its edges asks of the next is unknown here,
+                        // so it is asked for its default features.
                         work.push((to, BTreeSet::from(["default".to_string()])));
                     }
                 }
             }
             continue;
-        }
-        let Some(manifest) = members.get(&package.name) else {
-            return Err(format!("no manifest found for member {}", package.name));
         };
+        let manifest = &manifest;
         let first = !member_features.contains_key(&at);
         let known = member_features.entry(at).or_default();
         let before = known.len();
@@ -171,6 +184,38 @@ fn linked(manifest_dir: &Path) -> Result<BTreeSet<(String, String)>, String> {
         .filter(|p| p.name.starts_with("ikigai-"))
         .map(|p| (p.name.clone(), p.version.clone()))
         .collect())
+}
+
+/// The published manifests of registry crates, as Cargo unpacked them before this build:
+/// `<cargo home>/registry/src/<index>/<name>-<version>/Cargo.toml`. Not found (vendored
+/// sources, an unusual cargo home) ⇒ `None`, and the crate is walked by its lock edges.
+struct RegistryManifests {
+    roots: Vec<PathBuf>,
+}
+
+impl RegistryManifests {
+    fn new() -> Self {
+        let home = std::env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .or_else(|| std::env::var_os("USERPROFILE"))
+                    .map(|home| PathBuf::from(home).join(".cargo"))
+            });
+        let roots = home
+            .and_then(|home| std::fs::read_dir(home.join("registry").join("src")).ok())
+            .map(|dirs| dirs.filter_map(|d| d.ok()).map(|d| d.path()).collect())
+            .unwrap_or_default();
+        RegistryManifests { roots }
+    }
+
+    fn get(&self, name: &str, version: &str) -> Option<toml::Table> {
+        self.roots
+            .iter()
+            .map(|root| root.join(format!("{name}-{version}")).join("Cargo.toml"))
+            .find(|path| path.is_file())
+            .and_then(|path| read_toml(&path).ok())
+    }
 }
 
 fn read_toml(path: &Path) -> Result<toml::Table, String> {
