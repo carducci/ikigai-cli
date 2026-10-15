@@ -222,8 +222,17 @@ pub fn submit(config: IntakeConfig) -> IntakeEndpoint {
     IntakeEndpoint { config }
 }
 
-/// Escape a string for an HTML attribute / text context — enough for a URL and a page.
-fn html_escape(s: &str) -> String {
+/// Escape a string for an HTML text or double-quoted attribute context: `&`, `<`, `>`, `"` and
+/// `'` become entities and every other character passes through. Enough for a URL and a page;
+/// the public link pages in `ikigai-embedded` use it for every value they interpolate.
+///
+/// ```
+/// assert_eq!(
+///     ikigai_intake::html_escape(r#"<a href="x">Tom & Jerry's</a>"#),
+///     "&lt;a href=&quot;x&quot;&gt;Tom &amp; Jerry&#39;s&lt;/a&gt;"
+/// );
+/// ```
+pub fn html_escape(s: &str) -> String {
     s.chars()
         .flat_map(|c| match c {
             '&' => "&amp;".chars().collect::<Vec<_>>(),

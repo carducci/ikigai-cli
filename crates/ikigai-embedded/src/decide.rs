@@ -423,6 +423,25 @@ fn action_of(inv: &Invocation<'_>) -> String {
         .to_string()
 }
 
+/// The SHOW page's body: what the link would decide, and the form that posts it back.
+///
+/// Every interpolated value is escaped (ledger #1516). The shape gate keeps markup out of a link
+/// that verifies today, but the page must not depend on a check that lives somewhere else.
+fn show_body(id: &str, exp: i64, token: &str, verb_word: &str, note: &str) -> String {
+    let esc = ikigai_intake::html_escape;
+    let (id, token, verb_word, note) = (esc(id), esc(token), esc(verb_word), esc(note));
+    format!(
+        "<p>Booking <code>{id}</code>.</p>\
+         <form method=\"post\" id=\"act\">\
+         <input type=hidden name=id value=\"{id}\">\
+         <input type=hidden name=exp value=\"{exp}\">\
+         <input type=hidden name=t value=\"{token}\">\
+         <button style=\"font:inherit;padding:.6rem 1.2rem\">{verb_word}</button>\
+         </form><p style=\"color:#666\">{note}</p>{js}",
+        js = crate::passkey::DECISION_PASSKEY_JS,
+    )
+}
+
 #[async_trait::async_trait]
 impl Endpoint for CalendarRequest {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
@@ -466,16 +485,7 @@ impl Endpoint for CalendarRequest {
                 };
                 Ok(page(
                     &format!("{verb_word} this request?"),
-                    &format!(
-                        "<p>Booking <code>{id}</code>.</p>\
-                         <form method=\"post\" id=\"act\">\
-                         <input type=hidden name=id value=\"{id}\">\
-                         <input type=hidden name=exp value=\"{exp}\">\
-                         <input type=hidden name=t value=\"{token}\">\
-                         <button style=\"font:inherit;padding:.6rem 1.2rem\">{verb_word}</button>\
-                         </form><p style=\"color:#666\">{note}</p>{js}",
-                        js = crate::passkey::DECISION_PASSKEY_JS,
-                    ),
+                    &show_body(&id, exp, &token, verb_word, note),
                 ))
             }
             // ACT: record the intent. The Mac does the real work when it next drains.
@@ -704,6 +714,28 @@ mod tests {
     const ID: &str = "abc123def456";
     const NOW: i64 = 1_800_000_000;
     const EXP: i64 = NOW + 600;
+
+    /// Ledger #1516: every value the SHOW page interpolates is escaped, in text and in an
+    /// attribute. The shape gate (`id_shaped`, a verified URL-safe signature) keeps markup out of
+    /// a link that verifies today; this pins the page so it does not depend on that gate.
+    #[test]
+    fn the_show_page_renders_markup_in_its_fields_as_text() {
+        let body = show_body("<b>x</b>&y'", EXP, "t\"><i>z</i>", "Approve", "a note");
+        assert!(!body.contains("<b>"), "{body}");
+        assert!(!body.contains("<i>"), "{body}");
+        assert!(
+            body.contains("<code>&lt;b&gt;x&lt;/b&gt;&amp;y&#39;</code>"),
+            "the id as text: {body}"
+        );
+        assert!(
+            body.contains("name=id value=\"&lt;b&gt;x&lt;/b&gt;&amp;y&#39;\""),
+            "the id as an attribute: {body}"
+        );
+        assert!(
+            body.contains("name=t value=\"t&quot;&gt;&lt;i&gt;z&lt;/i&gt;\""),
+            "a quote cannot close the attribute: {body}"
+        );
+    }
 
     #[test]
     fn a_freshly_minted_token_verifies() {
