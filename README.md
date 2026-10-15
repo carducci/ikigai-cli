@@ -899,5 +899,12 @@ workspace.
 Copy `.cargo/config.toml.example` to `.cargo/config.toml` (gitignored) to redirect
 the `ikigai-core` dependency to a sibling `../ikigai-core` checkout.
 
+## Accessibility
+
+[ACCESSIBILITY.md](ACCESSIBILITY.md) lists what this repository emits that people read (the HTTP
+door's error pages, the embedded host's pages, the REPLs' text), the rules that output follows,
+how it is tested and what is not, and how to report a barrier. Read it before changing any of
+that output.
+
 ## License
 MIT OR Apache-2.0. See `LICENSE-MIT` / `LICENSE-APACHE`. See `ACKNOWLEDGEMENTS.md`.
