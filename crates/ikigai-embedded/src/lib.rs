@@ -3002,54 +3002,13 @@ fn safe_elisp_param(name: &str) -> String {
 
 fn first_line(text: &str) -> String {
     // ESCAPE compose markers. An endpoint's summary can contain one literally —
-    // `urn:iki:fn:compose` documents itself with `$a{<iri>}`, `$r{<iri>}` and `$h{<iri>}` — and
-    // the moment that text lands in a generated comment, composing the prelude tries to expand
-    // the EXAMPLE inside its own documentation ("bad IRI in marker `<iri>`"). `$$a{…}` is
-    // compose's literal form.
-    escape_markers(text.lines().next().unwrap_or("").trim())
-}
-
-/// The letters that open a compose marker: `$a{…}` (transclude), and since ikigai-fn 0.3.0
-/// `$r{…}` (raw) and `$h{…}` (HTML-escaped). A marker letter compose learns later and this
-/// list does not is the failure this list exists for: fn 0.3.0 added two, compose's own
-/// summary spelled both, and the generated alias prelude stopped composing until they were
-/// added here.
-const MARKER_LETTERS: [char; 3] = ['a', 'r', 'h'];
-
-/// Normalize any run of `$` before a marker (`a{`, `r{`, `h{`) to exactly `$$` — compose's
-/// literal form.
-///
-/// Idempotent on purpose. A plain `.replace("$a{", "$$a{")` also rewrites the ALREADY
-/// escaped `$$a{…}` that appears in the same sentence of compose's own summary, yielding
-/// `$$$a{…}` — which compose reads as a literal `$` followed by a live marker, and fails on
-/// again. Escaping must be a fixed point.
-fn escape_markers(text: &str) -> String {
-    let bytes: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len() + 8);
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == '$' {
-            let mut j = i;
-            while j < bytes.len() && bytes[j] == '$' {
-                j += 1;
-            }
-            if bytes.get(j + 1) == Some(&'{')
-                && bytes.get(j).is_some_and(|c| MARKER_LETTERS.contains(c))
-            {
-                out.push_str("$$");
-                i = j;
-                continue;
-            }
-            for _ in i..j {
-                out.push('$');
-            }
-            i = j;
-            continue;
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    out
+    // `urn:iki:fn:compose` documents itself with `$a{<iri>}`, `$r{<iri>}` and `$h{<iri>}`,
+    // and says "A literal `$` is written `$$`" — and the moment that text lands in a generated
+    // comment, composing the prelude tries to expand the EXAMPLE inside its own documentation
+    // ("bad IRI in marker `<iri>`"). ikigai-fn's own escape (0.4.1, ledger #646) is built from
+    // compose's parser, so a marker letter compose learns later is escaped here without an
+    // edit, and composing the result gives back exactly the summary: a `$$` survives as `$$`.
+    ikigai_fn::escape_markers(text.lines().next().unwrap_or("").trim())
 }
 
 /// How often the daemon refreshes its heartbeat file.
@@ -7436,27 +7395,30 @@ mod tests {
         assert_eq!(alias_name("urn:ikigai:thing", "Source"), "ikigai-thing");
     }
 
-    /// Compose documents ITSELF with a literal `$a{<iri>}` marker, so that text lands in a
-    /// generated comment — and composing the prelude then tries to expand the example in
-    /// its own documentation. Escaping must also be a FIXED POINT, or the already-escaped
-    /// `$$a{…}` in the same sentence becomes `$$$a{…}` and fails differently.
+    /// Compose documents ITSELF with literal markers, so that text lands in a generated
+    /// comment — and composing the prelude then tries to expand the examples in its own
+    /// documentation. The escape is ikigai-fn's (ledger #646): every marker, and every run of
+    /// two or more `$`, is doubled, so composing gives the summary back byte for byte. The
+    /// copy it replaced normalized any `$`-run before a marker to exactly `$$`, which lost a
+    /// `$` from text that spelled the escape itself.
     #[test]
-    fn transclusion_markers_in_summaries_are_escaped_idempotently() {
+    fn transclusion_markers_in_summaries_are_escaped_for_compose() {
         assert_eq!(
-            escape_markers("expands $a{<iri>} markers"),
+            first_line("expands $a{<iri>} markers\nsecond line"),
             "expands $$a{<iri>} markers"
         );
-        assert_eq!(escape_markers("literal is $$a{…}"), "literal is $$a{…}");
-        assert_eq!(escape_markers("$$$a{x}"), "$$a{x}");
-        assert_eq!(escape_markers("a $5 cost"), "a $5 cost");
-        // ikigai-fn 0.3.0's two new marker letters, as its own summary spells them.
         assert_eq!(
-            escape_markers("`$r{<iri>}` raw, `$h{<iri> || <fallback>}` escaped"),
+            first_line("`$r{<iri>}` raw, `$h{<iri> || <fallback>}` escaped"),
             "`$$r{<iri>}` raw, `$$h{<iri> || <fallback>}` escaped"
         );
-        assert_eq!(escape_markers("$$h{x} and $$$r{y}"), "$$h{x} and $$r{y}");
-        // Not a marker letter, and a `$` at the very end.
-        assert_eq!(escape_markers("$b{x} costs $"), "$b{x} costs $");
+        // Text that SPELLS the escape keeps both of its `$`: compose reads `$$$$` as `$$`.
+        assert_eq!(first_line("literal is $$a{…}"), "literal is $$$$a{…}");
+        assert_eq!(
+            first_line("a literal `$` is `$$`"),
+            "a literal `$` is `$$$$`"
+        );
+        // A lone `$` before anything but a marker is left readable.
+        assert_eq!(first_line("a $5 cost, $b{x}, $"), "a $5 cost, $b{x}, $");
     }
 
     /// A manifold row as core 0.1.91 mints it: its own match IRI, and the id only inside
@@ -8657,6 +8619,9 @@ mod tests {
         assert!(text.contains("(define (fn-toUpper"), "{text}");
         // Compose's own documentation arrives as text, with its markers literal.
         assert!(text.contains("`$h{<iri>}`"), "{text}");
+        // …and its `$$` too: the escape this replaced turned it into `$`, so the prelude
+        // misprinted how to write a literal dollar (ledger #646).
+        assert!(text.contains("A literal `$` is written `$$`."), "{text}");
     }
 
     #[test]

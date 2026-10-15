@@ -1029,13 +1029,14 @@ ikigai-fn = "0.4.1" # 0.4.1 = the 0.4 line names its `space()` `urn:iki:space:fn
 # the cache partitions under it. Under 0.x the old caret was a CEILING below the named release. ⚠
 # `base_space` EXTENDS `ikigai_fn::space()` with `bind`, and core 0.1.89 drops the name there, so
 # the embedded root's base layer stays anonymous; the claim is never made over doors fn does not
-# own. 0.4.1 adds only `MARKER_LETTERS`/`escape_markers`, which nothing here calls: taken as the
-# published head so the host is not born behind it.
+# own. 0.4.1 adds `MARKER_LETTERS`/`escape_markers`, and the alias prelude calls `escape_markers`
+# (ledger #646, replacing the host's own copy of the marker letters), so 0.4.1 is a floor by API
+# as well as the published head.
 # Beneath it, still true: 0.3.0 = compose is a view TEMPLATE LANGUAGE: `$h{…}` (HTML-escaped) and
 # `$r{…}` (raw) splice without re-expanding, `{name}` in a marker is a template argument, and
 # `$h{<iri> || <fallback>}` covers a failed part. This host serves `urn:iki:fn:compose`, so the
 # language IS its output, and the floor is the language rather than any Rust item (the host
-# calls only `ikigai_fn::space()`). Under 0.x a caret is a range: `^0.2.2` was `<0.3.0`, a
+# calls `ikigai_fn::space()` and, since 0.4.1, `escape_markers`). Under 0.x a caret is a range: `^0.2.2` was `<0.3.0`, a
 # CEILING that kept this host serving the old language after 0.3.0 shipped. Read as breaking,
 # and checked site by site: the demo shapes (`urn:data:page`, `:about`, `:control`,
 # `urn:demo:jury`, `:jury-gated`) render byte-identically, and the one thing that broke was
