@@ -12,7 +12,7 @@
 //! directly (no client-side cache probing across the wire). The wire protocol
 //! that remote resolvers speak lives in the companion `ikigai-wire` crate.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -248,6 +248,7 @@ pub fn naming_entry<'a>(entries: &'a [SpaceEntry], target: &Iri) -> Option<&'a S
 pub struct RemoteSpace {
     resolver: Arc<dyn Resolver>,
     names: RemoteNames,
+    contracts: Arc<ContractMemo>,
 }
 
 impl RemoteSpace {
@@ -256,7 +257,16 @@ impl RemoteSpace {
         RemoteSpace {
             resolver,
             names: RemoteNames::new(),
+            contracts: Arc::new(ContractMemo::new(CONTRACT_TTL)),
         }
+    }
+
+    /// How long this space trusts a contract it read from the peer (builder; default
+    /// [`CONTRACT_TTL`]). `Duration::ZERO` asks the peer on every describe, as before
+    /// ledger #1577. See [`CONTRACT_TTL`] for what the bound guarantees.
+    pub fn contract_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.contracts = Arc::new(ContractMemo::new(ttl));
+        self
     }
 }
 
@@ -282,6 +292,7 @@ impl Space for RemoteSpace {
             health: None,
             request: request.clone(),
             contract: None,
+            contracts: Arc::clone(&self.contracts),
         }
         .resolution(request)
     }
@@ -291,6 +302,8 @@ impl Space for RemoteSpace {
         // the name map current so template probes resolve under the real names.
         let entries = self.resolver.entries()?;
         self.names.refresh(&entries);
+        // A walk describes every row next: read them from the peer (see `ContractMemo`).
+        self.contracts.clear();
         Some(entries)
     }
 }
@@ -318,8 +331,12 @@ struct ForwardingEndpoint {
     health: Option<Arc<DescribeHealth>>,
     /// The peer's contract, when it was read at RESOLVE time — which is what a `Meta`
     /// resolution does (see [`resolution`](Self::resolution)). `None` means nobody has
-    /// asked yet, and [`describe`](Endpoint::describe) asks then, as it always did.
+    /// asked yet, and [`describe`](Endpoint::describe) asks then — or takes it from
+    /// `contracts`.
     contract: Option<Contract>,
+    /// The mount's memo of contracts its peer declared, shared by every endpoint the mount
+    /// hands out, so a hot read does not forward a `Meta` per read. See [`ContractMemo`].
+    contracts: Arc<ContractMemo>,
 }
 
 /// What forwarding a `Meta` to the peer said about a mounted name.
@@ -365,10 +382,17 @@ impl ForwardingEndpoint {
     fn resolution(mut self, request: &Request) -> Resolution {
         let silent = self.health.as_ref().is_some_and(|h| h.failing().is_some());
         if request.verb == Verb::Meta && !silent {
+            // ★ A `Meta` is the "describe it NOW" operation, so it never takes the memo's
+            // word for it — it refreshes the memo instead (see `ContractMemo`).
+            let target = self.request.target.as_str().to_string();
             match self.lookup() {
-                Ok(description) => self.contract = Some(Contract::Read(Box::new(description))),
+                Ok(description) => {
+                    self.contracts.put(&target, &description);
+                    self.contract = Some(Contract::Read(Box::new(description)))
+                }
                 Err(Lookup::Unbound) => {
-                    return Limit::new(request.target.as_str()).resolve(request, &Scope::empty())
+                    self.contracts.forget(&target);
+                    return Limit::new(request.target.as_str()).resolve(request, &Scope::empty());
                 }
                 Err(Lookup::Unavailable(reason)) => {
                     self.contract = Some(Contract::Unavailable(reason))
@@ -376,6 +400,15 @@ impl ForwardingEndpoint {
             }
         }
         Resolution::Hit(Resolved::new(Arc::new(self), Bindings::new()))
+    }
+
+    /// Stop trusting the memoized contract for this name when the peer REFUSED the forward:
+    /// a `Denied` the local floor did not predict, or an `Unresolved` for a name it was
+    /// described under, means the peer's contract may no longer be the one held here.
+    fn distrust_on_refusal<T>(&self, result: &Result<T, Error>) {
+        if matches!(result, Err(Error::Denied(_) | Error::Unresolved(_))) {
+            self.contracts.forget(self.request.target.as_str());
+        }
     }
 
     /// Forward a `Meta` (JSON face) for the target and read the peer's contract.
@@ -419,10 +452,9 @@ impl Endpoint for ForwardingEndpoint {
         // Error, so a hung/unreachable remote surfaces as transient — a Retry or
         // Failover above this mount can act on it, not a blanket permanent failure.
         if inv.trace_span().is_none() {
-            return self
-                .resolver
-                .issue_as(self.request.clone(), inv.capability)
-                .map(|(representation, _status)| as_held_here(representation));
+            let result = self.resolver.issue_as(self.request.clone(), inv.capability);
+            self.distrust_on_refusal(&result);
+            return result.map(|(representation, _status)| as_held_here(representation));
         }
         // The local kernel is recording: trace the forward too — install a collector
         // on the resolver so the round-trip goes as a traced call — then hand the
@@ -433,6 +465,7 @@ impl Endpoint for ForwardingEndpoint {
         self.resolver.set_tracer(collector.clone());
         let result = self.resolver.issue_as(self.request.clone(), inv.capability);
         self.resolver.clear_tracer();
+        self.distrust_on_refusal(&result);
         let (representation, _status) = result?;
         inv.record_subtree(collector.take());
         Ok(as_held_here(representation))
@@ -463,8 +496,18 @@ impl Endpoint for ForwardingEndpoint {
                         &reason,
                     );
                 }
+                // The floor and a routing read land here once per resolution, because each
+                // resolution is a fresh endpoint core's floor memo has not seen: answer from
+                // the mount's own memo while it is fresh (ledger #1577).
+                let target = self.request.target.as_str();
+                if let Some(description) = self.contracts.get(target) {
+                    return description;
+                }
                 match self.lookup() {
-                    Ok(description) => return description,
+                    Ok(description) => {
+                        self.contracts.put(target, &description);
+                        return description;
+                    }
                     // Asked off a `Meta` resolution — a floor or a routing read on a hit
                     // that resolved under another verb. The invoke will say "unresolved"
                     // itself; here there is only a contract to fail to read.
@@ -687,6 +730,143 @@ impl DescribeHealth {
     }
 }
 
+/// How long a mount ([`MountedRemote`], [`RemoteSpace`]) trusts a contract it read from its
+/// peer before reading it again, and the default for [`MountedRemote::contract_ttl`] and
+/// [`RemoteSpace::contract_ttl`] (ledger #1577).
+///
+/// Five seconds: a hot read pays at most one `Meta` round trip per forwarded name per five
+/// seconds instead of one per read, and a peer that was upgraded or rebound is described
+/// afresh by the first read that starts five seconds after the mount last read its
+/// contract. `Duration::ZERO` turns the memo off, which is the behavior before it: every
+/// describe asks the peer.
+///
+/// ## The guarantee
+///
+/// * **Staleness is bounded by the TTL.** A contract is reused for at most this long after
+///   it was read; the first describe after that asks the peer again. A peer that was
+///   upgraded, restarted or rebound is seen within that bound, whatever the transport did
+///   in between. (Invalidating on a reconnect instead would not be enough and is not
+///   available: the IPC client heals a broken connection INSIDE one call, so a restart is
+///   invisible to the mount, and a peer can rebind a name with no reconnect at all.)
+/// * **A contract that changed never widens what a caller may do.** The local floor is a
+///   pre-check. Every forwarded request carries the caller's capability, and the peer runs
+///   its OWN current floor on it (the server clamps it to the channel's principal first).
+///   So if the peer NARROWED a contract, a caller the stale local floor admits is refused by
+///   the peer; and if the peer WIDENED one, the stale local floor refuses a caller the peer
+///   would admit, until the TTL passes. Both directions err toward refusing. ⚠ This rests
+///   on the peer enforcing its own floor, which every ikigai kernel does. A peer that does
+///   not is trusting the mounting side's floor alone, and for such a peer a narrowed
+///   contract can be under-enforced for up to the TTL; mount it with `Duration::ZERO`.
+/// * **A refusal re-reads.** A forwarded request the peer answers with `Denied` or
+///   `Unresolved` evicts that name, so a contract that is disagreeing with the peer is not
+///   trusted for the rest of its TTL.
+/// * **An enumeration re-reads everything.** `entries()` is a catalog walk's first step and
+///   every row is described next, so a successful enumeration clears the memo and a
+///   manifold read describes from the peer exactly as it did before.
+/// * **A failure is never memoized.** Only a contract the peer actually declared is held. A
+///   silent peer is the mount's health record's business (consulted first, as before), and
+///   an unparseable answer is asked again on the next describe, as before (ledger #93).
+/// * **`Meta` always asks.** A `Meta` resolution reads the peer at resolve time (ledger
+///   #1146) and refreshes the entry with what it read, or evicts it when the peer no longer
+///   binds the name.
+pub const CONTRACT_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How many forwarded names' contracts a mount holds before it sweeps: expired ones first,
+/// then live ones down to three quarters, so a template mount (`urn:file:{path}`, one name
+/// per path) is bounded in memory and degrades to the old per-read `Meta` rather than off a
+/// cliff. The same shape as core's floor memo bound, for the same reason (ledger #791).
+const CONTRACT_MEMO_BOUND: usize = 1024;
+
+/// A monotonic "now" for transport bookkeeping (see [`DescribeHealth::record`] for why it
+/// is `Instant` and not the kernel `Clock`). One function so the opt-out is stated once.
+fn monotonic_now() -> std::time::Instant {
+    // Native-and-wasm, as in `DescribeHealth::record`: the browser shim provides it.
+    #[allow(clippy::disallowed_methods)]
+    let now = std::time::Instant::now();
+    now
+}
+
+/// The contracts a mount has read from its peer, per forwarded name, each trusted for
+/// [`CONTRACT_TTL`] (ledger #1577).
+///
+/// Core memoizes an endpoint's floor per endpoint ALLOCATION, and a mount hands out a fresh
+/// [`ForwardingEndpoint`] per resolution (it must: each one carries the request it forwards),
+/// so core's memo never hits and every mounted read called `describe()`, which forwarded a
+/// `Meta` to the peer. Measured with the ledger #1570 harness: exactly one `Meta` per read,
+/// half the round trips of a mounted read once every mounted answer became `Always`
+/// (ledger #92). This memo is the mount's own, keyed by the forwarded NAME, so it hits
+/// across the endpoints it hands out. What it guarantees, and why that is safe, is stated
+/// on [`CONTRACT_TTL`].
+struct ContractMemo {
+    ttl: std::time::Duration,
+    entries: Mutex<HashMap<String, (std::time::Instant, Description)>>,
+}
+
+impl ContractMemo {
+    fn new(ttl: std::time::Duration) -> Self {
+        ContractMemo {
+            ttl,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, (std::time::Instant, Description)>> {
+        // A poisoned lock must cost knowledge, never a describe: keep using the map.
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The contract read for `target` less than the TTL ago, if there is one.
+    fn get(&self, target: &str) -> Option<Description> {
+        let mut entries = self.lock();
+        match entries.get(target) {
+            Some((at, description)) if at.elapsed() < self.ttl => Some(description.clone()),
+            Some(_) => {
+                entries.remove(target);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Remember the contract the peer just declared for `target`.
+    fn put(&self, target: &str, description: &Description) {
+        if self.ttl.is_zero() {
+            return;
+        }
+        let now = monotonic_now();
+        let mut entries = self.lock();
+        if entries.len() >= CONTRACT_MEMO_BOUND && !entries.contains_key(target) {
+            let ttl = self.ttl;
+            entries.retain(|_, (at, _)| at.elapsed() < ttl);
+            let mut excess = entries
+                .len()
+                .saturating_sub(CONTRACT_MEMO_BOUND - CONTRACT_MEMO_BOUND / 4);
+            entries.retain(|_, _| {
+                if excess == 0 {
+                    return true;
+                }
+                excess -= 1;
+                false
+            });
+        }
+        entries.insert(target.to_string(), (now, description.clone()));
+    }
+
+    /// Stop trusting what was read for `target`.
+    fn forget(&self, target: &str) {
+        self.lock().remove(target);
+    }
+
+    /// Stop trusting anything read so far.
+    fn clear(&self) {
+        self.lock().clear();
+    }
+}
+
 /// The IRI a mount claims for ITSELF, so a mount that could not enumerate its peer has
 /// somewhere to say so: `{prefix}:ikigai:mount-unavailable`.
 ///
@@ -802,6 +982,9 @@ pub struct MountedRemote {
     /// What this mount has learned about its peer's ability to describe itself, shared
     /// with every [`ForwardingEndpoint`] it hands out. See [`DESCRIBE_COOLDOWN`].
     health: Arc<DescribeHealth>,
+    /// The contracts this mount has read from its peer, shared with every
+    /// [`ForwardingEndpoint`] it hands out. See [`ContractMemo`].
+    contracts: Arc<ContractMemo>,
 }
 
 /// How a mount relates the local namespace to the remote one.
@@ -835,6 +1018,7 @@ impl MountedRemote {
             mode: MountMode::Alias,
             names: RemoteNames::new(),
             health: Arc::new(DescribeHealth::default()),
+            contracts: Arc::new(ContractMemo::new(CONTRACT_TTL)),
         }
     }
 
@@ -853,6 +1037,7 @@ impl MountedRemote {
             mode: MountMode::Override,
             names: RemoteNames::new(),
             health: Arc::new(DescribeHealth::default()),
+            contracts: Arc::new(ContractMemo::new(CONTRACT_TTL)),
         }
     }
 
@@ -865,6 +1050,14 @@ impl MountedRemote {
     /// mount hands out, so replacing it later would leave endpoints consulting the old one.
     pub fn sharing(mut self, peers: &PeerHealth) -> Self {
         self.health = peers.get(&self.origin);
+        self
+    }
+
+    /// How long this mount trusts a contract it read from its peer (builder; default
+    /// [`CONTRACT_TTL`]). `Duration::ZERO` asks the peer on every describe, as before
+    /// ledger #1577. See [`CONTRACT_TTL`] for what the bound guarantees.
+    pub fn contract_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.contracts = Arc::new(ContractMemo::new(ttl));
         self
     }
 
@@ -957,6 +1150,7 @@ impl Space for MountedRemote {
             health: Some(Arc::clone(&self.health)),
             request: forwarded,
             contract: None,
+            contracts: Arc::clone(&self.contracts),
         }
         .resolution(request)
     }
@@ -970,6 +1164,9 @@ impl Space for MountedRemote {
         let entries = match self.resolver.try_entries() {
             Ok(Some(entries)) => {
                 self.health.clear();
+                // A walk describes every row next: read them from the peer (see
+                // `ContractMemo`), so a manifold read is as fresh as it was before the memo.
+                self.contracts.clear();
                 entries
             }
             // The peer does not enumerate at all. Nothing is missing that it would have
@@ -2265,5 +2462,333 @@ mod tests {
             composite.contains("×2"),
             "and it was computed on BOTH reads, not served from the cache: {composite}"
         );
+    }
+
+    // ---- ledger #1577: the mount's contract memo ----
+
+    /// A Meta renderer that answers every face with the description as JSON, the face a
+    /// mount reads a contract through, so a test peer can be a real kernel with a real floor.
+    struct JsonMeta;
+
+    impl ikigai_core::MetaRenderer for JsonMeta {
+        fn render(
+            &self,
+            description: &Description,
+            _target: &ReprType,
+        ) -> ikigai_core::Result<Representation> {
+            let bytes =
+                serde_json::to_vec(description).map_err(|e| Error::Endpoint(e.to_string()))?;
+            Ok(Representation::new(
+                ReprType::new("application/json"),
+                bytes,
+            ))
+        }
+    }
+
+    /// A peer's root whose bindings can be swapped, the way an upgraded or rebound peer's are.
+    struct Swappable(Mutex<Arc<dyn Space>>);
+
+    impl Space for Swappable {
+        fn resolve(&self, request: &Request, scope: &Scope) -> Resolution {
+            let inner = Arc::clone(&self.0.lock().unwrap());
+            inner.resolve(request, scope)
+        }
+
+        fn entries(&self) -> Option<Vec<SpaceEntry>> {
+            let inner = Arc::clone(&self.0.lock().unwrap());
+            inner.entries()
+        }
+    }
+
+    /// `urn:peer:doc`, a Source that requires `requires` when it is given.
+    fn doc_space(requires: Option<&str>) -> Arc<dyn Space> {
+        let mut description = Description::new("doc").verb(Verb::Source);
+        if let Some(scope) = requires {
+            description = description.requires(scope);
+        }
+        let doc = FnEndpoint::new("doc", |_inv| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"doc".to_vec(),
+            ))
+        })
+        .with_description(description);
+        Arc::new(EndpointSpace::new().bind(Exact::new("urn:peer:doc"), doc))
+    }
+
+    /// A peer kernel serving [`doc_space`], with the handle that rebinds it.
+    fn swappable_peer(requires: Option<&str>) -> (Arc<Swappable>, Arc<Kernel>) {
+        let space = Arc::new(Swappable(Mutex::new(doc_space(requires))));
+        let kernel =
+            Kernel::with_meta_renderer(Arc::clone(&space) as Arc<dyn Space>, Arc::new(JsonMeta));
+        (space, Arc::new(kernel))
+    }
+
+    /// Change what the peer binds, and tell it so (its own floor memo forgets the old one).
+    fn rebind(space: &Swappable, peer: &Kernel, now: Arc<dyn Space>) {
+        *space.0.lock().unwrap() = now;
+        peer.bindings_changed();
+    }
+
+    /// Counts what crosses the wire by verb: the ledger #1570 harness's instrument.
+    struct Counted {
+        inner: Arc<dyn Resolver>,
+        metas: std::sync::atomic::AtomicUsize,
+        others: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Counted {
+        fn over(peer: &Arc<Kernel>) -> Arc<Self> {
+            Arc::new(Counted {
+                inner: Arc::new(Forwarding(Arc::clone(peer))),
+                metas: Default::default(),
+                others: Default::default(),
+            })
+        }
+
+        fn metas(&self) -> usize {
+            self.metas.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn others(&self) -> usize {
+            self.others.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Resolver for Counted {
+        fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), Error> {
+            self.issue_as(request, &Capability::root())
+        }
+
+        fn issue_as(
+            &self,
+            request: Request,
+            capability: &Capability,
+        ) -> Result<(Representation, CacheStatus), Error> {
+            let counter = if request.verb == Verb::Meta {
+                &self.metas
+            } else {
+                &self.others
+            };
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.issue_as(request, capability)
+        }
+
+        fn is_cached(&self, request: &Request, capability: &Capability) -> bool {
+            self.inner.is_cached(request, capability)
+        }
+
+        fn entries(&self) -> Option<Vec<SpaceEntry>> {
+            self.inner.entries()
+        }
+    }
+
+    fn read_as(
+        kernel: &Kernel,
+        iri: &str,
+        capability: &Capability,
+    ) -> Result<Representation, Error> {
+        let request = Request::new(Verb::Source, Iri::parse(iri).unwrap());
+        Resolver::issue_as(kernel, request, capability).map(|(representation, _)| representation)
+    }
+
+    /// ★ Ledger #1577. Core's floor memo keys on the endpoint's allocation, and a mount
+    /// hands out a fresh endpoint per resolution, so every mounted read forwarded a `Meta`
+    /// for the floor: N reads, N `Meta`s (1.00 per read in the ledger #1570 harness). The
+    /// mount's own memo makes it one per name per TTL, through an alias mount, an override
+    /// mount and a bare `RemoteSpace` alike; an enumeration re-reads; and a TTL of zero is
+    /// the old behavior.
+    #[test]
+    fn a_hot_mounted_read_asks_the_peer_for_its_contract_once() {
+        const N: usize = 50;
+        let (_space, peer) = swappable_peer(None);
+        /// A label, the name read through it, its wire counter and the mounting space.
+        type Case = (&'static str, &'static str, Arc<Counted>, Arc<dyn Space>);
+        let cases: Vec<Case> = {
+            let alias = Counted::over(&peer);
+            let over = Counted::over(&peer);
+            let bare = Counted::over(&peer);
+            vec![
+                (
+                    "alias",
+                    "urn:mnt:peer:doc",
+                    Arc::clone(&alias),
+                    Arc::new(MountedRemote::new(alias, "urn:mnt:", "test://peer")),
+                ),
+                (
+                    "override",
+                    "urn:peer:doc",
+                    Arc::clone(&over),
+                    Arc::new(MountedRemote::overriding(over, "urn:peer:", "test://peer")),
+                ),
+                (
+                    "RemoteSpace",
+                    "urn:peer:doc",
+                    Arc::clone(&bare),
+                    Arc::new(RemoteSpace::new(bare)),
+                ),
+            ]
+        };
+        for (label, iri, wire, space) in cases {
+            let local = Kernel::new(Arc::clone(&space));
+            for _ in 0..N {
+                let answer = read_as(&local, iri, &Capability::root()).unwrap();
+                assert_eq!(answer.bytes, b"doc", "{label}");
+            }
+            assert_eq!(wire.others(), N, "{label}: every read is forwarded");
+            assert_eq!(
+                wire.metas(),
+                1,
+                "{label}: {N} hot reads asked the peer for the contract once"
+            );
+            // An enumeration is a catalog walk's first step and every row is described
+            // next, so it re-reads.
+            space.entries().expect("the peer enumerates");
+            read_as(&local, iri, &Capability::root()).unwrap();
+            assert_eq!(
+                wire.metas(),
+                2,
+                "{label}: an enumeration re-reads the contract"
+            );
+        }
+
+        // `Duration::ZERO` is the opt-out, and the behavior before the memo.
+        let wire = Counted::over(&peer);
+        let local = Kernel::new(Arc::new(
+            MountedRemote::overriding(wire.clone(), "urn:peer:", "test://peer")
+                .contract_ttl(std::time::Duration::ZERO),
+        ));
+        for _ in 0..N {
+            read_as(&local, "urn:peer:doc", &Capability::root()).unwrap();
+        }
+        assert_eq!(wire.metas(), N, "a zero TTL asks on every read");
+    }
+
+    /// ★ Ledger #1577: a contract that changed never widens what a caller may do. Within the
+    /// TTL the mount floors on the contract it read, so in BOTH directions the stale contract
+    /// errs toward refusing: a contract the peer NARROWED is refused by the peer's own floor
+    /// (the forward carries the caller's capability), and that refusal evicts the stale
+    /// contract; a contract the peer WIDENED is refused by the local floor until the TTL ends.
+    #[test]
+    fn a_stale_contract_never_admits_what_the_peer_now_refuses() {
+        let (space, peer) = swappable_peer(None);
+        let wire = Counted::over(&peer);
+        // An hour: everything below happens inside the TTL, whatever the machine's load.
+        let local = Kernel::new(Arc::new(
+            MountedRemote::overriding(wire.clone(), "urn:peer:", "test://peer")
+                .contract_ttl(std::time::Duration::from_secs(3600)),
+        ));
+        let caller = Capability::scoped(["urn:cap:other"]);
+        let doc = "urn:peer:doc";
+
+        // Open: the caller reads, and the mount now holds the open contract.
+        assert_eq!(read_as(&local, doc, &caller).unwrap().bytes, b"doc");
+        assert_eq!((wire.metas(), wire.others()), (1, 1));
+
+        // The peer NARROWS the contract. The local floor still holds the open one and
+        // admits, and the PEER refuses: the caller is never served.
+        rebind(&space, &peer, doc_space(Some(SECRET)));
+        let refused = read_as(&local, doc, &caller);
+        assert!(
+            matches!(&refused, Err(Error::Denied(_))),
+            "a narrowed contract refuses even through a stale memo: {refused:?}"
+        );
+        assert_eq!(
+            (wire.metas(), wire.others()),
+            (1, 2),
+            "the stale contract was used (no re-read) and the peer refused the forward"
+        );
+
+        // That refusal evicted the stale contract: the next read re-reads it, and the
+        // LOCAL floor now refuses without forwarding anything.
+        let refused = read_as(&local, doc, &caller);
+        assert!(matches!(&refused, Err(Error::Denied(_))), "{refused:?}");
+        assert_eq!(
+            (wire.metas(), wire.others()),
+            (2, 2),
+            "re-read once, refused locally, nothing forwarded"
+        );
+        // A caller holding the scope still reads.
+        let holder = Capability::scoped([SECRET]);
+        assert_eq!(read_as(&local, doc, &holder).unwrap().bytes, b"doc");
+
+        // The peer WIDENS it again. Inside the TTL the mount floors on the narrow contract
+        // it holds: the caller is refused here, not served (fail closed).
+        rebind(&space, &peer, doc_space(None));
+        let refused = read_as(&local, doc, &caller);
+        assert!(
+            matches!(&refused, Err(Error::Denied(_))),
+            "a stale narrow contract refuses until the TTL passes: {refused:?}"
+        );
+        assert_eq!(
+            wire.metas(),
+            2,
+            "inside the TTL the contract is not re-read"
+        );
+    }
+
+    /// ★ Ledger #1577: the staleness bound holds. A contract the peer changed is read again
+    /// by the first describe after the TTL, with no enumeration and no refusal to prompt it.
+    #[test]
+    fn a_changed_contract_is_seen_once_the_ttl_has_passed() {
+        let ttl = std::time::Duration::from_millis(200);
+        let (space, peer) = swappable_peer(Some(SECRET));
+        let wire = Counted::over(&peer);
+        let local = Kernel::new(Arc::new(
+            MountedRemote::overriding(wire.clone(), "urn:peer:", "test://peer").contract_ttl(ttl),
+        ));
+        let caller = Capability::scoped(["urn:cap:other"]);
+        assert!(matches!(
+            read_as(&local, "urn:peer:doc", &caller),
+            Err(Error::Denied(_))
+        ));
+        assert_eq!((wire.metas(), wire.others()), (1, 0), "refused locally");
+
+        rebind(&space, &peer, doc_space(None));
+        std::thread::sleep(ttl + std::time::Duration::from_millis(100));
+        assert_eq!(
+            read_as(&local, "urn:peer:doc", &caller).unwrap().bytes,
+            b"doc",
+            "past the TTL the widened contract is read and the caller is served"
+        );
+        assert_eq!((wire.metas(), wire.others()), (2, 1));
+    }
+
+    /// ★ Ledger #1577 beside #1146: `Meta` is the "describe it now" operation and never
+    /// answers from the memo, so a name the peer stopped binding is `Unresolved` at once,
+    /// even while a contract read a moment ago is held for it.
+    #[test]
+    fn a_meta_asks_the_peer_now_even_while_a_contract_is_memoized() {
+        let (space, peer) = swappable_peer(None);
+        let wire = Counted::over(&peer);
+        let local = Kernel::new(Arc::new(
+            MountedRemote::overriding(wire.clone(), "urn:peer:", "test://peer")
+                .contract_ttl(std::time::Duration::from_secs(3600)),
+        ));
+        read_as(&local, "urn:peer:doc", &Capability::root()).unwrap();
+        assert_eq!(wire.metas(), 1);
+
+        rebind(&space, &peer, Arc::new(EndpointSpace::new()));
+        let answer = Resolver::issue_as(&local, meta("urn:peer:doc"), &Capability::root());
+        assert!(
+            matches!(&answer, Err(Error::Unresolved(_))),
+            "an unbound name is Unresolved at once, memo or not: {answer:?}"
+        );
+        assert_eq!(wire.metas(), 2, "the Meta asked the peer");
+    }
+
+    /// The memo is bounded: a template mount reads one name per path, so more names than
+    /// the bound sweep it back below the bound instead of growing without limit, and a name
+    /// put last is still held.
+    #[test]
+    fn the_contract_memo_is_bounded() {
+        let memo = ContractMemo::new(std::time::Duration::from_secs(3600));
+        let description = Description::new("doc").verb(Verb::Source);
+        for n in 0..CONTRACT_MEMO_BOUND * 3 {
+            memo.put(&format!("urn:file:{n}"), &description);
+            assert!(memo.lock().len() <= CONTRACT_MEMO_BOUND, "after {n} puts");
+        }
+        let last = format!("urn:file:{}", CONTRACT_MEMO_BOUND * 3 - 1);
+        assert!(memo.get(&last).is_some(), "the newest contract is held");
     }
 }
