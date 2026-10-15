@@ -2188,4 +2188,82 @@ mod tests {
             "an insufficient one is refused BY THE PEER: {refused:?}"
         );
     }
+
+    /// ★ Ledger #1570: what ledger #92's fix ([`as_held_here`]) costs, and that the kernel
+    /// says so. A mounted answer is `Always` on the mounting side whatever the peer said, so a
+    /// cacheable LOCAL composite over it is recomputed on every read, and `urn:kernel:uncached`
+    /// names why: the mounted read as `declared`, the composite as `dependency <the mounted
+    /// name>`. Before the fix the peer's `Never` crossed, the composite cached, and the second
+    /// read below computed nothing, so neither row existed.
+    ///
+    /// The peer endpoint is PURE on purpose. It is where the rule costs most and buys least
+    /// (nothing on the peer can go stale), so this is the case to see first when a host asks
+    /// why a composite over a mount stopped caching.
+    #[test]
+    fn a_composite_over_a_mounted_read_is_uncached_and_says_why() {
+        use ikigai_core::{AsyncFnEndpoint, Fallback};
+
+        let pure = FnEndpoint::new("pure", |_inv| {
+            Ok(Representation::new(ReprType::new("text/plain"), b"pure".to_vec()).cacheable())
+        });
+        let peer = Arc::new(Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:peer:pure"), pure),
+        )));
+        let over = AsyncFnEndpoint::new("over", |inv: &Invocation<'_>| {
+            Box::pin(async move {
+                let inner = inv.source(&Iri::parse("urn:peer:pure").unwrap()).await?;
+                Ok(Representation::new(ReprType::new("text/plain"), inner.bytes).cacheable())
+            })
+        });
+        let local = Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(EndpointSpace::new().bind(Exact::new("urn:local:over"), over))
+                as Arc<dyn Space>,
+            Arc::new(MountedRemote::overriding(
+                Arc::new(Forwarding(Arc::clone(&peer))),
+                "urn:peer:",
+                "test://peer",
+            )) as Arc<dyn Space>,
+        ])));
+        let read = |kernel: &Kernel, iri: &str| {
+            let request = Request::new(Verb::Source, Iri::parse(iri).unwrap());
+            Resolver::issue_as(kernel, request, &Capability::root())
+                .unwrap_or_else(|error| panic!("{iri}: {error}"))
+                .0
+        };
+
+        // The peer's own answer is cacheable: only the mounting side changes.
+        assert_eq!(read(&peer, "urn:peer:pure").expiry, Expiry::Never);
+        assert_eq!(read(&local, "urn:peer:pure").expiry, Expiry::Always);
+        let first = read(&local, "urn:local:over");
+        assert_eq!(first.bytes, b"pure");
+        assert_eq!(
+            first.expiry,
+            Expiry::Always,
+            "a cacheable composite over a mounted read is no more cacheable than the mount"
+        );
+        read(&local, "urn:local:over");
+
+        let readout = String::from_utf8(read(&local, "urn:kernel:uncached").bytes).unwrap();
+        let row = |name: &str| {
+            readout
+                .lines()
+                .find(|line| line.split_whitespace().next() == Some(name))
+                .unwrap_or_else(|| panic!("no `{name}` row in urn:kernel:uncached:\n{readout}"))
+                .to_string()
+        };
+        let mounted = row("urn:peer:pure");
+        assert!(
+            mounted.contains("declared"),
+            "the mounted read is uncacheable by its own (forwarded) answer: {mounted}"
+        );
+        let composite = row("urn:local:over");
+        assert!(
+            composite.contains("dependency urn:peer:pure"),
+            "the composite names the mounted read as the reason: {composite}"
+        );
+        assert!(
+            composite.contains("×2"),
+            "and it was computed on BOTH reads, not served from the cache: {composite}"
+        );
+    }
 }
