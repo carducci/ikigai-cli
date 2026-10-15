@@ -20,7 +20,10 @@
 //! transport is TLS with the QUIC door's own server certificate, which a client pins.
 //!
 //! **Routes**, GET and POST only (a DELETE that answers with a body is not something every HTTP
-//! client can read, so `take` is a POST that answers 200 with what it took):
+//! client can read, so `take` is a POST that answers 200 with what it took). A HEAD is a GET
+//! that answers with the head alone, as ikigai-web's routed adapter answers it: GET's status and
+//! headers, `Content-Length` GET's length, no content; a refusal to a HEAD is a head alone too,
+//! and a read route's `Allow` names HEAD beside GET (ledger #1593):
 //!
 //! | method | path | resource | default `as` |
 //! | --- | --- | --- | --- |
@@ -109,6 +112,11 @@ fn error_response(e: &Error) -> Response {
     )
 }
 
+/// Whether `method` reads: GET, or HEAD, which is GET answered with the head alone.
+fn is_read(method: &str) -> bool {
+    method == "GET" || method == "HEAD"
+}
+
 /// A layer name as the layer host names them: `[a-z0-9-]`, 1 to 24 characters.
 fn is_layer(name: &str) -> bool {
     (1..=24).contains(&name.len())
@@ -188,7 +196,7 @@ pub fn route(req: &HttpRequest) -> Result<Routed, Response> {
                     // POST is `out`, and POST with `X-HTTP-Method-Override: DELETE` is `take`
                     // (still a POST that answers with the tuple, for a client whose DELETE
                     // cannot read a body).
-                    ["tuples"] if req.method == "GET" => {
+                    ["tuples"] if is_read(&req.method) => {
                         let one = req.query.iter().any(|(k, _)| k == "tuple");
                         let face = if one { LD } else { JSON };
                         ("GET", Verb::Source, at("tuples"), Some(face), None)
@@ -214,10 +222,12 @@ pub fn route(req: &HttpRequest) -> Result<Routed, Response> {
             }
             _ => return Err(not_found()),
         };
-    if req.method != method {
-        // `/tuples` takes both; every other route one.
+    if req.method != method && !(method == "GET" && is_read(&req.method)) {
+        // `/tuples` takes both; every other route one. HEAD rides with GET.
         let allow = if segments.last() == Some(&"tuples") {
-            "GET, POST"
+            "GET, HEAD, POST"
+        } else if method == "GET" {
+            "GET, HEAD"
         } else {
             method
         };
@@ -451,6 +461,8 @@ async fn connection(
         _ => return Ok(()),
     };
     if !admitted {
+        // Written before any request is read, so a HEAD here still gets the 503's content
+        // (ikigai-web's own busy door peeks at the request line first; this one does not).
         let busy =
             refusal(503, "unavailable", "too many connections").with_header("Retry-After", "1");
         return ikigai_web::write_response(&mut tls, busy, &config).await;
@@ -460,10 +472,18 @@ async fn connection(
     };
     // A resolution is synchronous and a feed may wait up to a minute, so it runs on the
     // blocking pool, never on a runtime worker.
+    let method = req.method.clone();
     let answer = tokio::task::spawn_blocking(move || front.answer(&req))
         .await
         .unwrap_or_else(|_| refusal(500, "endpoint", "the front failed answering this request"));
-    ikigai_web::write_response(&mut tls, answer, &config).await?;
+    // The writer refuses a header it cannot write safely (a content type with a CR or LF from
+    // an endpoint, say) and writes nothing; check first, so the client hears a JSON 500 rather
+    // than a dropped connection.
+    let answer = match answer.check() {
+        Ok(()) => answer,
+        Err(why) => refusal(500, "endpoint", &why.to_string()),
+    };
+    ikigai_web::write_answer(&mut tls, &method, answer, &config).await?;
     tls.shutdown().await
 }
 
@@ -675,8 +695,8 @@ mod tests {
         for (method, path, allow) in [
             ("GET", "/layer/talk/say", "POST"),
             ("DELETE", "/layer/tasks/take", "POST"),
-            ("POST", "/layer/talk/entries", "GET"),
-            ("PUT", "/layers/me", "GET"),
+            ("POST", "/layer/talk/entries", "GET, HEAD"),
+            ("PUT", "/layers/me", "GET, HEAD"),
         ] {
             let refused = route(&req(method, path, &[], b"")).unwrap_err();
             assert_eq!(refused.status, 405, "{method} {path}");
@@ -684,6 +704,19 @@ mod tests {
                 .headers
                 .contains(&("Allow".to_string(), allow.to_string())));
         }
+    }
+
+    #[test]
+    fn head_routes_as_get_and_nowhere_else() {
+        let me = route(&req("HEAD", "/layers/me", &[], b"")).unwrap();
+        assert_eq!((me.verb, me.iri.as_str()), (Verb::Source, "urn:layers:me"));
+        let rd = route(&req("HEAD", "/layer/tasks/tuples", &[], b"")).unwrap();
+        assert_eq!((rd.verb, arg(&rd, "as")), (Verb::Source, Some(JSON)));
+        let say = route(&req("HEAD", "/layer/talk/say", &[], b"")).unwrap_err();
+        assert_eq!(say.status, 405);
+        assert!(say
+            .headers
+            .contains(&("Allow".to_string(), "POST".to_string())));
     }
 
     #[test]
@@ -712,7 +745,7 @@ mod tests {
         assert_eq!(put.status, 405);
         assert!(put
             .headers
-            .contains(&("Allow".to_string(), "GET, POST".to_string())));
+            .contains(&("Allow".to_string(), "GET, HEAD, POST".to_string())));
     }
 
     #[test]

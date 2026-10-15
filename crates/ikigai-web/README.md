@@ -107,6 +107,19 @@ content on every path: the adapter's answers, the admission refusal, the push st
 refusals, every framing refusal `read_request` makes (its method is read off the raw request
 line when the rest cannot be parsed), and the busy door's `503`.
 
+### A door with its own router
+
+A door that routes for itself (the layer host's HTTPS front, say) reads with `read_request` and
+answers with `write_response` or `write_answer`, so the parsing, the bounds and the head are
+this crate's in every door. Every header such a door sets on its `Response` is checked before
+a byte is written, the same way an endpoint's are: a name is a token, a value (the content
+type's included) is at most 4096 bytes of visible ASCII, space and tab, and the headers the
+writer owns are refused (`Content-Length`, `Content-Type`, `Connection`, `Transfer-Encoding` and
+the other hop-by-hop headers). A refused response is not written at all: the writer returns an
+`InvalidInput` error carrying the `HeaderRefusal`, and the door decides what the client hears
+(`Response::check` asks first). `write_answer` takes the request's method and answers a `HEAD`
+with the head alone, as the routed adapter does.
+
 ## The mapping
 
 | HTTP | kernel |

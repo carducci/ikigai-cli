@@ -824,6 +824,54 @@ fn no_token_a_revoked_token_and_an_unenrolled_client_are_refused() {
     assert!(!out.status.success());
 }
 
+/// ledger #1593: HEAD is answered the way ikigai-web's routed adapter answers it (cli PR 516):
+/// a read route takes it as GET, with GET's status and headers and `Content-Length` GET's
+/// length, and no content; every refusal to a HEAD (401, 404, 405) is a head alone too. A
+/// read route's `Allow` names HEAD beside GET.
+#[test]
+fn head_is_answered_with_the_head_alone_on_every_path() {
+    let host = host("head");
+    let bob = host.mint(BOB);
+    let get = host.https("GET", "/layers/me", Some(&bob), b"");
+    assert_eq!(get.status, 200);
+    assert!(!get.body.is_empty(), "GET has content");
+    let head = host.https("HEAD", "/layers/me", Some(&bob), b"");
+    assert_eq!(head.status, 200, "{}", head.head);
+    assert!(
+        head.body.is_empty(),
+        "HEAD has no content: {:?}",
+        String::from_utf8_lossy(&head.body)
+    );
+    assert_eq!(
+        head.header("content-length"),
+        Some(get.body.len().to_string()),
+        "{}",
+        head.head
+    );
+    assert_eq!(head.header("content-type"), get.header("content-type"));
+    assert_eq!(head.header("cache-control").as_deref(), Some("no-store"));
+
+    // The refusals: no token, no route, a route that takes POST only.
+    for (path, token, status) in [
+        ("/layers/me", None, 401),
+        ("/layer/talk/nope", Some(bob.as_str()), 404),
+        ("/layer/talk/say", Some(bob.as_str()), 405),
+    ] {
+        let refused = host.https("HEAD", path, token, b"");
+        assert_eq!(refused.status, status, "HEAD {path}: {}", refused.head);
+        assert!(
+            refused.body.is_empty(),
+            "HEAD {path} has no content: {:?}",
+            String::from_utf8_lossy(&refused.body)
+        );
+    }
+    let wrong = host.https("POST", "/layer/talk/entries", Some(&bob), b"");
+    assert_eq!(wrong.status, 405);
+    assert_eq!(wrong.header("allow").as_deref(), Some("GET, HEAD"));
+    let wrong = host.https("PUT", "/layer/tasks/tuples", Some(&bob), b"");
+    assert_eq!(wrong.header("allow").as_deref(), Some("GET, HEAD, POST"));
+}
+
 #[test]
 fn a_race_between_an_http_taker_and_a_quic_taker_has_exactly_one_winner() {
     let host = host("race");
@@ -1188,5 +1236,5 @@ fn an_expecting_client_is_answered_promptly_on_every_route() {
     let wrong = expect_continue(&host, "/layers/me", Some(&bob), message);
     assert!(wrong.waited < prompt, "the 405 waited {:?}", wrong.waited);
     assert_eq!(wrong.last.status, 405);
-    assert_eq!(wrong.last.header("allow").as_deref(), Some("GET"));
+    assert_eq!(wrong.last.header("allow").as_deref(), Some("GET, HEAD"));
 }

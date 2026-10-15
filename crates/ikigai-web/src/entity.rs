@@ -110,8 +110,12 @@ impl EndpointHeader {
     }
 }
 
-/// Why a header an endpoint asked for was refused. Its display text is the body of the `500`
-/// the door answers with.
+/// Why a response header was refused: one an endpoint asked for (its display text is the body
+/// of the `500` the door answers with), or one a door's own code set on a [`Response`] it
+/// handed to [`write_response`] (carried inside the `InvalidInput` error the writer returns).
+///
+/// [`Response`]: crate::Response
+/// [`write_response`]: crate::write_response
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeaderRefusal {
     /// The header's name as the endpoint wrote it (empty when the envelope itself is
@@ -122,7 +126,7 @@ pub struct HeaderRefusal {
 }
 
 impl HeaderRefusal {
-    fn new(header: &str, why: impl Into<String>) -> HeaderRefusal {
+    pub(crate) fn new(header: &str, why: impl Into<String>) -> HeaderRefusal {
         HeaderRefusal {
             header: header.to_string(),
             why: why.into(),
@@ -133,11 +137,11 @@ impl HeaderRefusal {
 impl std::fmt::Display for HeaderRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.header.is_empty() {
-            write!(f, "refused an endpoint's response headers: {}", self.why)
+            write!(f, "refused the response headers: {}", self.why)
         } else {
             write!(
                 f,
-                "refused the endpoint's response header `{}`: {}",
+                "refused the response header `{}`: {}",
                 self.header, self.why
             )
         }
@@ -316,7 +320,7 @@ fn not_allowed(name: &str) -> HeaderRefusal {
 /// A header value is at most [`MAX_HEADER_VALUE`] bytes of visible ASCII, space and tab
 /// (RFC 9110 §5.5 field-content, without obs-text). A CR or LF is refused here, so a value
 /// cannot end its own line and start another header.
-fn check_value(name: &str, value: &str) -> Result<(), HeaderRefusal> {
+pub(crate) fn check_value(name: &str, value: &str) -> Result<(), HeaderRefusal> {
     if value.len() > MAX_HEADER_VALUE {
         return Err(HeaderRefusal::new(
             name,
@@ -334,6 +338,45 @@ fn check_value(name: &str, value: &str) -> Result<(), HeaderRefusal> {
         return Err(HeaderRefusal::new(name, why));
     }
     Ok(())
+}
+
+/// The headers the response writer owns, refused from any caller's list (ledger #1593).
+/// `Content-Length` and `Connection: close` frame every answer and are written by the writer
+/// alone; `Content-Type` is written from the response's own content type, so a second would
+/// make two; and the hop-by-hop headers (RFC 9110 §7.6.1) describe this connection, which the
+/// writer closes after one answer, so none of them can be true when a caller sets it.
+pub(crate) const WRITER_OWNED: [&str; 9] = [
+    "Connection",
+    "Content-Length",
+    "Content-Type",
+    "Keep-Alive",
+    "Proxy-Connection",
+    "TE",
+    "Trailer",
+    "Transfer-Encoding",
+    "Upgrade",
+];
+
+/// One header a door's OWN code sets on a response it writes (ledger #1593): the name is a
+/// `token` and not one the writer owns ([`WRITER_OWNED`]), and the value passes the check an
+/// endpoint's does ([`check_value`]). Unlike an endpoint's, the name need not be on the
+/// [`EndpointHeader`] allowlist: a door sets `Allow`, `WWW-Authenticate`, `Retry-After` and the
+/// like for itself.
+pub(crate) fn check_door_header(name: &str, value: &str) -> Result<(), HeaderRefusal> {
+    if name.is_empty() || !name.bytes().all(is_tchar) {
+        return Err(HeaderRefusal::new(
+            name,
+            "not a header name (empty, or a character a name cannot hold)",
+        ));
+    }
+    if WRITER_OWNED.iter().any(|o| o.eq_ignore_ascii_case(name)) {
+        return Err(HeaderRefusal::new(
+            name,
+            "the response writer sets it itself (framing, the content type, or a hop-by-hop \
+             header); it cannot come from the caller",
+        ));
+    }
+    check_value(name, value)
 }
 
 /// RFC 9110 §5.6.2 `tchar`: what a header name is made of.
