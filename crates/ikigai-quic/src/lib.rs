@@ -2015,6 +2015,91 @@ mod tests {
         );
     }
 
+    /// ★ Ledger #92 over QUIC: a cut on the PEER reaches a read made through a mount. The
+    /// peer's endpoint is cacheable and threaded (`depends_on`); a pure one would pass either
+    /// way. The IPC test of the same name pins the same rule; the rule lives in the mount
+    /// (`ikigai-resolve`), so this one shows it holds whatever carries the call.
+    #[test]
+    fn a_cut_on_the_peer_reaches_a_read_through_the_mount() {
+        use std::sync::Mutex;
+
+        use ikigai_core::{Fallback, Space};
+        use ikigai_resolve::{MountedRemote, Resolver};
+
+        const STATE: &str = "urn:test:state";
+        let value = Arc::new(Mutex::new(b"v1".to_vec()));
+        let cell = {
+            let value = Arc::clone(&value);
+            FnEndpoint::new("cell", move |_inv: &Invocation<'_>| {
+                Ok(
+                    Representation::new(ReprType::new("text/plain"), value.lock().unwrap().clone())
+                        .cacheable()
+                        .depends_on(STATE),
+                )
+            })
+        };
+        let peer = Arc::new(Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:cell"), cell),
+        )));
+
+        let server_id = generate();
+        let client_id = generate();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server_cfg = server_config(
+            &server_id,
+            std::slice::from_ref(&client_id.cert_pem),
+            DEFAULT_IDLE_TIMEOUT,
+        )
+        .unwrap();
+        let rt = Runtime::new().unwrap();
+        let endpoint = rt
+            .block_on(async { quinn::Endpoint::server(server_cfg, addr) })
+            .unwrap();
+        let server_addr = endpoint.local_addr().unwrap();
+        let served = Arc::clone(&peer);
+        let session = Session {
+            capability: Capability::root(),
+            file_segment: String::new(),
+            principal: None,
+        };
+        let server = thread::spawn(move || {
+            rt.block_on(async move {
+                let incoming = endpoint.accept().await.unwrap();
+                let connection = incoming.await.unwrap();
+                serve_connection(&served, connection, &session).await;
+            });
+        });
+        let client = connect(server_addr, &client_id, &server_id.cert_pem).unwrap();
+        let mounting = Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(EndpointSpace::new()) as Arc<dyn Space>,
+            Arc::new(MountedRemote::overriding(
+                Arc::new(client),
+                "urn:test:",
+                format!("quic:{server_addr}"),
+            )) as Arc<dyn Space>,
+        ])));
+        let read = |kernel: &Kernel| {
+            let cell = Request::new(Verb::Source, Iri::parse("urn:test:cell").unwrap());
+            Resolver::issue_as(kernel, cell, &Capability::root())
+                .unwrap()
+                .0
+                .bytes
+        };
+
+        assert_eq!(read(&mounting), b"v1");
+        *value.lock().unwrap() = b"v2".to_vec();
+        peer.cut(STATE);
+        assert_eq!(read(&peer), b"v2", "the peer serves the new state");
+        assert_eq!(
+            read(&mounting),
+            b"v2",
+            "the mounting kernel must not serve a peer answer whose thread the peer has cut"
+        );
+
+        drop(mounting);
+        server.join().unwrap();
+    }
+
     /// A kernel mimicking the file module enough to show wire-side rooting + scoping:
     /// `urn:file:{path}` echoes the (localized) path it received, gated by a prefix ACL
     /// over the session's `urn:cap:fs:read:<segment>` scopes — as ikigai-fs does for real

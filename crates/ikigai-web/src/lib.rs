@@ -1832,8 +1832,10 @@ struct Freshness {
 ///   crate version at startup (the standalone server's `urn:repo:style`) changes its bytes
 ///   across one without any thread being cut — that server shipped `immutable` for `Never`
 ///   and every correct change was invisible short of a hard reload;
-/// - threads do not cross a mount (`serde(skip)`), so an answer from a peer arrives looking
-///   independent of everything.
+/// - threads do not cross a mount (`serde(skip)`), so an answer from a peer arrived looking
+///   independent of everything; since ledger #92 a mount hands its kernel every peer answer
+///   as `Always` instead (`ikigai-resolve`'s `as_held_here`), but a host that serves a peer's
+///   answer by some other route still cannot see the peer's threads.
 ///
 /// `no-cache` is not `no-store`: a cache keeps the bytes and revalidates before reuse, and
 /// against the strong [`etag_of`] validator that is a bodyless `304` for as long as nothing
