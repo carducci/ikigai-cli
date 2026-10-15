@@ -259,7 +259,8 @@ mod tests {
     use std::sync::Arc;
 
     fn kernel(name: &str) -> Kernel {
-        let dir = std::env::temp_dir().join(format!("ikigai-decisions-{name}"));
+        let dir =
+            std::env::temp_dir().join(format!("ikigai-decisions-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Kernel::new(Arc::new(EndpointSpace::new().bind(

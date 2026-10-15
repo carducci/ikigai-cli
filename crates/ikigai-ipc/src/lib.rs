@@ -34,20 +34,64 @@ use ikigai_wire::{
 // depending on ikigai-wire directly.
 pub use ikigai_wire::HelloMode;
 
-/// Run `kernel` as a server on `path` until the listener itself fails: bind
-/// the socket (replacing a stale one), restrict it to `0600`, and serve each
-/// same-user connection on its own thread. Connections from another UID are
-/// refused — defense in depth over the `0700` directory.
+/// Run `kernel` as a server on `path` until the listener itself fails: [`bind`] the socket
+/// (replacing a stale one, restricted to `0600`), then [`serve_on`] it, each same-user
+/// connection on its own thread. Connections from another UID are refused — defense in
+/// depth over the `0700` directory.
 ///
 /// Returns only on a dead listener (`EBADF`, `EINVAL`, …). One connection's accept
 /// error is skipped, and running out of descriptors or threads is backed off and
 /// retried with the episode logged once (ledger #720; see the private `accept`
 /// module) — so a host's socket door does not exit on a transient `EMFILE`.
+///
+/// ⚠ This call does not return while it serves, so it gives no readiness signal: the socket
+/// is bound somewhere inside it. A host that announces the door, or a test that dials it,
+/// binds first with [`bind`] and serves the listener with [`serve_on`] (ledger #1051).
 pub fn serve(kernel: Kernel, path: &Path) -> io::Result<()> {
-    let kernel = Arc::new(kernel);
+    serve_on(kernel, bind(path)?)
+}
+
+/// [`serve`] for a kernel the caller SHARES: one kernel, so one cache and one set of golden
+/// threads, behind this door and whatever else holds the `Arc` (an HTTP face, a file watcher,
+/// another door). A write through one face cuts the threads every other face's readers hang
+/// from, and a read cached through one is a hit through the others (ledger #593). The QUIC
+/// door's counterpart is `ikigai_quic::serve_shared_on`.
+pub fn serve_shared(kernel: Arc<Kernel>, path: &Path) -> io::Result<()> {
+    serve_shared_on(kernel, bind(path)?)
+}
+
+/// Bind the server socket at `path`: remove a stale socket file, bind, and restrict the socket
+/// to `0600`. The listener is LISTENING when this returns, so a client that connects from then
+/// on waits in its backlog until [`serve_on`] accepts it rather than being refused: a host can
+/// announce the door the moment this returns, and a test can dial it without polling
+/// (ledger #1051, #430).
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use ikigai_core::{EndpointSpace, Kernel};
+///
+/// let path = std::path::Path::new("/tmp/ikigai-doc.sock");
+/// let listener = ikigai_ipc::bind(path)?;
+/// eprintln!("serving on {}", path.display()); // true when it prints: the socket is bound
+/// let kernel = Kernel::new(Arc::new(EndpointSpace::new()));
+/// ikigai_ipc::serve_on(kernel, listener)?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn bind(path: &Path) -> io::Result<UnixListener> {
     let _ = std::fs::remove_file(path); // a leftover socket would fail the bind
     let listener = UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
+}
+
+/// [`serve`] on a listener the caller already bound — with [`bind`], which sets the socket's
+/// mode; a listener bound any other way is served with whatever mode its socket has.
+pub fn serve_on(kernel: Kernel, listener: UnixListener) -> io::Result<()> {
+    serve_shared_on(Arc::new(kernel), listener)
+}
+
+/// [`serve_shared`] on a listener the caller already bound (see [`serve_on`]).
+pub fn serve_shared_on(kernel: Arc<Kernel>, listener: UnixListener) -> io::Result<()> {
     let me = own_uid();
     let mut backoff = accept::Backoff::default();
     loop {
@@ -1116,6 +1160,75 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// ledger #1051: [`bind`] is the readiness signal. The socket is bound, `0600` and
+    /// listening when it returns, so a client dials at once, BEFORE the accept loop starts,
+    /// and is served once it does: no poll, no retry.
+    #[test]
+    fn a_bound_listener_takes_a_connection_before_the_server_runs() {
+        let path = socket_path("bind-first");
+        let listener = bind(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the socket is private as soon as it exists");
+
+        // The connection is queued in the backlog; nothing is accepting yet.
+        let dialed = UnixStream::connect(&path).expect("a bound socket takes a connection");
+        drop(dialed);
+
+        thread::spawn(move || {
+            let _ = serve_on(kernel(), listener);
+        });
+        let client = connect(&path).unwrap();
+        assert_eq!(client.issue(upper("ready")).unwrap().0.bytes, b"READY");
+        drop(client);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ledger #593: [`serve_shared`] puts the CALLER's kernel behind the door, so the door and
+    /// the host share one cache. A read through the door is cached on the host's kernel, a cut
+    /// on the host's kernel is a recompute through the door, and the host still holds it.
+    #[test]
+    fn serve_shared_puts_one_kernel_and_one_cache_behind_the_door() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&runs);
+        let counter = FnEndpoint::new("counter", move |_| {
+            let n = counted.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(
+                Representation::new(ReprType::new("text/plain"), n.to_string().into_bytes())
+                    .cacheable(),
+            )
+        });
+        let kernel = Arc::new(Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:counter"), counter),
+        )));
+        let read = || Request::new(Verb::Source, Iri::parse("urn:test:counter").unwrap());
+
+        let path = socket_path("shared");
+        let listener = bind(&path).unwrap();
+        thread::spawn({
+            let kernel = Arc::clone(&kernel);
+            move || {
+                let _ = serve_shared_on(kernel, listener);
+            }
+        });
+        let client = connect(&path).unwrap();
+
+        assert_eq!(client.issue(read()).unwrap().0.bytes, b"1");
+        assert!(
+            kernel.is_cached(&read(), &Capability::root()),
+            "the door's read is in the host's cache"
+        );
+        let (again, status) = client.issue(read()).unwrap();
+        assert_eq!(
+            (again.bytes.as_slice(), status),
+            (&b"1"[..], CacheStatus::Hit)
+        );
+        kernel.cut("urn:test:counter");
+        assert_eq!(client.issue(read()).unwrap().0.bytes, b"2");
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        drop(client);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// ★ A LIMITED name crosses the wire exactly as an unbound one does (ledger #536). The
     /// served surface carves `urn:personal:` out with a `Limit` (`ikigai-embedded`'s
     /// `served_root`), and a boundary that reveals nothing in-process must reveal nothing on
@@ -2025,20 +2138,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Connect once the server thread has bound its socket — polling rather than
-    /// sleeping a guess, but BOUNDED: an unbounded `loop` that never connects is a
-    /// hung CI job with no diagnosis, which is the same class of failure this whole
-    /// change is about.
-    fn connect_when_up(path: &Path) -> IpcResolver {
-        for _ in 0..200 {
-            if let Ok(client) = connect(path) {
-                return client;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        panic!("the test server never came up at {}", path.display());
-    }
-
     /// ★ The case with NO COVERAGE before ledger #404, and the reason it shipped: a peer
     /// that ACCEPTS the connection, completes the version hello, and then answers nothing
     /// at all. A refused connect fails fast and a dead socket fails fast; only *accepted
@@ -2229,14 +2328,12 @@ mod tests {
             let live_path = socket_path("mixed-live");
             let received = Arc::new(AtomicUsize::new(0));
             let server = silent_peer(&silent_path, Arc::clone(&received));
-            let _ = std::fs::remove_file(&live_path);
-            let live = thread::spawn({
-                let live_path = live_path.clone();
-                move || {
-                    let _ = serve(kernel(), &live_path);
-                }
+            // Bound before the server thread starts, so the connect below needs no retry.
+            let listener = bind(&live_path).unwrap();
+            let live = thread::spawn(move || {
+                let _ = serve_on(kernel(), listener);
             });
-            let healthy = connect_when_up(&live_path);
+            let healthy = connect(&live_path).unwrap();
             let silent = connect_with_timeout(&silent_path, Some(Duration::from_secs(30)))
                 .unwrap()
                 .with_describe_timeout(Some(BOUND));
@@ -2511,15 +2608,13 @@ mod tests {
         #[allow(clippy::disallowed_methods)]
         fn a_healthy_enumeration_does_not_pay_a_deadline() {
             let path = socket_path("healthy-enum");
-            let _ = std::fs::remove_file(&path);
-            let server = thread::spawn({
-                let path = path.clone();
-                move || {
-                    let _ = serve(kernel(), &path);
-                }
+            let listener = bind(&path).unwrap();
+            let server = thread::spawn(move || {
+                let _ = serve_on(kernel(), listener);
             });
-            let client =
-                connect_when_up(&path).with_describe_timeout(Some(Duration::from_secs(30)));
+            let client = connect(&path)
+                .unwrap()
+                .with_describe_timeout(Some(Duration::from_secs(30)));
             let mounted = MountedRemote::new(Arc::new(client), "urn:edge:", "ipc:healthy.sock");
 
             let start = std::time::Instant::now();

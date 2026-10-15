@@ -2030,7 +2030,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn kernel_at(sub: &str) -> Kernel {
-        let root = std::env::temp_dir().join("ikigai-intray-test").join(sub);
+        let root = std::env::temp_dir()
+            .join(format!("ikigai-intray-test-{}", std::process::id()))
+            .join(sub);
         let _ = std::fs::remove_dir_all(&root);
         Kernel::new(Arc::new(space(root)))
     }
@@ -2125,7 +2127,7 @@ mod tests {
     #[test]
     fn a_per_space_read_grant_reads_its_own_space_and_no_other() {
         let root = std::env::temp_dir()
-            .join("ikigai-intray-test")
+            .join(format!("ikigai-intray-test-{}", std::process::id()))
             .join("space-per-read");
         let _ = std::fs::remove_dir_all(&root);
         let k = Kernel::new(Arc::new(space(root.clone())));
@@ -2507,7 +2509,9 @@ mod tests {
 
     /// Make a space reactive by writing its handler file, and return the shared root.
     fn reactive_root(sub: &str, space_name: &str, handler: &str) -> PathBuf {
-        let root = std::env::temp_dir().join("ikigai-intray-test").join(sub);
+        let root = std::env::temp_dir()
+            .join(format!("ikigai-intray-test-{}", std::process::id()))
+            .join(sub);
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(space_name)).unwrap();
         std::fs::write(root.join(space_name).join("handler"), handler).unwrap();
@@ -2891,7 +2895,7 @@ mod tests {
     fn a_space_without_a_handler_is_not_reactive() {
         // No handler file → not reactive: the drop stays in the inbox for rd/take.
         let root = std::env::temp_dir()
-            .join("ikigai-intray-test")
+            .join(format!("ikigai-intray-test-{}", std::process::id()))
             .join("react-none");
         let _ = std::fs::remove_dir_all(&root);
         let k = Kernel::new(Arc::new(space(root.clone())));

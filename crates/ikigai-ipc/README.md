@@ -12,6 +12,11 @@ embedded one.
 // server
 ikigai_ipc::serve(kernel, &path)?;        // runs until the listener itself dies (EMFILE is waited out)
 
+// …or bind first, so the door is ready (listening, 0600) before anything announces it
+let listener = ikigai_ipc::bind(&path)?;
+eprintln!("serving on {}", path.display());
+ikigai_ipc::serve_on(kernel, listener)?;  // serve_shared / serve_shared_on take an Arc<Kernel>
+
 // client — an IpcResolver the engine drives like any other Resolver
 let resolver = ikigai_ipc::connect(&path)?;
 let (representation, status) = resolver.issue(request)?;
@@ -36,6 +41,13 @@ Each accepted connection is served on its own thread, answering calls against th
 kernel's own `Resolver` impl until the peer hangs up — so cache status is computed
 exactly as the embedded path computes it, and two clients sharing a server see each
 other's cached results.
+
+`serve` gives no readiness signal: it does not return while it serves, and the socket is
+bound somewhere inside it. A host that prints a banner, or a test that dials the door, calls
+`bind` (which returns a listening socket) and then `serve_on`; a connection made in between
+waits in the backlog. `serve_shared` and `serve_shared_on` take the kernel as an
+`Arc<Kernel>`, so one kernel, and one cache, can sit behind this door and another face (an
+HTTP door, a file watcher) at once, as `ikigai_quic::serve_shared_on` does for QUIC.
 
 ## Two deadlines: patience for work, a bound for self-description
 

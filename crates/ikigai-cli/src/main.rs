@@ -4045,9 +4045,24 @@ fn serve_ipc(path: Option<String>, mounts: Mounts) -> ! {
             }
         }
     }
-    eprintln!("ikigai: serving on {}  (Ctrl-C to stop)", socket.display());
     let kernel = ikigai_embedded::trusted_kernel_with_mounts("Remote (IPC)", resolved);
-    match ikigai_ipc::serve(kernel, &socket) {
+    // BIND BEFORE THE BANNER (ledger #430, #1224; the QUIC and HTTP doors already do): the
+    // banner is the readiness signal every harness and supervisor waits for, and it printed
+    // before the bind, so a client that dialed on it got `No such file or directory` about
+    // half the time. The listener is listening once `bind` returns, so a client that connects
+    // after the banner waits in the backlog until the accept loop takes it.
+    let listener = match ikigai_ipc::bind(&socket) {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!(
+                "ikigai: serve error: could not bind {}: {e}",
+                socket.display()
+            );
+            std::process::exit(1);
+        }
+    };
+    eprintln!("ikigai: serving on {}  (Ctrl-C to stop)", socket.display());
+    match ikigai_ipc::serve_on(kernel, listener) {
         Ok(()) => std::process::exit(0),
         Err(e) => {
             eprintln!("ikigai: serve error: {e}");

@@ -1086,7 +1086,8 @@ mod tests {
     // collide on the credential/window files (a global env var would race across them) — and a
     // configured relying party, which a test that wants none removes with `unconfigure`.
     fn isolate(name: &str) {
-        let dir = std::env::temp_dir().join(format!("ikigai-passkey-ep-{name}"));
+        let dir =
+            std::env::temp_dir().join(format!("ikigai-passkey-ep-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // Private whatever the umask: a workspace others can write is refused (ledger #850).
