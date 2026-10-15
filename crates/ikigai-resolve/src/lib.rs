@@ -422,7 +422,7 @@ impl Endpoint for ForwardingEndpoint {
             return self
                 .resolver
                 .issue_as(self.request.clone(), inv.capability)
-                .map(|(representation, _status)| representation);
+                .map(|(representation, _status)| as_held_here(representation));
         }
         // The local kernel is recording: trace the forward too — install a collector
         // on the resolver so the round-trip goes as a traced call — then hand the
@@ -435,7 +435,7 @@ impl Endpoint for ForwardingEndpoint {
         self.resolver.clear_tracer();
         let (representation, _status) = result?;
         inv.record_subtree(collector.take());
-        Ok(representation)
+        Ok(as_held_here(representation))
     }
 
     fn name(&self) -> &str {
@@ -481,6 +481,38 @@ impl Endpoint for ForwardingEndpoint {
             &reason,
         )
     }
+}
+
+/// A peer's answer as the MOUNTING kernel may hold it: never cacheable here (ledger #92).
+///
+/// ★ **A mounted kernel can learn of a cut on its peer only by asking the peer again.** The
+/// peer's cacheable answer is valid until the peer cuts one of its golden threads: one its
+/// endpoint declared with `depends_on`, one it inherited from a sub-resource, or its own
+/// target's, which every cacheable answer has carried since core 0.1.73. Those cuts happen on
+/// the peer, made by a watcher, by `urn:kernel:cut`, or by a write that reaches the peer by
+/// another route, and nothing crosses back to tell this kernel. Thread NAMES do not cross either
+/// (`Representation::threads` is `serde(skip)`), but carrying them would not change this:
+/// a name this kernel holds is cut only by what happens HERE, and the cuts that matter happen
+/// THERE. So an answer this kernel stored would be served after the peer had moved on, for as
+/// long as this process lives. A long-lived client (`ikigai mcp`, `ikigai serve`, a config-home
+/// mount of gonk's socket) did exactly that until this rule (measured 2026-10-07: a watched
+/// `urn:repo:{root}:tree` read stayed `[cached]` after a file was added under the root).
+///
+/// So the expiry is rewritten to [`Expiry::Always`], whatever the peer said, `Never` and a
+/// time-bounded `At` alike (a deadline bounds staleness, it does not remove it: the peer may cut
+/// before it). What a mounted read costs is then one round trip, to the PEER's cache, which
+/// still holds the answer with its threads and is cut by the peer's own writes and watchers;
+/// a composite over it is uncacheable here too, and `urn:kernel:uncached` lists the mounted
+/// read as `declared` and the composite as `dependency <the mounted name>`. Only the expiry
+/// changes: the bytes, the type and the peer's own cache status are untouched.
+///
+/// ⚠ What this does NOT give is a mounted read that is cached here AND fresh. That needs the
+/// peer's cuts to cross the wire: core's cut listeners (`Kernel::listen`) already report them
+/// on the peer, and a wire call that streamed them to the mounting side, which would cut the
+/// threads it hung its copies on, is the shape. It is a protocol addition, not a fix, and it is
+/// not built.
+fn as_held_here(representation: Representation) -> Representation {
+    representation.with_expiry(Expiry::Always)
 }
 
 /// The description a mounted endpoint gets when its peer's contract could not be read —

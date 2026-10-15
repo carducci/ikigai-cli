@@ -1382,6 +1382,75 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// ★ Ledger #92: a cut on the PEER must reach a read made THROUGH a mount. The peer's
+    /// endpoint is cacheable and hangs from a thread of its own (`depends_on`), which is the
+    /// case that matters: a pure endpoint has no state to go stale, so it would pass either way.
+    /// Before the fix the mounting kernel cached the first answer and served it after the
+    /// peer's state changed and its thread was cut, because threads do not cross the wire and
+    /// nothing on the mounting side could cut the entry.
+    #[test]
+    fn a_cut_on_the_peer_reaches_a_read_through_the_mount() {
+        use ikigai_core::{Fallback, Space};
+        use ikigai_resolve::MountedRemote;
+
+        const STATE: &str = "urn:test:state";
+        let value = Arc::new(Mutex::new(b"v1".to_vec()));
+        let cell = {
+            let value = Arc::clone(&value);
+            FnEndpoint::new("cell", move |_inv| {
+                Ok(
+                    Representation::new(ReprType::new("text/plain"), value.lock().unwrap().clone())
+                        .cacheable()
+                        .depends_on(STATE),
+                )
+            })
+        };
+        let peer = Arc::new(Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:cell"), cell),
+        )));
+
+        let path = socket_path("peer-cut");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let served = Arc::clone(&peer);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_connection(&served, stream);
+        });
+
+        let client = connect(&path).unwrap();
+        let mounting = Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(EndpointSpace::new()) as Arc<dyn Space>,
+            Arc::new(MountedRemote::overriding(
+                Arc::new(client),
+                "urn:test:",
+                format!("ipc:{}", path.display()),
+            )) as Arc<dyn Space>,
+        ])));
+        let read = |kernel: &Kernel| {
+            let cell = Request::new(Verb::Source, Iri::parse("urn:test:cell").unwrap());
+            Resolver::issue_as(kernel, cell, &Capability::root())
+                .unwrap()
+                .0
+                .bytes
+        };
+
+        assert_eq!(read(&mounting), b"v1");
+        *value.lock().unwrap() = b"v2".to_vec();
+        peer.cut(STATE);
+        // Control: the peer itself recomputes after its own cut.
+        assert_eq!(read(&peer), b"v2", "the peer serves the new state");
+        assert_eq!(
+            read(&mounting),
+            b"v2",
+            "the mounting kernel must not serve a peer answer whose thread the peer has cut"
+        );
+
+        drop(mounting);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     // Native-only test: the IPC transport is Unix-domain sockets, unavailable on
     // wasm. The test measures elapsed time to prove the read timeout fires.
