@@ -4,6 +4,7 @@
 
 use ikigai_web::{write_answer, write_response, EdgeConfig, HeaderRefusal, Response};
 use tokio::io::AsyncReadExt;
+use tokio::net::{TcpListener, TcpStream};
 
 /// Write `response` the way `write` does and read back everything that reached the client.
 async fn written<F, Fut>(write: F) -> (std::io::Result<()>, String)
@@ -205,4 +206,49 @@ async fn a_status_it_cannot_write_is_refused_and_nothing_is_written() {
         result.unwrap_or_else(|e| panic!("{status}: {e}"));
         assert!(wire.starts_with(&format!("HTTP/1.1 {status} ")), "{wire}");
     }
+}
+
+/// Ledger #1597: a `204` and a `304` are written with no `Content-Length` (RFC 9110 §8.6), to
+/// GET and to HEAD alike, and read back as raw bytes from a real socket. Every other status
+/// keeps its length, a bodiless `200` its `0` included.
+#[tokio::test]
+async fn a_204_and_a_304_are_written_with_no_content_length() {
+    async fn over_a_socket(method: &'static str, response: Response) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            write_answer(&mut sock, method, response, &EdgeConfig::default()).await
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut out = Vec::new();
+        client.read_to_end(&mut out).await.unwrap();
+        server.await.unwrap().unwrap();
+        String::from_utf8_lossy(&out).into_owned()
+    }
+    for status in [204, 304] {
+        for method in ["GET", "HEAD"] {
+            let response = Response::new(status, "", Vec::new())
+                .with_header("ETag", "\"v1\"")
+                .with_header("Cache-Control", "no-cache");
+            let wire = over_a_socket(method, response).await;
+            assert!(
+                wire.starts_with(&format!("HTTP/1.1 {status} ")),
+                "{method}: {wire}"
+            );
+            assert!(
+                !wire.to_ascii_lowercase().contains("content-length"),
+                "{method} {status}: {wire}"
+            );
+            assert!(wire.contains("\r\nETag: \"v1\"\r\n"), "{wire}");
+            assert!(wire.ends_with("Connection: close\r\n\r\n"), "{wire:?}");
+        }
+    }
+    // `write_response` is the same writer.
+    let (result, wire) = write_one(Response::new(204, "", Vec::new())).await;
+    result.unwrap();
+    assert!(!wire.contains("Content-Length"), "{wire}");
+    // Any other status keeps its length, an empty body's 0 included.
+    let wire = over_a_socket("GET", Response::new(200, "", Vec::new())).await;
+    assert!(wire.contains("\r\nContent-Length: 0\r\n"), "{wire}");
 }

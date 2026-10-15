@@ -342,8 +342,8 @@ pub(crate) fn check_value(name: &str, value: &str) -> Result<(), HeaderRefusal> 
 }
 
 /// The headers the response writer owns, refused from any caller's list (ledger #1593).
-/// `Content-Length` and `Connection: close` frame every answer and are written by the writer
-/// alone; `Content-Type` is written from the response's own content type, so a second would
+/// `Content-Length` and `Connection: close` frame every answer (`Content-Length` on every
+/// status but `204` and `304`, ledger #1597) and are written by the writer alone; `Content-Type` is written from the response's own content type, so a second would
 /// make two; and the hop-by-hop headers (RFC 9110 §7.6.1) describe this connection, which the
 /// writer closes after one answer, so none of them can be true when a caller sets it.
 pub(crate) const WRITER_OWNED: [&str; 9] = [

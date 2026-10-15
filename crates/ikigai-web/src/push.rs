@@ -972,6 +972,11 @@ mod tests {
         .await;
         assert!(post.starts_with("HTTP/1.1 405 "), "{post}");
         assert!(post.contains("Allow: GET, OPTIONS\r\n"), "{post}");
+        // The stream's OPTIONS is a 204, which carries no Content-Length (ledger #1597).
+        let options = roundtrip(addr, "OPTIONS /_ikigai/push HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(options.starts_with("HTTP/1.1 204 "), "{options}");
+        assert!(options.contains("Allow: GET, OPTIONS\r\n"), "{options}");
+        assert!(!options.contains("Content-Length"), "{options}");
     }
 
     /// A `path=` subscription is routed exactly as a request is, so a strict route variable
