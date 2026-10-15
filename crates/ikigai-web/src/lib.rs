@@ -2326,9 +2326,10 @@ fn reason_phrase(status: u16) -> &'static str {
 }
 
 /// A response a door with its own router writes with [`write_response`]: a status, a
-/// content type (empty for none), extra headers and a body. `Content-Length` and
-/// `Connection: close` are always written; one request is served per connection, as the edge
-/// serves them.
+/// content type (empty for none), extra headers and a body. `Connection: close` is always
+/// written, and `Content-Length` on every status but `204` and `304`, which carry no content
+/// and must not claim a length (RFC 9110 §8.6, ledger #1597); one request is served per
+/// connection, as the edge serves them.
 ///
 /// The writer checks every header before it writes a byte ([`Response::check`], ledger #1593):
 /// a name is an RFC 9110 `token`; a value, the content type's included, is at most
@@ -2438,6 +2439,32 @@ impl Response {
 ///
 /// This writes the content whatever the method was. A door answering a `HEAD` writes with
 /// [`write_answer`].
+///
+/// The head frames the content with `Content-Length`, except on a `204` or a `304`, which
+/// carry none and claim no length (RFC 9110 §8.6, ledger #1597):
+///
+/// ```
+/// use ikigai_web::{write_response, EdgeConfig, Response};
+/// use tokio::io::AsyncReadExt;
+///
+/// # #[tokio::main]
+/// # async fn main() {
+/// for (status, length) in [(200, Some("Content-Length: 2")), (204, None), (304, None)] {
+///     let body = if status == 200 { b"hi".to_vec() } else { Vec::new() };
+///     let (mut client, mut server) = tokio::io::duplex(4096);
+///     write_response(&mut server, Response::new(status, "", body), &EdgeConfig::default())
+///         .await
+///         .unwrap();
+///     drop(server);
+///     let mut out = String::new();
+///     client.read_to_string(&mut out).await.unwrap();
+///     match length {
+///         Some(line) => assert!(out.contains(line), "{out}"),
+///         None => assert!(!out.contains("Content-Length"), "{out}"),
+///     }
+/// }
+/// # }
+/// ```
 pub async fn write_response<S: AsyncWrite + Unpin>(
     sock: &mut S,
     response: Response,
@@ -3330,7 +3357,16 @@ async fn write<S: AsyncWrite + Unpin>(sock: &mut S, resp: Resp) -> std::io::Resu
 /// `None` only for a response whose body is delimited by the connection closing — the
 /// event stream ([`push`]), whose length is not known when its head is sent (RFC 9112
 /// §6.3, the last rule: no `Content-Length`, no transfer coding, `Connection: close`).
+///
+/// A `204` or a `304` never carries `Content-Length`, whatever `content_length` says (ledger
+/// #1597). Neither has content, and both end at the blank line (RFC 9112 §6.3, the first rule),
+/// so the header frames nothing; RFC 9110 §8.6 forbids it on a `204` outright, and allows it on
+/// a `304` only as the length a `200` would have carried. This writer omits it on a `304`
+/// rather than send that length: it is optional, a `304` built from an `If-None-Match` hit has
+/// no content to measure, and a wrong one (a `0`, as this used to send) misleads a cache that
+/// updates its stored response from the `304`'s headers. A HEAD of either is the same head.
 fn head_of(resp: &Resp, content_length: Option<usize>) -> String {
+    let content_length = content_length.filter(|_| !matches!(resp.status, 204 | 304));
     let mut head = format!("HTTP/1.1 {} {}\r\n", resp.status, resp.reason);
     if !resp.content_type.is_empty() {
         head.push_str(&format!("Content-Type: {}\r\n", resp.content_type));
@@ -4270,8 +4306,54 @@ mod tests {
             again.starts_with("HTTP/1.1 304 Not Modified"),
             "got: {again}"
         );
-        assert!(again.contains("Content-Length: 0"), "got: {again}");
+        assert!(!again.contains("Content-Length"), "got: {again}");
         assert!(!again.ends_with("hi"), "304 has no body, got: {again}");
+    }
+
+    /// Ledger #1597: a `204` and a `304` carry no `Content-Length` (RFC 9110 §8.6: never on a
+    /// `204`; on a `304` only the length a `200` would carry, and this writer omits it). The
+    /// adapter used to write `Content-Length: 0` on both. Every answer here is read as raw
+    /// bytes off the socket, and each is the head alone.
+    #[tokio::test]
+    async fn a_204_and_a_304_carry_no_content_length() {
+        let addr = start().await;
+        let get = roundtrip(addr, "GET /test/id/hello HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        let etag = etag_of_response(&get);
+        let conditional = |method: &str| {
+            format!("{method} /test/id/hello HTTP/1.1\r\nHost: x\r\nIf-None-Match: {etag}\r\n\r\n")
+        };
+        let answers = [
+            (
+                "DELETE",
+                "204",
+                roundtrip(addr, "DELETE /test/deletable HTTP/1.1\r\nHost: x\r\n\r\n").await,
+            ),
+            (
+                "OPTIONS",
+                "204",
+                roundtrip(addr, "OPTIONS /test/id/hello HTTP/1.1\r\nHost: x\r\n\r\n").await,
+            ),
+            ("GET", "304", roundtrip(addr, &conditional("GET")).await),
+            ("HEAD", "304", roundtrip(addr, &conditional("HEAD")).await),
+        ];
+        for (method, status, resp) in answers {
+            assert!(
+                resp.starts_with(&format!("HTTP/1.1 {status} ")),
+                "{method}: {resp}"
+            );
+            assert!(
+                !resp.to_ascii_lowercase().contains("content-length"),
+                "{method} {status}: {resp}"
+            );
+            assert!(
+                resp.ends_with("\r\n\r\n"),
+                "{method}: the head alone: {resp:?}"
+            );
+        }
+        // The other answers keep their length: a 200, and its HEAD (ledger #118).
+        assert!(get.contains("Content-Length: 2\r\n"), "{get}");
+        let head = roundtrip(addr, "HEAD /test/id/hello HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(head.contains("Content-Length: 2\r\n"), "{head}");
     }
 
     #[tokio::test]
