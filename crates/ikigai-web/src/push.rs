@@ -199,8 +199,8 @@
 //! ```
 
 use crate::{
-    apply_edge_policy, error_resp, head_of, iri_from_path, write_within, EdgeConfig, ErrorBody,
-    HttpRequest, Resp, RouteTable, Shared,
+    apply_edge_policy, error_resp, finish, head_of, iri_from_path, write_within, EdgeConfig,
+    ErrorBody, HttpRequest, Resp, RouteTable, Shared,
 };
 use ikigai_core::{CutBatch, CutEvent, Iri, ListenSpec, CAP_LISTEN, LISTEN_CAPACITY};
 use std::time::Duration;
@@ -426,7 +426,10 @@ pub(crate) async fn stream(
 ) -> std::io::Result<()> {
     let config = &shared.config;
     let wt = config.write_timeout;
-    let refuse = |mut resp: Resp| {
+    // Every refusal below is finished like any other answer: a page for a browser, and the
+    // head alone for HEAD (ledger #117).
+    let refuse = |resp: Resp| {
+        let mut resp = finish(resp, &req);
         apply_edge_policy(&mut resp, config, &req, None);
         resp
     };
@@ -480,7 +483,7 @@ pub(crate) async fn stream(
         content_type: "text/event-stream".to_string(),
         cache_control: Some("no-store".to_string()),
         // What is heard follows the capability, which `CapFn` reads from these.
-        vary: vec!["Authorization", "Cookie"],
+        vary: vec!["Authorization".to_string(), "Cookie".to_string()],
         ..Resp::status(200, "OK")
     };
     // nginx buffers a proxied response unless told otherwise, which would hold every event.

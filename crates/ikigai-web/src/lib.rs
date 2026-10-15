@@ -29,7 +29,14 @@
 //! - **typed error → status**: `Denied`→403, `NotFound`/`Unresolved`→404, invalid/missing
 //!   arg→400, `Conflict`→409, transient→503, else 500. The body is the message as
 //!   `text/plain`, or a typed JSON object (see [`error_json`]) when [`EdgeConfig::error_body`]
-//!   asks for [`ErrorBody::Json`].
+//!   asks for [`ErrorBody::Json`]. A plain-text error is a minimal HTML page for a client that
+//!   asks for `text/html` over `text/plain` (a browser), with `Vary: Accept` either way.
+//! - **response headers from an endpoint**: an endpoint that needs `Set-Cookie`,
+//!   `Cache-Control`, `Vary`, `Content-Disposition` or `Content-Language` answers an
+//!   [`HTTP_ENTITY`] envelope ([`with_headers`]); the door checks each header against a closed
+//!   allowlist ([`EndpointHeader`]) and its own [`EdgeConfig::endpoint_headers`], and refuses
+//!   anything else with `500` naming it.
+//! - **HEAD**: the head GET would carry and no content, on every path, refusals included.
 //! - **a write's answer**: a Sink or Delete whose endpoint answers with a representation is
 //!   `200` with it (a take returns what it took); an empty answer is `204`.
 //! - **server push**: with [`EdgeConfig::push`] set, one `GET` of the push path holds an
@@ -42,7 +49,13 @@
 #![forbid(unsafe_code)]
 
 mod accept;
+mod entity;
+mod error_page;
 pub mod push;
+pub use entity::{
+    with_headers, EndpointHeader, HeaderRefusal, HTTP_ENTITY, MAX_HEADER_BLOCK, MAX_HEADER_LINES,
+    MAX_HEADER_VALUE,
+};
 pub use push::{PushConfig, DEFAULT_PUSH_PATH};
 
 use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request, Verb};
@@ -360,7 +373,17 @@ pub struct EdgeConfig {
     /// [`ErrorBody::Json`] is the typed object [`error_json`] renders, as `application/json`.
     /// The status is the same either way. Refusals the edge makes on its own (`405`, `406`,
     /// `413`, a strict route variable's `400`) carry no kernel error and stay `text/plain`.
+    ///
+    /// Either way, a `text/plain` error body is answered as a minimal HTML page to a client
+    /// that names `text/html` in `Accept` and prefers it to `text/plain` (a browser
+    /// navigating), and every such answer carries `Vary: Accept`. A JSON body is left as it is.
     pub error_body: ErrorBody,
+    /// The response headers this door accepts from an endpoint's [`HTTP_ENTITY`] envelope
+    /// (see [`with_headers`]), out of the closed list [`EndpointHeader::ALL`]. An envelope
+    /// asking for a header not listed here is refused with `500` naming it. Default
+    /// [`EndpointHeader::DEFAULTS`], which leaves out `Set-Cookie`: add it on a door whose
+    /// endpoints mint sessions.
+    pub endpoint_headers: Vec<EndpointHeader>,
 }
 
 /// How a typed kernel error is rendered into a response body. See [`EdgeConfig::error_body`].
@@ -471,6 +494,7 @@ impl Default for EdgeConfig {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             push: None,
             error_body: ErrorBody::Text,
+            endpoint_headers: EndpointHeader::DEFAULTS.to_vec(),
         }
     }
 }
@@ -820,10 +844,29 @@ pub async fn accept_next(listener: &TcpListener) -> std::io::Result<(TcpStream, 
 /// the client reads it (measured: the first version of this test saw `ECONNRESET`, not a
 /// status). So: write, half-close, then drain what the client sent until it hangs up, bounded
 /// by the header deadline and 64 KiB. Holds no permit, so it is bounded by those two alone.
+///
+/// The first line is read BEFORE the answer, under the same deadline as the drain, so a `HEAD`
+/// is answered with the head alone like every other refusal (ledger #117). A client that
+/// sends nothing is answered when the deadline passes, as a request this door never saw.
 async fn refuse_busy(mut sock: TcpStream, config: &EdgeConfig) {
+    let deadline = tokio::time::Instant::now() + config.header_timeout;
+    let mut seen = Vec::new();
+    let first_line = async {
+        let mut tmp = [0u8; 1024];
+        while seen.len() < 64 * 1024 && !seen.contains(&b'\n') {
+            match sock.read(&mut tmp).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => seen.extend_from_slice(&tmp[..n]),
+            }
+        }
+    };
+    let _ = tokio::time::timeout_at(deadline, first_line).await;
     let mut busy = Resp::text(503, "Service Unavailable", "too many connections");
     busy.headers
         .push(("Retry-After".to_string(), "1".to_string()));
+    if is_head(&seen) {
+        busy = busy.into_head();
+    }
     if write_within(&mut sock, busy, config.write_timeout)
         .await
         .is_err()
@@ -833,15 +876,15 @@ async fn refuse_busy(mut sock: TcpStream, config: &EdgeConfig) {
     let _ = sock.shutdown().await;
     let drain = async {
         let mut tmp = [0u8; 1024];
-        let mut seen = 0usize;
-        while seen < 64 * 1024 {
+        let mut drained = seen.len();
+        while drained < 64 * 1024 {
             match sock.read(&mut tmp).await {
                 Ok(0) | Err(_) => break,
-                Ok(n) => seen += n,
+                Ok(n) => drained += n,
             }
         }
     };
-    let _ = tokio::time::timeout(config.header_timeout, drain).await;
+    let _ = tokio::time::timeout_at(deadline, drain).await;
 }
 
 /// The response the adapter builds before writing it to the socket.
@@ -860,7 +903,7 @@ struct Resp {
     /// cache keys a stored response on these, so a missing name lets it hand one client's
     /// answer to another). Kept apart from `headers` so the read path and the edge policy
     /// can both contribute without writing `Vary` twice.
-    vary: Vec<&'static str>,
+    vary: Vec<String>,
     /// Extra headers layered on by the edge policy (security headers, CORS).
     headers: Vec<(String, String)>,
     /// An answer to HEAD: the head GET would carry, `Content-Length` included, and no
@@ -871,6 +914,13 @@ struct Resp {
 }
 
 impl Resp {
+    /// Name one more request header in `Vary`, once whatever its case.
+    fn add_vary(&mut self, name: &str) {
+        if !self.vary.iter().any(|v| v.eq_ignore_ascii_case(name)) {
+            self.vary.push(name.to_string());
+        }
+    }
+
     /// This answer as HEAD sends it: the same status and headers, `Content-Length` the length
     /// of the content GET would send, and no content. The length used to be 0 on every HEAD,
     /// reads included, because each read path emptied its body before the head was written
@@ -1001,20 +1051,20 @@ where
         match tokio::time::timeout(config.header_timeout, read_head(sock, &mut buf)).await {
             Err(_) => {
                 let resp = Resp::text(408, "Request Timeout", "request headers took too long");
-                return refused(sock, resp, wt).await;
+                return refused(sock, resp, &buf, wt).await;
             }
             Ok(read) => match read? {
                 Head::End(pos) => pos,
                 Head::Closed => return Ok(None),
                 Head::TooLarge => {
                     let resp = Resp::text(431, "Request Header Fields Too Large", "");
-                    return refused(sock, resp, wt).await;
+                    return refused(sock, resp, &buf, wt).await;
                 }
             },
         };
     let mut req = match parse_head(&buf[..header_end]) {
         Ok(r) => r,
-        Err(why) => return refused(sock, Resp::text(400, "Bad Request", why), wt).await,
+        Err(why) => return refused(sock, Resp::text(400, "Bad Request", why), &buf, wt).await,
     };
     // THE FRAMING IS SETTLED BEFORE A BODY BYTE IS READ. Everything here decides how much
     // an anonymous client may make this process hold and hand onward, and this door is
@@ -1029,6 +1079,7 @@ where
         return refused(
             sock,
             Resp::text(501, "Not Implemented", "unsupported transfer-encoding"),
+            &buf,
             wt,
         )
         .await;
@@ -1045,6 +1096,7 @@ where
                 return refused(
                     sock,
                     Resp::text(400, "Bad Request", "malformed Content-Length"),
+                    &buf,
                     wt,
                 )
                 .await
@@ -1063,6 +1115,7 @@ where
         return refused(
             sock,
             Resp::text(413, "Payload Too Large", "request body too large"),
+            &buf,
             wt,
         )
         .await;
@@ -1074,6 +1127,7 @@ where
         return refused(
             sock,
             Resp::text(413, "Payload Too Large", "request body too large"),
+            &buf,
             wt,
         )
         .await;
@@ -1119,7 +1173,7 @@ where
     match tokio::time::timeout(config.body_timeout, read_body).await {
         Err(_) => {
             let resp = Resp::text(408, "Request Timeout", "request body took too long");
-            return refused(sock, resp, wt).await;
+            return refused(sock, resp, &buf, wt).await;
         }
         Ok(read) => read?,
     }
@@ -1131,6 +1185,7 @@ where
         return refused(
             sock,
             Resp::text(400, "Bad Request", "incomplete request body"),
+            &buf,
             wt,
         )
         .await;
@@ -1158,12 +1213,30 @@ fn expects_continue(head: &[u8], req: &HttpRequest) -> bool {
 }
 
 /// Write a refusal [`read_request`] decided on, and report that there is no request.
+///
+/// `raw` is whatever of the request arrived. When its method is `HEAD` the refusal is sent
+/// as a head alone (RFC 9110 §9.3.2), even when the rest of the request could not be parsed:
+/// the method is the first token of the first line, and nothing else is needed to know it.
 async fn refused<S: AsyncWrite + Unpin>(
     sock: &mut S,
     resp: Resp,
+    raw: &[u8],
     limit: std::time::Duration,
 ) -> std::io::Result<Option<HttpRequest>> {
+    let resp = if is_head(raw) { resp.into_head() } else { resp };
     write_within(sock, resp, limit).await.map(|()| None)
+}
+
+/// Whether the request that begins `raw` is a `HEAD`: its first token, read the way
+/// [`parse_head`] reads the method (whitespace-separated, case-sensitive as RFC 9110 §9.1
+/// has it), whether or not the rest of the line has arrived.
+fn is_head(raw: &[u8]) -> bool {
+    let line = raw.split(|&b| b == b'\n').next().unwrap_or_default();
+    let mut tokens = line
+        .split(|b| b.is_ascii_whitespace())
+        .filter(|t| !t.is_empty());
+    // A method still arriving ("HEA") is not yet a HEAD; one followed by anything is.
+    tokens.next() == Some(&b"HEAD"[..]) && (tokens.next().is_some() || line.len() > 4)
 }
 
 async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::io::Result<()> {
@@ -1184,7 +1257,7 @@ async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::
     // `?description` face and dispatch alike (ledger #879). Nothing below has run, so a
     // refused request learns nothing about what is behind the door.
     if let Some(refusal) = shared.config.admit_fn.as_ref().and_then(|f| f(&req)) {
-        let mut resp = refusal_resp(&refusal);
+        let mut resp = finish(refusal_resp(&refusal), &req);
         apply_edge_policy(&mut resp, &shared.config, &req, None);
         return write_within(&mut sock, resp, wt).await;
     }
@@ -1196,12 +1269,23 @@ async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::
         }
     }
     let matched = table.match_path(&req.path);
-    let mut resp = respond(&shared, &req, matched.as_ref()).await;
-    if req.method == "HEAD" {
-        resp = resp.into_head();
-    }
+    let mut resp = finish(respond(&shared, &req, matched.as_ref()).await, &req);
     apply_edge_policy(&mut resp, &shared.config, &req, matched.as_ref());
     write_within(&mut sock, resp, wt).await
+}
+
+/// The last word on any answer to a parsed request, whichever path built it: an error body
+/// negotiated as a page or plain text ([`error_page::negotiate`]), then, for `HEAD`, the head
+/// alone ([`Resp::into_head`]). Every path that writes an answer to a request it has parsed
+/// goes through here, so no path has to remember either rule (ledger #117: a refusal written
+/// on its own path sent its body to HEAD).
+fn finish(resp: Resp, req: &HttpRequest) -> Resp {
+    let resp = error_page::negotiate(resp, req.header("accept"));
+    if req.method == "HEAD" {
+        resp.into_head()
+    } else {
+        resp
+    }
 }
 
 /// The core adapter: method → verb (gated by `describe().verbs`), path → iri,
@@ -1347,36 +1431,55 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
     // Sink it issues is THIS request — stamped above with `received`, `client` and
     // `principal` like any other write — with only its content replaced (ledger #520).
     if req.method == "PATCH" {
-        return apply_patch(config, kernel, request, &cap, req).await;
+        let shared = !shaped_by_credentials(shared, req, matched, &cap);
+        return apply_patch(config, kernel, request, &cap, req, shared).await;
     }
 
-    match kernel.issue(request, &cap).await {
+    let answer = kernel.issue(request, &cap).await.map(|repr| {
+        // An endpoint's response headers, when it asked for any (ledger #117). Checked here,
+        // after the endpoint ran: a refused header refuses the ANSWER, never the work, so a
+        // Delete that ran is still remembered below. Whether the credentials shaped the
+        // answer costs a `cap_fn` call, so a write asks only when an envelope may need it.
+        let shared = if verb == Verb::Source || entity::is_entity(&repr) {
+            !shaped_by_credentials(shared, req, matched, &cap)
+        } else {
+            true
+        };
+        open_answer(config, &iri, verb, repr, shared)
+    });
+    match answer {
+        Ok(Err(refused)) if verb == Verb::Delete => {
+            record_tombstone(shared, tombstone_key(&iri_str, req));
+            header_refused(&refused)
+        }
+        Ok(Err(refused)) => header_refused(&refused),
         // Reads project a strong ETag + Cache-Control and honor `If-None-Match` (→304).
-        Ok(repr) if verb == Verb::Source => {
+        Ok(Ok(served)) if verb == Verb::Source => {
+            let repr = &served.repr;
             let freshness = Freshness {
-                self_contained: self_contained(&repr, &iri, declared),
-                shared: !shaped_by_credentials(shared, req, matched, &cap),
+                self_contained: self_contained(repr, &iri, declared),
+                shared: served.shared,
             };
-            let mut vary = Vec::new();
+            let mut vary: Vec<String> = Vec::new();
             // `Accept` selected this face unless the client named it in the URL (`?as=`, which
             // every cache keys on already) or the resource has exactly one face to give.
             if explicit.is_none() && faces.served.len() != 1 {
-                vary.push("Accept");
+                vary.push("Accept".to_string());
             }
             // The headers a capability function reads identity from. The edge cannot see
             // inside `cap_fn`, so it names them whenever `cap_fn` was consulted; a route that
             // pins its capability makes the answer the same for every caller — unless the
             // door named a principal, which it read off the same credentials.
             if matched.and_then(|m| m.cap.as_ref()).is_none() || cap.principal().is_some() {
-                vary.extend(CREDENTIAL_HEADERS.iter().map(|(_, name)| *name));
+                vary.extend(CREDENTIAL_HEADERS.iter().map(|(_, name)| name.to_string()));
             }
-            read_resp(req, repr, freshness, vary)
+            read_resp(req, served, freshness, vary)
         }
-        Ok(repr) if verb == Verb::Delete => {
+        Ok(Ok(served)) if verb == Verb::Delete => {
             record_tombstone(shared, tombstone_key(&iri_str, req));
-            write_resp(verb, repr)
+            write_resp(verb, served)
         }
-        Ok(repr) => write_resp(verb, repr),
+        Ok(Ok(served)) => write_resp(verb, served),
         // A DELETE of an already-absent resource is idempotent (204) within the tombstone
         // window; otherwise it's a genuine 404, carrying the endpoint's own message.
         Err(e @ ikigai_core::Error::NotFound(_)) if verb == Verb::Delete => {
@@ -1489,8 +1592,9 @@ async fn apply_patch(
     sink: Request,
     cap: &Capability,
     req: &HttpRequest,
+    shared: bool,
 ) -> Resp {
-    let iri = &sink.target;
+    let iri = sink.target.clone();
     let ct = req
         .header("content-type")
         .unwrap_or("")
@@ -1512,7 +1616,8 @@ async fn apply_patch(
         .issue(Request::new(Verb::Source, iri.clone()), cap)
         .await
     {
-        Ok(repr) => repr,
+        // The content a read serves, so the patch applies to what the client saw.
+        Ok(repr) => served_content(repr),
         Err(e) => return error_resp(config, &e), // NotFound → 404, Denied → 403
     };
     let patched = match strategy(&current.bytes, &req.body) {
@@ -1524,16 +1629,18 @@ async fn apply_patch(
         ArgRef::Inline(media_type_of(&current).into_bytes()),
     );
     match kernel.issue(sink, cap).await {
-        Ok(repr) if repr.bytes.is_empty() => Resp::status(204, "No Content"),
-        Ok(repr) => {
-            let etag = etag_of(&repr);
-            Resp {
-                content_type: media_type_of(&repr),
-                body: repr.bytes,
-                etag: Some(etag),
-                ..Resp::status(200, "OK")
+        Ok(repr) => match open_answer(config, &iri, Verb::Sink, repr, shared) {
+            Err(refused) => header_refused(&refused),
+            Ok(served) if served.repr.bytes.is_empty() => write_resp(Verb::Sink, served),
+            Ok(served) => {
+                let mut resp = Resp {
+                    etag: Some(etag_of(&served.repr)),
+                    ..Resp::status(200, "OK")
+                };
+                served.answer(&mut resp);
+                resp
             }
-        }
+        },
         Err(e) => error_resp(config, &e),
     }
 }
@@ -1596,7 +1703,7 @@ async fn check_write_precondition(
         .issue(Request::new(Verb::Source, iri.clone()), cap)
         .await
     {
-        Ok(repr) => Some(etag_of(&repr)),
+        Ok(repr) => Some(etag_of(&served_content(repr))),
         Err(ikigai_core::Error::NotFound(_)) => None,
         // Can't read to verify (denied) — surface that rather than guessing.
         Err(ikigai_core::Error::Denied(m)) => {
@@ -1730,13 +1837,9 @@ fn method_not_allowed(allow: String) -> Resp {
 /// `Cache-Control` and the `Vary` that names what selected it; `304 Not Modified` (headers
 /// only, the SAME validator, `Cache-Control` and `Vary`, per RFC 9110 §15.4.5) when
 /// `If-None-Match` matches. A HEAD is answered from this same response (see [`Resp::into_head`]).
-fn read_resp(
-    req: &HttpRequest,
-    repr: ikigai_core::Representation,
-    freshness: Freshness,
-    vary: Vec<&'static str>,
-) -> Resp {
-    let etag = etag_of(&repr);
+fn read_resp(req: &HttpRequest, served: Served, freshness: Freshness, vary: Vec<String>) -> Resp {
+    let repr = &served.repr;
+    let etag = etag_of(repr);
     // Native-only: `ikigai-web` is the inbound HTTP transport (a tokio TcpListener), so it has
     // no wasm build and no kernel handle to take an injected Clock from here. Wall-clock now
     // is what turns an `Expiry::At` deadline into a `max-age` a remote cache counts down.
@@ -1748,35 +1851,166 @@ fn read_resp(
     let cc = Some(cache_control_of(repr.expiry, freshness, now));
     if let Some(inm) = req.header("if-none-match") {
         if if_none_match_hit(inm, &etag) {
-            return Resp {
+            let mut resp = Resp {
                 etag: Some(etag),
                 cache_control: cc,
                 vary,
                 ..Resp::status(304, "Not Modified")
             };
+            served.asked_for(&mut resp);
+            return resp;
         }
     }
-    Resp {
-        content_type: media_type_of(&repr),
-        body: repr.bytes,
+    let mut resp = Resp {
         etag: Some(etag),
         cache_control: cc,
         vary,
         ..Resp::status(200, "OK")
-    }
+    };
+    served.answer(&mut resp);
+    resp
 }
 
 /// A write response: a Sink or Delete returning no body → 204; otherwise 200 with whatever
 /// representation the write produced. A Delete can answer with one (a take returns the thing
 /// it took), and a 204 would discard it.
-fn write_resp(verb: Verb, repr: ikigai_core::Representation) -> Resp {
-    if verb.is_mutating() && repr.bytes.is_empty() {
-        return Resp::status(204, "No Content");
+fn write_resp(verb: Verb, served: Served) -> Resp {
+    let mut resp = if verb.is_mutating() && served.repr.bytes.is_empty() {
+        Resp::status(204, "No Content")
+    } else {
+        Resp::status(200, "OK")
+    };
+    served.answer(&mut resp);
+    resp
+}
+
+/// An endpoint's answer as the door serves it: the content (an [`HTTP_ENTITY`] envelope
+/// opened, anything else as it came), its `Content-Type`, and the response headers it asked
+/// for, already checked.
+struct Served {
+    repr: ikigai_core::Representation,
+    content_type: String,
+    asked: Vec<(EndpointHeader, String)>,
+    /// Any caller would have been handed this answer (see [`shaped_by_credentials`]); when
+    /// false, an endpoint's `Cache-Control` is made `private`.
+    shared: bool,
+}
+
+impl Served {
+    /// Fill `resp` with this answer: its content (none for a `204`, which carries none) and
+    /// every header the endpoint asked for.
+    fn answer(self, resp: &mut Resp) {
+        self.apply(resp, true);
     }
-    Resp {
-        content_type: media_type_of(&repr),
-        body: repr.bytes,
-        ..Resp::status(200, "OK")
+
+    /// Only the headers a `304` repeats (RFC 9110 §15.4.5): `Cache-Control`, `Vary`, and a
+    /// `Set-Cookie`, which is not representation metadata. No content and no content metadata.
+    fn asked_for(self, resp: &mut Resp) {
+        self.apply(resp, false);
+    }
+
+    fn apply(self, resp: &mut Resp, with_content: bool) {
+        if with_content && resp.status != 204 {
+            resp.content_type = self.content_type;
+            resp.body = self.repr.bytes;
+        }
+        for (header, value) in self.asked {
+            match header {
+                EndpointHeader::CacheControl => {
+                    resp.cache_control = Some(if self.shared {
+                        value
+                    } else {
+                        private_cache_control(&value)
+                    });
+                }
+                EndpointHeader::Vary => {
+                    for name in value.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+                        resp.add_vary(name);
+                    }
+                }
+                EndpointHeader::SetCookie => resp.headers.push((header.name().to_string(), value)),
+                EndpointHeader::ContentDisposition | EndpointHeader::ContentLanguage => {
+                    if with_content && resp.status != 204 {
+                        resp.headers.push((header.name().to_string(), value));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Open an endpoint's answer for serving (see [`Served`]). An [`HTTP_ENTITY`] envelope the
+/// door cannot accept is refused (see [`header_refused`]), and logged, because the fault is
+/// the endpoint's and only its operator can fix it.
+fn open_answer(
+    config: &EdgeConfig,
+    iri: &Iri,
+    verb: Verb,
+    mut repr: ikigai_core::Representation,
+    shared: bool,
+) -> Result<Served, HeaderRefusal> {
+    if !entity::is_entity(&repr) {
+        return Ok(Served {
+            content_type: media_type_of(&repr),
+            repr,
+            asked: Vec::new(),
+            shared,
+        });
+    }
+    match entity::open(&mut repr, &config.endpoint_headers, verb.is_mutating()) {
+        Ok(opened) => Ok(Served {
+            repr,
+            content_type: opened.content_type,
+            asked: opened.headers,
+            shared,
+        }),
+        Err(refused) => {
+            eprintln!("ikigai-web: {} ({})", refused, iri.as_str());
+            Err(refused)
+        }
+    }
+}
+
+/// The answer to an endpoint whose response headers the door refused: `500`, naming the
+/// header and why. None of the refused answer is served, its content included.
+fn header_refused(refused: &HeaderRefusal) -> Resp {
+    Resp::text(500, "Internal Server Error", &refused.to_string())
+}
+
+/// The content an answer serves, for computing its validator: an [`HTTP_ENTITY`] envelope
+/// opened (whatever its headers), anything else as it is. So a precondition is checked
+/// against the same `ETag` a read of the resource hands out.
+fn served_content(mut repr: ikigai_core::Representation) -> ikigai_core::Representation {
+    if entity::is_entity(&repr) {
+        // On a refusal `open` leaves `repr` as it was, and the envelope is hashed whole.
+        let _ = entity::open(&mut repr, &EndpointHeader::ALL, true);
+    }
+    repr
+}
+
+/// An endpoint's `Cache-Control` for an answer the request's credentials shaped: `public`
+/// dropped, and `private` added unless it already says `private` or `no-store`. The endpoint
+/// cannot see what the door's capability function made of the credentials; the door can.
+fn private_cache_control(value: &str) -> String {
+    let directives: Vec<&str> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|d| !d.is_empty() && !d.eq_ignore_ascii_case("public"))
+        .collect();
+    let named = |name: &str| {
+        directives.iter().any(|d| {
+            d.split('=')
+                .next()
+                .is_some_and(|n| n.trim().eq_ignore_ascii_case(name))
+        })
+    };
+    if named("private") || named("no-store") {
+        directives.join(", ")
+    } else {
+        std::iter::once("private")
+            .chain(directives)
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -2149,8 +2383,8 @@ fn apply_edge_policy(
     // names it on every response, not only the ones that echo an origin. Naming it only there
     // let a cache store the answer to a same-origin request (no CORS headers) and hand it to
     // a cross-origin one, which the browser then blocks.
-    if !cors.allowed_origins.is_empty() && !resp.vary.contains(&"Origin") {
-        resp.vary.push("Origin");
+    if !cors.allowed_origins.is_empty() {
+        resp.add_vary("Origin");
     }
 
     // CORS: only when the request carries an Origin the (effective) policy allows.

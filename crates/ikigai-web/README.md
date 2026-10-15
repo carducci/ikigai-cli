@@ -57,6 +57,56 @@ there cannot refuse them: `OPTIONS`, the `?description` face and the push stream
 that refused by handing a request an empty capability still disclosed those. `None` (the
 default) admits everything. The doctest on `AdmitFn` pins the behavior.
 
+### Response headers from an endpoint
+
+A kernel `Representation` is a media type and bytes, with nowhere to say "and set this
+cookie". An endpoint that needs a response header answers an **entity envelope** instead: the
+media type `application/vnd.ikigai.http-entity` (`ikigai_web::HTTP_ENTITY`), whose bytes are
+header lines, an empty line, then the content, the shape of a multipart body part.
+`Content-Type` is required and names the content's own type. In Rust, `ikigai_web::with_headers`
+builds one (and keeps the representation's expiry and golden threads); any other language
+writes the same bytes.
+
+```text
+Content-Type: application/json
+Set-Cookie: session=abc; Path=/; HttpOnly; SameSite=Strict
+
+{"signed_in":true}
+```
+
+The door serves the content with those headers, after two checks. The header must be on a
+CLOSED allowlist (`EndpointHeader`), and the door must accept it
+(`EdgeConfig::endpoint_headers`). Anything else is refused with `500` naming the header, never
+dropped: a cookie an endpoint thinks it set and the client never got is a failure nobody would
+see. A value is at most 4096 bytes of visible ASCII, space and tab, so no CR or LF can start a
+header of its own.
+
+| header | merged how |
+|--------|------------|
+| `Cache-Control` | replaces the value the door projects from the answer's expiry; when the request's credentials shaped the answer, `public` is dropped and `private` added |
+| `Vary` | added to the names the door already varies on |
+| `Set-Cookie` | one header per line; only on an answer no cache can hold (a write, or an uncacheable read), and only at a door that adds `EndpointHeader::SetCookie` (it is not in the defaults) |
+| `Content-Disposition`, `Content-Language` | as given; left off a `304` |
+
+Everything else is refused: the hop-by-hop headers and the framing (`Connection`,
+`Transfer-Encoding`, `Content-Length`), and every header the door owns (`ETag`, `Allow`, the
+security and CORS headers). ⚠ The envelope is an HTTP concern carried through a
+transport-neutral kernel, so a CLI `source`, QUIC or MCP caller sees the envelope bytes as they
+are: use it on resources browsers call.
+
+### Errors as pages, and HEAD
+
+Every refusal is a sentence. A client that names `text/html` in `Accept` and prefers it to
+`text/plain` (a browser navigating) gets that sentence as a minimal, accessible HTML page
+(`lang`, a title, a `main` landmark, a heading naming the status, the message escaped, no
+style or script); every other client gets `text/plain` as before. Both carry `Vary: Accept`.
+A door that chose `ErrorBody::Json` keeps JSON.
+
+A `HEAD` is answered with the head GET would carry (its `Content-Length` included) and no
+content on every path: the adapter's answers, the admission refusal, the push stream's
+refusals, every framing refusal `read_request` makes (its method is read off the raw request
+line when the rest cannot be parsed), and the busy door's `503`.
+
 ## The mapping
 
 | HTTP | kernel |
@@ -90,7 +140,8 @@ default) admits everything. The doctest on `AdmitFn` pins the behavior.
   (`name` and `detail` for an invalid argument, `name` for a missing one, `target` for an
   unresolved path, `depth` and `target` for a nesting refusal). `ikigai_web::error_json`
   renders it, so a host can produce the same body elsewhere. Refusals the edge makes on
-  its own (`405`, `406`, `413`, a strict route variable's `400`) stay `text/plain`.
+  its own (`405`, `406`, `413`, a strict route variable's `400`) stay `text/plain`. A
+  `text/plain` body is a page for a browser (see "Errors as pages, and HEAD" above).
 - **A write's answer:** a `PUT`/`POST` or `DELETE` whose endpoint answers with a
   representation is `200` with it — a take returns what it took — and an empty answer
   is `204`.
