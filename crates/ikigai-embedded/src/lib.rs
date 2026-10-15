@@ -8813,55 +8813,111 @@ mod tests {
         );
     }
 
+    /// Touch `name` under `root` OUT OF BAND (not through the kernel) and wait for the watcher
+    /// to cut its thread, observed as the cached read going away. Re-touches every 250 ms,
+    /// because a write that lands before the watch is established is LOST, not delayed (the
+    /// first barrier touch usually is: `watch_root` returns before its thread has called
+    /// `watch()`); a touch is idempotent, so touching again early costs nothing. Gives up at a
+    /// 30 s deadline, because delivery latency under load is unbounded. Answers whether the cut
+    /// was seen.
+    // Native-only test helper: the deadline bounds real FSEvents/inotify delivery, which is
+    // wall-clock time no injected `Clock` can stand in for, so `Instant::now` is the right call.
+    #[allow(clippy::disallowed_methods)]
+    fn wait_for_out_of_band_cut(
+        kernel: &Kernel,
+        root: &Path,
+        name: &str,
+        content: &[u8],
+        cap: &Capability,
+    ) -> bool {
+        use std::time::{Duration, Instant};
+        let read = Request::new(
+            Verb::Source,
+            Iri::parse(format!("urn:file:{name}")).unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            std::fs::write(root.join(name), content).unwrap();
+            let retouch = Instant::now() + Duration::from_millis(250);
+            while Instant::now() < retouch {
+                if !kernel.is_cached(&read, cap) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        false
+    }
+
+    /// Ledger #1509: this used to wait a FIXED 400 ms for the watch to start, and that sleep
+    /// carried two assumptions. (1) The watch is live by then, which load can break (the
+    /// re-touch covered that one). (2) Every event from BEFORE the watch has been delivered by
+    /// then: FSEvents can hand a stream events for writes made just before it started (measured:
+    /// the setup's own `v1` write arrives ~12 ms after `watch()` returns on an idle machine), and
+    /// one landing after the first read cuts it, failing "cached after the first read".
+    ///
+    /// Both are now OBSERVED instead of assumed: a barrier file is cached, touched out of band,
+    /// and the test waits (bounded) until the watcher has cut it. That proves the watch is live,
+    /// and because a stream delivers events in order and the barrier is touched after the setup's
+    /// writes, every earlier event, `notes.txt`'s `v1` included, has been handled by then. Each
+    /// file is touched only in its own phase, so a late duplicate from one phase cannot cut the
+    /// other's read.
     #[test]
     fn the_watcher_cuts_a_thread_on_an_out_of_band_change() {
-        use std::time::Duration;
         let root = std::env::temp_dir().join(format!("ikigai-watch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("notes.txt"), b"v1").unwrap();
+        std::fs::write(root.join("barrier.txt"), b"b").unwrap();
 
         // A cacheable file space over the temp root, with the watcher behind it.
         let kernel = Arc::new(Kernel::new(Arc::new(ikigai_fs::cacheable_space(&root))));
         watch_root(Arc::clone(&kernel), root.clone());
-        std::thread::sleep(Duration::from_millis(400)); // let the watch start
         let cap = Capability::root();
-        let source = || Request::new(Verb::Source, Iri::parse("urn:file:notes.txt").unwrap());
+        let source = |name: &str| {
+            Request::new(
+                Verb::Source,
+                Iri::parse(format!("urn:file:{name}")).unwrap(),
+            )
+        };
+
+        // The barrier: the watch is live and has drained everything before it.
+        assert_eq!(
+            block_on(kernel.issue(source("barrier.txt"), &cap))
+                .unwrap()
+                .bytes,
+            b"b"
+        );
+        assert!(
+            wait_for_out_of_band_cut(&kernel, &root, "barrier.txt", b"b", &cap),
+            "the watch should be live within 30s (the barrier was never cut)"
+        );
 
         // Cache the read.
-        assert_eq!(block_on(kernel.issue(source(), &cap)).unwrap().bytes, b"v1");
+        assert_eq!(
+            block_on(kernel.issue(source("notes.txt"), &cap))
+                .unwrap()
+                .bytes,
+            b"v1"
+        );
         assert!(
-            kernel.is_cached(&source(), &cap),
+            kernel.is_cached(&source("notes.txt"), &cap),
             "cached after the first read"
         );
 
-        // Change the file OUT OF BAND — not through the kernel.
-        std::fs::write(root.join("notes.txt"), b"v2").unwrap();
-
-        // The watcher should cut the thread. Two macOS/fsevents hazards: delivery
-        // latency is unbounded under load, and a write landing before the stream
-        // is fully established is LOST, not delayed (streams start at
-        // kFSEventStreamEventIdSinceNow). So poll with a generous ceiling,
-        // early-exiting the moment the thread is cut, and re-touch the file every
-        // ~2s — each touch is itself an out-of-band change, so a lost first event
-        // doesn't strand the run.
-        let mut cut = false;
-        for tick in 0..300 {
-            if !kernel.is_cached(&source(), &cap) {
-                cut = true;
-                break;
-            }
-            if tick % 20 == 19 {
-                std::fs::write(root.join("notes.txt"), b"v2").unwrap();
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        // Change the file OUT OF BAND, and the watcher cuts the thread.
         assert!(
-            cut,
+            wait_for_out_of_band_cut(&kernel, &root, "notes.txt", b"v2", &cap),
             "watcher should cut the thread within 30s of an out-of-band change"
         );
 
         // A fresh read now sees v2.
-        assert_eq!(block_on(kernel.issue(source(), &cap)).unwrap().bytes, b"v2");
+        assert_eq!(
+            block_on(kernel.issue(source("notes.txt"), &cap))
+                .unwrap()
+                .bytes,
+            b"v2"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
     // ---------- the public booking door: what it offers and what it accepts ----------
