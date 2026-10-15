@@ -181,6 +181,14 @@ quoting:
   content that is ONE quoted token, `sink <iri> \"a note\"`, is unquoted by the same rules
   (stores: a note). To store the quote marks, escape them: `sink <iri> \"\\\"a note\\\"\"`.
 
+stdin (an `ikigai -c` batch whose stdin is not a terminal):
+  stdin is read once, by the first command that wants it: a `sink` given no content (so a
+  secret never reaches the command line), a `delete` given none whose target declares
+  `content`, or a `source` stage with no value and exactly one REQUIRED argument unfilled.
+  The read waits 2s for a first byte, then goes without it and says so on stderr, so a pipe
+  nobody writes (a supervisor's, an agent's) costs 2s. `< /dev/null` answers at once: an
+  empty body for a `sink`, no value for a `source`.
+
 try:
   source urn:iki:fn:toUpper resource-oriented computing
   source urn:demo:echo/hello
