@@ -270,10 +270,10 @@ fn accepted(config: &IntakeConfig) -> Representation {
                  <title>Redirecting\u{2026}</title>\
                  <style>body{{font-family:system-ui,sans-serif;max-width:32rem;margin:20vh auto;\
                  padding:0 1.5rem;text-align:center;line-height:1.5}}a{{color:inherit}}</style>\
-                 </head><body>\
+                 </head><body><main>\
                  <p>Taking you to the confirmation\u{2026}</p>\
                  <p><a href=\"{url}\">Continue</a> if you are not redirected.</p>\
-                 </body></html>"
+                 </main></body></html>"
             );
             Representation::new(
                 ReprType::new("text/html").with_param("charset", "utf-8"),
@@ -936,6 +936,13 @@ mod tests {
         assert_eq!(rep.repr_type.media_type, "text/html");
         let page = String::from_utf8(rep.bytes).unwrap();
         assert!(page.contains("<!doctype html>"), "{page}");
+        // Its language and its one landmark (ledger #1624, ACCESSIBILITY.md).
+        assert!(page.contains("<html lang=\"en\">"), "{page}");
+        assert_eq!(page.matches("<main>").count(), 1, "one main: {page}");
+        assert!(
+            page.contains("<main><p>Taking you to the confirmation"),
+            "the message is inside main: {page}"
+        );
         assert!(
             page.contains(r#"content="0;url=https://bosatsu.net""#),
             "meta refresh to the url: {page}"
