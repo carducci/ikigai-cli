@@ -399,6 +399,17 @@ pub struct Engine {
     /// because writing a file and opening it is a fact about the medium, not the grammar (a
     /// browser frontend draws it inline; a terminal cannot). `None` ⇒ `show` is refused by name.
     viewer: Option<Arc<dyn why::Viewer>>,
+    /// What this host is and how to replace it, named under an unresolved name (ledger #288)
+    /// — the HOST's to supply ([`with_host_build`](Self::with_host_build)), because only the
+    /// binary that IS the kernel knows its own version. `None` ⇒ the message is unchanged.
+    host_build: Option<HostBuild>,
+}
+
+/// The running build and the command that replaces it, for [`Engine::with_host_build`].
+#[derive(Clone, Debug)]
+struct HostBuild {
+    version: String,
+    upgrade: String,
 }
 
 /// The name a temporal corridor is injected under: `urn:ctx:time:` + the instant in canonical
@@ -526,7 +537,34 @@ impl Engine {
             as_of_doors: None,
             scope: RefCell::new(Scope::empty()),
             viewer: None,
+            host_build: None,
         }
+    }
+
+    /// Name this host's build under every unresolved name (ledger #288): `version` is how the
+    /// running binary names itself (`ikigai 0.1.63`) and `upgrade` the command that installs
+    /// a newer one. An unresolved name is most often a name the binary predates, a resource
+    /// added (or renamed) after it was built, and the bare message names the resource, not
+    /// that reason.
+    ///
+    /// ```text
+    /// error: no endpoint resolved for urn:iki:fn:toUpper
+    ///        this host is ikigai 0.1.18; a name newer than this build needs an upgrade: cargo install --locked ikigai-cli
+    /// ```
+    ///
+    /// It does not guess WHICH version introduced the name: that needs an index of names by
+    /// release, which does not exist. Set it only where this process IS the kernel answering:
+    /// a client attached to another host would be naming the wrong build.
+    pub fn with_host_build(
+        mut self,
+        version: impl Into<String>,
+        upgrade: impl Into<String>,
+    ) -> Self {
+        self.host_build = Some(HostBuild {
+            version: version.into(),
+            upgrade: upgrade.into(),
+        });
+        self
     }
 
     /// Enable `as-of=<instant>`: the doors a temporal corridor binds. A line carrying
@@ -2194,7 +2232,7 @@ impl Engine {
     /// no JSON Meta renderer, a target that does not declare the argument — leaves the
     /// message exactly as [`describe`] gives it.
     async fn explain_failure(&self, shape: &RequestShape, error: &ikigai_core::Error) -> String {
-        let text = describe(&*self.resolver, error);
+        let text = describe(&*self.resolver, error, self.host_build.as_ref());
         let (name, missing) = match error {
             ikigai_core::Error::MissingArgument(name) => (name, true),
             ikigai_core::Error::InvalidArgument { name, .. } => (name, false),
@@ -2273,33 +2311,47 @@ impl Engine {
 const SUGGESTION_INDENT: &str = "       ";
 
 /// A resolution failure as a **face** should say it: the typed error's own words,
-/// plus a near-name suggestion when — and only when — the catalog actually binds one.
+/// plus a near-name suggestion when — and only when — the catalog actually binds one, and
+/// then, when the host named its build ([`Engine::with_host_build`]), that build and how to
+/// upgrade it.
 ///
 /// ```text
 /// error: no endpoint resolved for urn:iki:fn:toUpper
 ///        did you mean `urn:fn:toUpper`? (bound here)
+///        this host is ikigai 0.1.18; a name newer than this build needs an upgrade: cargo install --locked ikigai-cli
 /// ```
 ///
 /// [`ikigai_core::Error::Unresolved`] is deliberately untouched — it carries the fact
 /// and nothing else, and its `Display` has no kernel to consult. Enrichment happens
 /// here, where the resolver (and so the catalog) is in hand. With no candidate the
-/// returned string is byte-identical to `error.to_string()`, which is the property
-/// that keeps this from making every error noisier.
-fn describe(resolver: &dyn Resolver, error: &ikigai_core::Error) -> String {
-    let text = error.to_string();
+/// returned string is byte-identical to `error.to_string()` on an engine that named no
+/// build, which is the property that keeps this from making every error noisier. The build
+/// line is one line, and only under an unresolved name.
+fn describe(
+    resolver: &dyn Resolver,
+    error: &ikigai_core::Error,
+    host: Option<&HostBuild>,
+) -> String {
+    let mut text = error.to_string();
     let ikigai_core::Error::Unresolved(iri) = error else {
         return text;
     };
     // Only reached once a resolve has already failed, so the catalog read — a blocking
     // round-trip on a remote resolver — is off every hot path.
-    let Some(entries) = resolver.entries() else {
-        return text;
-    };
-    let patterns: Vec<String> = entries.into_iter().map(|entry| entry.pattern).collect();
-    match suggest::note(iri.as_str(), &patterns) {
-        Some(note) => format!("{text}\n{SUGGESTION_INDENT}{note}"),
-        None => text,
+    if let Some(entries) = resolver.entries() {
+        let patterns: Vec<String> = entries.into_iter().map(|entry| entry.pattern).collect();
+        if let Some(note) = suggest::note(iri.as_str(), &patterns) {
+            text.push_str(&format!("\n{SUGGESTION_INDENT}{note}"));
+        }
     }
+    if let Some(host) = host {
+        text.push_str(&format!(
+            "\n{SUGGESTION_INDENT}this host is {}; a name newer than this build needs an \
+             upgrade: {}",
+            host.version, host.upgrade
+        ));
+    }
+    text
 }
 
 /// What the error path needs from a request it no longer holds: issuing consumes it, and
@@ -3811,6 +3863,45 @@ mod tests {
         ));
         let err = output(engine.eval("source urn:iki:fn:toUpper hi")).unwrap_err();
         assert_eq!(err, "no endpoint resolved for urn:iki:fn:toUpper");
+    }
+
+    /// A host that named its build says it under an unresolved name (ledger #288), after
+    /// the near-name suggestion, whether or not there is one — and an engine that named none
+    /// is unchanged (the two tests above).
+    #[test]
+    fn an_unresolved_name_names_the_host_build_and_its_upgrade() {
+        let broken = FnEndpoint::new("broken", |_inv: &Invocation<'_>| {
+            Err(ikigai_core::Error::Endpoint("boom".to_string()))
+        });
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:fn:toUpper"), echo_endpoint())
+            .bind(Exact::new("urn:test:broken"), broken);
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ))
+        .with_host_build("ikigai 9.9.9", "cargo install --locked ikigai-cli");
+        let build = "       this host is ikigai 9.9.9; a name newer than this build needs an \
+                     upgrade: cargo install --locked ikigai-cli";
+        let err = output(engine.eval("source urn:iki:fn:toUpper hi")).unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "no endpoint resolved for urn:iki:fn:toUpper\n       \
+                 did you mean `urn:fn:toUpper`? (bound here)\n{build}"
+            )
+        );
+        let err = output(engine.eval("source urn:iki:fn:sideways hi")).unwrap_err();
+        assert_eq!(
+            err,
+            format!("no endpoint resolved for urn:iki:fn:sideways\n{build}")
+        );
+        // Only under an unresolved name: another failure is left as it is.
+        let err = output(engine.eval("source urn:test:broken")).unwrap_err();
+        assert!(
+            err.contains("boom") && !err.contains("this host is"),
+            "{err}"
+        );
     }
 
     /// The fan-out path stringifies its branch errors on the REPL thread, after the
