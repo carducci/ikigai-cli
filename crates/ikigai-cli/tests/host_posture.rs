@@ -41,18 +41,6 @@ use std::time::Duration;
 /// against a hang, not a performance assertion.
 const PATIENCE: Duration = Duration::from_secs(90);
 
-/// The two halves of the same patience for the places that POLL rather than block.
-///
-/// ⚠ A count and a gap rather than a deadline, because `Instant::now` is a disallowed
-/// method across this workspace (it compiles for wasm32 and panics at runtime, so the rule
-/// pushes every timestamp through the injected `Clock`). A native-only test could `#[allow]`
-/// it, but the allow would widen to the whole function and silently cover whatever is added
-/// next — and a bounded retry is exact, needs no opt-out, and is the idiom the existing
-/// `a_prefer_mounts_entries_dial_a_live_peer` already uses.
-const TRIES: usize = 1800;
-/// See [`TRIES`]: 1800 × 50ms is [`PATIENCE`].
-const GAP: Duration = Duration::from_millis(50);
-
 /// A child process that is killed when the test ends, whatever the test does. A server
 /// outliving its test would hold a port or a socket for the rest of the run.
 struct Door(Child);
@@ -121,23 +109,19 @@ fn start(home: &Path, args: &[&str], ready: &'static str) -> (Door, String) {
     (door, seen)
 }
 
-/// Wait for an IPC door's socket to appear.
+/// Assert that an IPC door's socket is BOUND the moment its banner has printed (ledger #430).
 ///
-/// ⚠ **The IPC banner is not a readiness signal.** `serve_ipc` prints `serving on <path>`
-/// and then calls `ikigai_ipc::serve`, which is what binds — so a client that raced the
-/// banner got `No such file or directory` roughly half the time. Reported up rather than
-/// changed here: moving a banner is a behavior change for every log and test that reads
-/// one, and the tests in `mount_posture.rs` never connect, so nothing had noticed. (The
-/// HTTP door had the same ordering and no longer does: it binds first, ledger #1223, see
-/// [`bound_port`].)
-fn wait_for_socket(path: &str) {
-    for _ in 0..TRIES {
-        if Path::new(path).exists() {
-            return;
-        }
-        std::thread::sleep(GAP);
-    }
-    panic!("`{path}` was never bound within {PATIENCE:?}");
+/// ★ The banner is the readiness signal. `serve_ipc` used to print `serving on <path>` and
+/// only then call `ikigai_ipc::serve`, which is what bound, so a client that dialed on the
+/// banner got `No such file or directory` roughly half the time, and this file carried a
+/// poller for the socket. The door now binds first (`ikigai_ipc::bind`, then `serve_on`), as
+/// the HTTP and QUIC doors do (ledger #1223, see [`bound_port`]), so this checks once and
+/// never waits: a regression fails here instead of being absorbed by a retry.
+fn assert_bound(path: &str) {
+    assert!(
+        Path::new(path).exists(),
+        "`{path}` must be bound when the banner prints: the banner is the readiness signal"
+    );
 }
 
 /// Ask a serving door for a resource, through the binary's own client. Returns stdout.
@@ -224,7 +208,7 @@ fn a_serving_door_reports_the_mounts_it_composed() {
     let sock = format!("/tmp/iki-hp-{}.sock", std::process::id());
     let _ = std::fs::remove_file(&sock);
     let (_door, banner) = start(&home, &["serve", &sock], "serving on");
-    wait_for_socket(&sock);
+    assert_bound(&sock);
     let text = ask(&home, &sock, "source urn:host:posture");
 
     assert!(text.contains(&format!("door       {sock}")), "{text}");
@@ -286,7 +270,7 @@ fn a_declined_topology_is_reported_as_a_decline_not_as_emptiness() {
     let sock = format!("/tmp/iki-hp-d{}.sock", std::process::id());
     let _ = std::fs::remove_file(&sock);
     let (_door, _) = start(&home, &["serve", &sock, "--no-config-mounts"], "serving on");
-    wait_for_socket(&sock);
+    assert_bound(&sock);
     let text = ask(&home, &sock, "source urn:host:posture");
     assert!(
         text.contains("mount   declined (--no-config-mounts)"),
