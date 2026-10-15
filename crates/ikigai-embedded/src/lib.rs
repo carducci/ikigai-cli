@@ -217,11 +217,24 @@ fn about() -> FnEndpoint {
     )
 }
 
-/// `urn:host:info` — reports the host's *nature* (the `nature` label, set by
-/// whoever composes the kernel: `Embedded (Native)`, `Remote (IPC)`, …) and its
-/// runtime, so `source urn:host:info` shows what differs between the embedded,
-/// IPC, and QUIC situations. Deliberately **uncacheable** — a live host fact, not
-/// a pure function — which also demonstrates the `uncacheable` cache outcome.
+/// `urn:host:info` — reports the host's *nature* and its runtime, so `source urn:host:info`
+/// says which situation answered it. The nature is a label the code that COMPOSES the kernel
+/// passes in, one per situation:
+///
+/// | situation                                   | composed by                                  | nature              |
+/// |---------------------------------------------|----------------------------------------------|---------------------|
+/// | in process: the REPL, `-c`, `--daemon`, MCP | [`kernel`], [`watched_kernel_with_mounts`] … | `Embedded (Native)` |
+/// | a same-user socket: `ikigai serve <path>`   | [`trusted_kernel_with_mounts`]               | `Remote (IPC)`      |
+/// | `ikigai serve quic://…`                     | [`served_kernel_hosting`]                    | `Remote (QUIC)`     |
+/// | `ikigai serve --http …`                     | [`kernel_for_with_mounts`]                   | `Remote (HTTP)`     |
+///
+/// ⚠ A client that `--connect`s to a socket is answered by the SERVING kernel, so it reads
+/// `Remote (IPC)`, never `Embedded (Native)`: the nature describes the kernel that resolved
+/// the read, not the process that asked. (Until ledger #430 the socket door discarded its
+/// label and reported `Embedded (Native)`.) The body is `text/plain`, three indented
+/// `key value` lines under an `ikigai host` heading; `host_info_names_the_nature_it_was_given`
+/// pins it. Deliberately **uncacheable** — a live host fact, not a pure function — which also
+/// demonstrates the `uncacheable` cache outcome.
 fn host_info(nature: &'static str) -> FnEndpoint {
     FnEndpoint::new("host-info", move |_inv: &Invocation<'_>| {
         let runtime = if cfg!(target_family = "wasm") {
@@ -4333,6 +4346,12 @@ fn root_space() -> Arc<dyn Space> {
     root_space_with_mounts(Vec::new())
 }
 
+/// The nature the in-process kernels report through `urn:host:info`: the REPL, `-c`, the
+/// `--daemon` writer and MCP over stdio all run the embedded root in this process. A DOOR
+/// that serves the same root to another process passes its own label to
+/// [`root_space_for`] instead (`serve_ipc` passes `Remote (IPC)`).
+const EMBEDDED_NATURE: &str = "Embedded (Native)";
+
 /// The embedded root space, plus a `MountedRemote` per `(prefix, origin, resolver)`
 /// — each tried after every local space, so a resource the local kernel lacks under
 /// `prefix` forwards to the remote, and the remote's catalog appears re-prefixed and
@@ -4348,7 +4367,15 @@ fn root_space() -> Arc<dyn Space> {
 /// not build stops the process here, with core's message: never a silent fall back to the
 /// default. See [`arrangement`] for why the process EXITS rather than panics.
 fn root_space_with_mounts(mounts: Vec<MountSpec>) -> Arc<dyn Space> {
-    let members = root_members();
+    root_space_for(EMBEDDED_NATURE, mounts)
+}
+
+/// [`root_space_with_mounts`], reporting `nature` through `urn:host:info` (ledger #430). The
+/// root is the same for every caller; only the label differs, because the same embedded root
+/// is served IN process and, by [`trusted_kernel_with_mounts`], over a same-user socket, and
+/// `urn:host:info` exists to tell those situations apart.
+fn root_space_for(nature: &'static str, mounts: Vec<MountSpec>) -> Arc<dyn Space> {
+    let members = root_members(nature);
     let harvest = arrangement::harvest(&members);
     let (arranged, origin): (Arc<dyn Space>, String) = match arrangement::active() {
         None => (
@@ -4512,7 +4539,7 @@ fn lisp_doors() -> Vec<String> {
 
 /// The spaces the embedded root's built-in arrangement is composed of, in resolution order —
 /// and the ONE list the endpoint registry for a declared arrangement is harvested from.
-fn root_members() -> Vec<Arc<dyn Space>> {
+fn root_members(nature: &'static str) -> Vec<Arc<dyn Space>> {
     // The browse family (urn:repo:{root}:tree/file/state/hash/explain/… +
     // urn:iki:annotation:*), opt-in via `browse.root` config lines — see the
     // `browse` module for the grammar. Wired here, before the space list, so
@@ -4541,7 +4568,7 @@ fn root_members() -> Vec<Arc<dyn Space>> {
         None => Arc::new(ikigai_sparql::space()),
     };
     let mut spaces: Vec<Arc<dyn Space>> = vec![
-        Arc::new(local_space("Embedded (Native)")) as Arc<dyn Space>,
+        Arc::new(local_space(nature)) as Arc<dyn Space>,
         Arc::new(http_space()) as Arc<dyn Space>,
         Arc::new(llm_space()) as Arc<dyn Space>,
         // Video-conference scheduling (urn:meeting:schedule + urn:meeting:zoom:schedule). Reads
@@ -6484,12 +6511,11 @@ pub fn trusted_kernel_for(nature: &'static str) -> Kernel {
 /// unachievable while only the REPL and `--daemon` could take mount flags.
 pub fn trusted_kernel_with_mounts(nature: &'static str, mounts: Vec<MountSpec>) -> Kernel {
     start_uptime_clock();
-    let _ = nature;
-    let space = if mounts.is_empty() {
-        root_space()
-    } else {
-        root_space_with_mounts(mounts)
-    };
+    // `nature` is what `urn:host:info` reports on this door (ledger #430). From cli PR 244
+    // (2026-07-29), when this door began serving the FULL root, until ledger #430 it was
+    // discarded and the door reported the root's hard-coded `Embedded (Native)`; before PR 244
+    // it served `local_space(nature)` and reported what it was passed, as this does again.
+    let space = root_space_for(nature, mounts);
     Kernel::with_meta_renderer(with_wire_eval(space), Arc::new(CliRenderer))
         .with_clock(Arc::new(SystemClock))
         .with_subclass_axioms(subclass_axioms())
@@ -6642,6 +6668,65 @@ mod tests {
         // And building the whole local space — the innocuous-looking call — stays inside it.
         let _ = root_space();
         assert!(root.is_dir(), "{root:?}");
+    }
+
+    // --- `urn:host:info` names the situation that answered (ledger #430) ----
+
+    /// Source `urn:host:info` on `kernel` as the owner, as text.
+    fn host_info_of(kernel: &Kernel) -> String {
+        let request = Request::new(Verb::Source, Iri::parse("urn:host:info").unwrap());
+        let answer = block_on(kernel.issue(request, &Capability::root())).expect("host info");
+        String::from_utf8(answer.bytes.to_vec()).expect("utf-8")
+    }
+
+    /// The body's shape, which leaves the process: an `ikigai host` heading over three
+    /// indented `key value` lines, the nature exactly as the composer passed it.
+    #[test]
+    fn host_info_names_the_nature_it_was_given() {
+        let kernel = Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:host:info"), host_info("Odd (Label)")),
+        ));
+        let body = host_info_of(&kernel);
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 4, "{body}");
+        assert_eq!(lines[0], "ikigai host");
+        assert_eq!(lines[1], "  nature    Odd (Label)");
+        assert!(lines[2].starts_with("  runtime   native · "), "{body}");
+        assert!(lines[3].starts_with("  space     "), "{body}");
+    }
+
+    /// ★ The socket door reports the label `serve_ipc` passes, with and without mounts —
+    /// both branches of the composer. Until ledger #430 it discarded the label and said
+    /// `Embedded (Native)`, which is what a `--connect`ed client and the live daemon's
+    /// readers saw.
+    #[test]
+    fn the_ipc_door_reports_the_nature_it_was_given() {
+        let bare = host_info_of(&trusted_kernel_for("Remote (IPC)"));
+        assert!(bare.contains("  nature    Remote (IPC)\n"), "{bare}");
+        assert!(!bare.contains("Embedded"), "{bare}");
+
+        let (spec, _calls) = mount(
+            "urn:elsewhere:",
+            MountKind::Prefer,
+            ikigai_core::Error::Unavailable,
+        );
+        let mounted = host_info_of(&trusted_kernel_with_mounts("Remote (IPC)", vec![spec]));
+        assert!(mounted.contains("  nature    Remote (IPC)\n"), "{mounted}");
+    }
+
+    /// The other faces are unchanged: the in-process kernel still says `Embedded (Native)`,
+    /// and the QUIC and HTTP doors still report the labels they are given.
+    #[test]
+    fn the_other_faces_keep_their_natures() {
+        let embedded = host_info_of(&kernel());
+        assert!(
+            embedded.contains("  nature    Embedded (Native)\n"),
+            "{embedded}"
+        );
+        let quic = host_info_of(&served_kernel("Remote (QUIC)", ServedSurface::default()));
+        assert!(quic.contains("  nature    Remote (QUIC)\n"), "{quic}");
+        let http = host_info_of(&kernel_for("Remote (HTTP)"));
+        assert!(http.contains("  nature    Remote (HTTP)\n"), "{http}");
     }
 
     // --- the `urn:iki:` rename window (ikigai-browse 0.3.0) -----------------
@@ -10300,7 +10385,7 @@ mod arrangement_tests {
 
     /// The built-in arrangement, and the registry harvested from the SAME members.
     fn default_root() -> (Arc<dyn Space>, arrangement::Harvest) {
-        let members = root_members();
+        let members = root_members(EMBEDDED_NATURE);
         let harvest = arrangement::harvest(&members);
         (Arc::new(Fallback::new(members)), harvest)
     }

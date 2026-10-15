@@ -331,3 +331,35 @@ fn the_public_http_door_refuses_posture_and_a_granted_one_serves_it() {
         "{body}"
     );
 }
+
+/// ★ `urn:host:info` names the door that ANSWERED (ledger #430). A `--connect`ed client is
+/// answered by the serving kernel, so it reads `Remote (IPC)`; the same binary resolving in
+/// process reads `Embedded (Native)`; the HTTP door reads `Remote (HTTP)`. Until ledger #430
+/// the socket door discarded the label `serve_ipc` passes and said `Embedded (Native)`, so
+/// this pins `serve_ipc`'s label through the real binary, beside the composer's unit tests in
+/// `ikigai-embedded`.
+#[test]
+fn each_door_names_its_own_nature_in_host_info() {
+    let home = scratch("nature", &[]);
+
+    let sock = format!("/tmp/iki-hn{}.sock", std::process::id());
+    let _ = std::fs::remove_file(&sock);
+    let (_door, _) = start(&home, &["serve", &sock], "serving on");
+    assert_bound(&sock);
+    let remote = ask(&home, &sock, "source urn:host:info");
+    assert!(remote.contains("nature    Remote (IPC)"), "{remote}");
+    assert!(!remote.contains("Embedded"), "{remote}");
+
+    let out = spawn(&home, &["--plain", "-c", "source urn:host:info"])
+        .output()
+        .expect("the binary runs in process");
+    let local = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{local}");
+    assert!(local.contains("nature    Embedded (Native)"), "{local}");
+
+    let (_http, banner) = start(&home, &["serve", "--http", "0"], "serving HTTP on");
+    let (status, body) = get(bound_port(&banner), "/host/info");
+    assert!(status.contains("200"), "{status} {body}");
+    assert!(body.contains("nature    Remote (HTTP)"), "{body}");
+    let _ = std::fs::remove_file(&sock);
+}
