@@ -383,14 +383,19 @@ pub struct CalendarRequest {
 
 /// A small self-contained page. No stylesheet to fetch — this renders on a phone, once,
 /// probably on cellular, and it should not depend on anything else being up.
+///
+/// It states its language and holds its heading and body in one `<main>` (ACCESSIBILITY.md,
+/// ledger #1624). `title` and `body` go in as markup, unescaped: escaping an interpolated value
+/// is the caller's job (see [`show_body`]).
 pub(crate) fn page(title: &str, body: &str) -> Representation {
     Representation::new(
         ReprType::new("text/html").with_param("charset", "utf-8"),
         format!(
-            "<!doctype html><meta name=viewport content=\"width=device-width,initial-scale=1\">\
+            "<!doctype html><html lang=\"en\">\
+             <meta name=viewport content=\"width=device-width,initial-scale=1\">\
              <title>{title}</title>\
              <body style=\"font:16px/1.5 system-ui;margin:3rem auto;max-width:32rem;padding:0 1rem\">\
-             <h1 style=\"font-size:1.3rem\">{title}</h1>{body}"
+             <main><h1 style=\"font-size:1.3rem\">{title}</h1>{body}</main></body></html>"
         )
         .into_bytes(),
     )
@@ -715,6 +720,34 @@ mod tests {
     const NOW: i64 = 1_800_000_000;
     const EXP: i64 = NOW + 600;
 
+    /// Ledger #1624 (ACCESSIBILITY.md): every page the embedded host serves states its language
+    /// (WCAG 3.1.1) and puts its heading and content in ONE `<main>` landmark. The decision,
+    /// contact-block, label and passkey pages all come through [`page`], so pinning it pins them.
+    #[test]
+    fn a_page_states_its_language_and_has_one_main_holding_its_content() {
+        let rep = page("Approve this request?", "<p>the body</p>");
+        let html = String::from_utf8(rep.bytes).unwrap();
+        assert!(
+            html.starts_with("<!doctype html><html lang=\"en\">"),
+            "html lang: {html}"
+        );
+        assert_eq!(html.matches("<html").count(), 1, "{html}");
+        assert_eq!(html.matches("<main>").count(), 1, "one main: {html}");
+        assert_eq!(html.matches("</main>").count(), 1, "{html}");
+        let main = &html[html.find("<main>").unwrap()..html.find("</main>").unwrap()];
+        assert!(
+            main.contains("<h1") && main.contains("<p>the body</p>"),
+            "the heading and the body are inside main: {html}"
+        );
+        assert!(html.ends_with("</main></body></html>"), "{html}");
+        // Still the small self-contained page a phone renders: the viewport and the width cap.
+        assert!(
+            html.contains("width=device-width,initial-scale=1"),
+            "{html}"
+        );
+        assert!(html.contains("max-width:32rem"), "{html}");
+    }
+
     /// Ledger #1516: every value the SHOW page interpolates is escaped, in text and in an
     /// attribute. The shape gate (`id_shaped`, a verified URL-safe signature) keeps markup out of
     /// a link that verifies today; this pins the page so it does not depend on that gate.
@@ -973,6 +1006,9 @@ mod endpoint_tests {
         let (exp, token) = w.valid("approve");
         let html = w.call(Verb::Source, "approve", ID, exp, &token);
         assert!(html.contains("Approve this request?"), "{html}");
+        // The page a phone opens from the email: its language and its one landmark (ledger #1624).
+        assert!(html.contains("<html lang=\"en\">"), "{html}");
+        assert_eq!(html.matches("<main>").count(), 1, "{html}");
         assert!(
             html.contains("method=\"post\""),
             "offers a POST button: {html}"

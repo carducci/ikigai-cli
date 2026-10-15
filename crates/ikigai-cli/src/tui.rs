@@ -19,8 +19,9 @@
 use std::io;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
-use ratatui::style::{Style, Stylize};
+use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs, Wrap};
 use ratatui::{DefaultTerminal, Frame};
@@ -150,6 +151,8 @@ enum ViMotion {
 /// Mutable UI state: the input buffer and cursor, the transcript, and history.
 #[derive(Default)]
 struct State {
+    /// Draw without color: the environment set `NO_COLOR` (see [`no_color_requested`]).
+    no_color: bool,
     input: String,
     /// Byte offset of the cursor within `input`, always on a `char` boundary.
     cursor: usize,
@@ -241,6 +244,7 @@ fn event_loop(
 ) -> io::Result<()> {
     let mut state = State {
         keys,
+        no_color: no_color_requested(std::env::var_os("NO_COLOR").as_deref()),
         ..State::default()
     };
     // The composed topology, at the top of the scrollback. An EMPTY `input` marks it as a
@@ -1191,7 +1195,33 @@ fn clock_spans(clock: &str) -> Vec<Span<'static>> {
     ]
 }
 
+/// Whether the environment asks for no color: `NO_COLOR` present and not empty, whatever its
+/// value (<https://no-color.org>). An empty `NO_COLOR` asks for nothing.
+fn no_color_requested(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| !v.is_empty())
+}
+
+/// Draw one frame, then take the color out of it when [`State::no_color`] is set.
+///
+/// Stripping the drawn buffer, rather than asking every span whether to color itself, keeps the
+/// rule in one place: a span added later cannot forget it. Modifiers stay (bold, dim, and the
+/// reverse that marks the selected tab): `NO_COLOR` forbids color, not emphasis, and no meaning
+/// here is carried by color alone (ACCESSIBILITY.md).
 fn draw(frame: &mut Frame, state: &State) {
+    draw_frame(frame, state);
+    if state.no_color {
+        strip_color(frame.buffer_mut());
+    }
+}
+
+/// Reset every cell's foreground and background to the terminal's own.
+fn strip_color(buf: &mut Buffer) {
+    for cell in &mut buf.content {
+        cell.set_fg(Color::Reset).set_bg(Color::Reset);
+    }
+}
+
+fn draw_frame(frame: &mut Frame, state: &State) {
     // The tab strip is two rows when the demo tabs are shown (core tabs + clock on top,
     // the ~dozen demo tabs wrapped below) — one row otherwise (title + clock).
     let tab_rows = if state.demos.is_empty() { 1 } else { 2 };
@@ -1542,6 +1572,105 @@ mod tests {
     fn render(width: u16, height: u16, state: &State) {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| draw(frame, state)).unwrap();
+    }
+
+    /// The bytes a real terminal would receive for one frame of `state`: drawn on the test
+    /// backend, then written through the crossterm backend the TUI runs on, into a buffer.
+    fn terminal_bytes(state: &State) -> String {
+        use ratatui::backend::{Backend, CrosstermBackend};
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, state)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut bytes = Vec::<u8>::new();
+        {
+            let mut out = CrosstermBackend::new(&mut bytes);
+            let cells = buf.content.iter().enumerate().map(|(i, cell)| {
+                let (x, y) = buf.pos_of(i);
+                (x, y, cell)
+            });
+            out.draw(cells).unwrap();
+            Backend::flush(&mut out).unwrap();
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// The SGR color codes in `bytes` that SET a color (foreground, background or underline,
+    /// basic, bright, 256 or RGB). The resets (39, 49, 59) are not color, and a backend writes
+    /// them when it finishes a frame.
+    fn color_sets(bytes: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        for seq in bytes.split("\x1b[").skip(1) {
+            let Some(params) = seq.split('m').next().filter(|p| seq.len() > p.len()) else {
+                continue;
+            };
+            if !params.chars().all(|c| c.is_ascii_digit() || c == ';') {
+                continue; // not an SGR (a cursor move ends in H, not m)
+            }
+            if params.split(';').any(|p| {
+                matches!(
+                    p.parse::<u16>(),
+                    Ok(30..=38 | 40..=48 | 58 | 90..=97 | 100..=107)
+                )
+            }) {
+                found.push(params.to_string());
+            }
+        }
+        found
+    }
+
+    /// A frame with every colored element on it: the clock, the tab strip, a prompt, output
+    /// and an error.
+    fn a_colorful_state() -> State {
+        let mut state = State {
+            clock: "12:34".into(),
+            ..State::default()
+        };
+        state.transcript.push(Entry {
+            input: "source urn:time:now".into(),
+            result: Ok("12:34".into()),
+            cache: CacheStats::default(),
+        });
+        state.transcript.push(Entry {
+            input: "source urn:nope".into(),
+            result: Err("no endpoint resolved".into()),
+            cache: CacheStats::default(),
+        });
+        state
+    }
+
+    /// Ledger #1624 (ACCESSIBILITY.md): a set, non-empty `NO_COLOR` takes every color escape out
+    /// of what the full-screen REPL writes, and the words that carry the meaning stay.
+    #[test]
+    fn no_color_takes_every_color_escape_out_of_the_frame() {
+        let colored = terminal_bytes(&a_colorful_state());
+        assert!(
+            !color_sets(&colored).is_empty(),
+            "without NO_COLOR the frame is colored, so the check below can see color"
+        );
+
+        let plain = terminal_bytes(&State {
+            no_color: true,
+            ..a_colorful_state()
+        });
+        assert_eq!(color_sets(&plain), Vec::<String>::new(), "{plain:?}");
+        for words in [
+            "ikigai> source urn:time:now",
+            "error: no endpoint resolved",
+            "REPL",
+        ] {
+            assert!(plain.contains(words), "the text stays: {words}");
+        }
+    }
+
+    /// <https://no-color.org>: present and not empty, whatever the value; empty or absent asks
+    /// for nothing.
+    #[test]
+    fn no_color_is_requested_by_a_set_non_empty_variable_only() {
+        use std::ffi::OsStr;
+        assert!(no_color_requested(Some(OsStr::new("1"))));
+        assert!(no_color_requested(Some(OsStr::new("false"))));
+        assert!(!no_color_requested(Some(OsStr::new(""))));
+        assert!(!no_color_requested(None));
     }
 
     /// The startup topology (ledger #418) is a note the HOST wrote, not a line anyone

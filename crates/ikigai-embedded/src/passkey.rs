@@ -560,14 +560,19 @@ pub fn is_enrolled() -> bool {
 /// What a decision page carries: a status line and the shared ceremony script. The page's form
 /// must have `id="act"`; `PASSKEY_APP_JS` wires it — on submit, fetch a challenge, run
 /// `navigator.credentials.get` if enrolled, attach the assertion as `pk_*` fields, submit.
-pub(crate) const DECISION_PASSKEY_JS: &str =
-    "<p id=pkstatus style=\"color:#666\"></p><script src=\"/passkey/app.js\"></script>";
+///
+/// The status line is a polite live region (WCAG 4.1.3, ledger #1624), empty in the served
+/// markup so it exists before the script writes a message into it: a screen reader announces a
+/// change to a region it already knows. `#666` on white is 5.7:1.
+pub(crate) const DECISION_PASSKEY_JS: &str = "<p id=pkstatus role=status aria-live=polite \
+     style=\"color:#666\"></p><script src=\"/passkey/app.js\"></script>";
 
 /// The registration page body: a button (wired by `PASSKEY_APP_JS` via `id="reg"`) that runs
-/// `navigator.credentials.create`, then POSTs the new credential id + its SPKI public key.
+/// `navigator.credentials.create`, then POSTs the new credential id + its SPKI public key. Its
+/// `#status` line is a live region, like [`DECISION_PASSKEY_JS`]'s.
 const REGISTER_PAGE_BODY: &str = r#"<p>Create a passkey for this site — your device will ask you to confirm with Face/Touch ID.</p>
 <button id=reg style="font:inherit;padding:.6rem 1.2rem">Create passkey</button>
-<p id=status style="color:#666"></p>
+<p id=status role=status aria-live=polite style="color:#666"></p>
 <script src="/passkey/app.js"></script>"#;
 
 /// What `/passkey/register` shows on an edge started without `--passkey-rp-id`.
@@ -1069,6 +1074,30 @@ mod tests {
     /// unconfigured case is reachable without racing the configured tests.
     pub(super) fn test_rp() -> Option<RelyingParty> {
         TEST_RP.with(|r| r.borrow().clone())
+    }
+
+    /// Ledger #1624 (ACCESSIBILITY.md, WCAG 4.1.3): the line the ceremony script writes its
+    /// progress and failures into is a polite live region, and it is in the SERVED markup, ahead
+    /// of the script, so it exists before any message is set: a screen reader announces a change
+    /// to a region it already knows, not one inserted with its text.
+    #[test]
+    fn the_passkey_status_lines_are_live_regions_present_before_the_script() {
+        for (id, html) in [
+            ("pkstatus", DECISION_PASSKEY_JS),
+            ("status", REGISTER_PAGE_BODY),
+        ] {
+            let open = format!("<p id={id} role=status aria-live=polite");
+            let at = html
+                .find(&open)
+                .unwrap_or_else(|| panic!("#{id} is a live region: {html}"));
+            let script = html.find("<script").expect("the ceremony script");
+            assert!(at < script, "#{id} precedes the script: {html}");
+            // And it is the element the script writes into: the region and the messages agree.
+            assert!(
+                PASSKEY_APP_JS.contains(&format!("document.getElementById('{id}')")),
+                "the script writes #{id}"
+            );
+        }
     }
 
     const RP_ID: &str = "edge.test";
