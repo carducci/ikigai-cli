@@ -1699,14 +1699,30 @@ impl SpaceReactor {
         match &result {
             // A dead-letter note alongside the tuple, so a failure is inspectable via
             // `rd state=error`.
+            //
+            // A note that cannot be written (disk full, permissions) leaves the tuple in
+            // `error/` with no record of WHY, which is the one thing `rd state=error` exists
+            // to show, so the reason goes to stderr instead of being dropped (ledger #1548).
             Err(msg) => {
-                let _ = std::fs::write(dir.join(format!("{id}.err")), msg);
+                if let Err(e) = std::fs::write(dir.join(format!("{id}.err")), msg) {
+                    eprintln!(
+                        "ikigai-intray: space `{name}`: dead letter {id} has no .err note \
+                         ({e}); it failed with: {msg}"
+                    );
+                }
             }
             // The mirror image: what the handler ANSWERED, beside the handled tuple. This
             // is the difference between "a booking was processed" and knowing what was
-            // decided and whether anyone was told. Empty answers write nothing.
+            // decided and whether anyone was told. Empty answers write nothing. A note that
+            // cannot be written is said on stderr, without the answer itself (which may be
+            // long, and is the handler's to log), so its absence is not mistaken for silence.
             Ok(said) if !said.trim().is_empty() => {
-                let _ = std::fs::write(dir.join(format!("{id}.out")), said);
+                if let Err(e) = std::fs::write(dir.join(format!("{id}.out")), said) {
+                    eprintln!(
+                        "ikigai-intray: space `{name}`: handled tuple {id} has no .out note \
+                         ({e}); its answer was not recorded"
+                    );
+                }
             }
             // Said nothing THIS pass: an answer left by an earlier pass must not stand in
             // for it.

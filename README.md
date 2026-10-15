@@ -491,6 +491,15 @@ The local file module (`urn:file:*`) is jailed to one directory, first match win
 3. `$IKIGAI_FILES`, kept as a fallback;
 4. `~/.ikigai/workspace`.
 
+**A file changed on disk is served fresh, in every mode.** `urn:file:*` reads are cached on a
+golden thread, and a filesystem watcher over the file root cuts that thread when a file changes
+outside ikigai (an editor, a deploy replacing `foaf.xsl`), so the next read recomputes. The REPL
+and `--daemon` have always run it; every `serve` door (IPC, QUIC, `--http`) now starts one per
+process, says `watching <dir>` on stderr before its banner, and needs no restart after a
+workspace edit. A door whose surface binds no `urn:file:` (the calendar-only QUIC surface)
+starts none. Through 0.1.63 the doors ran no watcher and served a replaced file's first-read
+bytes until the process restarted.
+
 ## The spam filter (`ikigai-bayes`)
 
 The local root binds [`ikigai-bayes`](https://github.com/ikigai-rs/ikigai-bayes), a
