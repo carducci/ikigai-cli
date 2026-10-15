@@ -41,6 +41,8 @@ usage:
   ikigai --connect [<target>]  attach the REPL to a kernel server (a Unix path, or quic://host:port)
   ikigai --mount <pfx>=<tgt>   compose a remote kernel at prefix <pfx> (<tgt> = Unix path or quic://host:port)
   ikigai serve [<target>]      run a kernel server (a Unix socket path, or quic://addr to bind)
+                               every door (socket, QUIC, --http) watches the file root, so a
+                               file changed on disk is served fresh, no restart
   ikigai serve <q> --cap <s>   serve under a fixed capability ceiling <s> every client is clamped to
                                (with clients.json below, the OUTER bound each grant narrows within)
   ikigai serve <q>             per-identity authority when ~/.config/ikigai/clients.json enrolls
@@ -3594,12 +3596,18 @@ fn serve_quic(
             // servable, still bounded by require_net to the granted provider hosts.
             llm: surface_caps.iter().any(|c| c.starts_with("urn:cap:net:")),
         };
-        let kernel = ikigai_embedded::served_kernel_hosting(
+        // ONE kernel for both faces (QUIC and the layers HTTPS front): a write through one
+        // must cut the threads the other's readers hang from (`ikigai_quic::serve_shared_on`).
+        let kernel = std::sync::Arc::new(ikigai_embedded::served_kernel_hosting(
             "Remote (QUIC)",
             surface,
             resolved,
             layers.as_ref().map(|hosted| &hosted.host),
-        );
+        ));
+        // And ONE workspace watch for that kernel, started before the banner, so a file
+        // changed on disk is served fresh from the first request (ledger #246). Held to the end
+        // of this closure, which is for as long as the door serves.
+        let _workspace = watch_served_workspace(&kernel);
         let signed_door = ikigai_embedded::code_signers_configured();
         let mut faces = vec![if surface.personal {
             "calendar-only"
@@ -3759,9 +3767,6 @@ fn serve_quic(
         };
         // The transport wants the PEMs; the banner wanted the identities. Same list.
         let pems: Vec<String> = trusted.into_iter().map(|client| client.pem).collect();
-        // ONE kernel for both faces: a write through one must cut the threads the other's
-        // readers hang from (`ikigai_quic::serve_shared_on`).
-        let kernel = std::sync::Arc::new(kernel);
         match (front, front_minter) {
             (Some(front), Some(front_minter)) => {
                 spawn_layers_front(front, std::sync::Arc::clone(&kernel), front_minter)?
@@ -4021,6 +4026,40 @@ fn connect_quic(_target: &str, _certs: &Certs) -> Result<Engine, String> {
     Err("`quic://` needs the `quic` feature".to_string())
 }
 
+/// Start a serving process's ONE workspace watch over its shared kernel, and say so on
+/// stderr: which directory, or why there is none (ledger #246, #1425).
+///
+/// A served kernel binds the cacheable `urn:file:*`, so without a watch a file changed on disk
+/// outside the kernel is served from the cached read until the process restarts. Called once
+/// per door process, after the kernel is shared and before the banner, never per connection.
+/// The returned handle stops the watch when dropped, so the caller holds it while it serves.
+#[cfg(all(
+    feature = "embedded",
+    any(feature = "quic", feature = "web", all(feature = "ipc", unix))
+))]
+fn watch_served_workspace(
+    kernel: &std::sync::Arc<ikigai_core::Kernel>,
+) -> Option<ikigai_embedded::WorkspaceWatch> {
+    match ikigai_embedded::watch_workspace(kernel) {
+        Ok(Some(watch)) => {
+            eprintln!(
+                "ikigai: watching {} (a file changed on disk is served fresh)",
+                watch.root().display()
+            );
+            Some(watch)
+        }
+        // The kernel binds no `urn:file:` (the calendar-only surface): nothing to watch.
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!(
+                "ikigai: warning: workspace watcher not started ({e}); a file changed on disk \
+                 outside ikigai is served stale until restart"
+            );
+            None
+        }
+    }
+}
+
 // --- IPC serve / connect ----------------------------------------------------
 
 #[cfg(all(feature = "embedded", feature = "ipc", unix))]
@@ -4104,7 +4143,13 @@ fn serve_ipc(path: Option<String>, mounts: Mounts) -> ! {
             }
         }
     }
-    let kernel = ikigai_embedded::trusted_kernel_with_mounts("Remote (IPC)", resolved);
+    // Shared, so the door and the workspace watch hold ONE kernel: the watch cuts the threads
+    // this door's cached `urn:file:*` reads hang from (ledger #246).
+    let kernel = std::sync::Arc::new(ikigai_embedded::trusted_kernel_with_mounts(
+        "Remote (IPC)",
+        resolved,
+    ));
+    let _workspace = watch_served_workspace(&kernel);
     // BIND BEFORE THE BANNER (ledger #430, #1224; the QUIC and HTTP doors already do): the
     // banner is the readiness signal every harness and supervisor waits for, and it printed
     // before the bind, so a client that dialed on it got `No such file or directory` about
@@ -4121,7 +4166,7 @@ fn serve_ipc(path: Option<String>, mounts: Mounts) -> ! {
         }
     };
     eprintln!("ikigai: serving on {}  (Ctrl-C to stop)", socket.display());
-    match ikigai_ipc::serve_on(kernel, listener) {
+    match ikigai_ipc::serve_shared_on(kernel, listener) {
         Ok(()) => std::process::exit(0),
         Err(e) => {
             eprintln!("ikigai: serve error: {e}");
@@ -4333,6 +4378,10 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
         "Remote (HTTP)",
         resolved,
     ));
+    // The door's ONE workspace watch: a stylesheet or context replaced on disk is served on
+    // the next request, no unit restart (ledger #246: the edge kept rendering a replaced
+    // `foaf.xsl` until `systemctl restart`). Held for as long as this function serves.
+    let _workspace = watch_served_workspace(&kernel);
     // `--cap` clamps every request to a fixed ceiling — how the public HTTP face is
     // narrowed for the edge (a request can reach only what the ceiling grants). Without
     // it, the public (empty-scope) capability: only cap-free resources resolve.

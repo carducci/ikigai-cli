@@ -1623,6 +1623,10 @@ fn served_space(nature: &'static str) -> EndpointSpace {
     base_space(nature)
         .bind(
             UriTemplate::parse(ikigai_fs::FILE_TEMPLATE).expect("FILE_TEMPLATE is valid"),
+            // Cacheable, so a file changed on disk outside the kernel is seen only through
+            // a watcher cutting its thread: the serving host starts one with
+            // [`watch_workspace`] (ledger #246). A kernel built from this space with no
+            // watch keeps serving the first bytes it read until the process restarts.
             ikigai_fs::FileEndpoint::new(file_root()).cacheable(),
         )
         // The PUBLIC front doors: a contact enquiry and a booking request. These are the
@@ -6163,32 +6167,94 @@ fn derive_every() -> Option<std::time::Duration> {
     (seconds >= 30).then(|| std::time::Duration::from_secs(seconds))
 }
 
-/// Watch `root` recursively; on any out-of-band change, cut `urn:file:<rel>` so the
-/// cached read recomputes. Runs on a detached thread for the process's lifetime; a
-/// watch error disables it silently (caching then invalidates only on
+/// Watch `root` recursively for the REPL's and the daemon's kernel; on any out-of-band
+/// change, cut `urn:file:<rel>` so the cached read recomputes. Kept for the process's
+/// lifetime; a watch error disables it silently (caching then invalidates only on
 /// kernel-mediated writes — still correct for files written through ikigai).
 fn watch_root(kernel: Arc<Kernel>, root: PathBuf) {
-    // Canonicalize so the prefix matches the paths `notify` reports — it resolves
-    // symlinks (notably macOS maps `/var` → `/private/var`), and the relative path
-    // is what becomes the `urn:file:<rel>` thread.
-    let root = root.canonicalize().unwrap_or(root);
-    std::thread::spawn(move || {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut watcher = match notify::recommended_watcher(move |res| {
-            let _ = tx.send(res);
-        }) {
-            Ok(watcher) => watcher,
-            Err(_) => return,
-        };
-        if watcher.watch(&root, RecursiveMode::Recursive).is_err() {
-            return;
-        }
-        // `watcher` is held to the end of this scope, keeping the watch (and the
-        // channel) alive; the loop blocks until the process exits.
-        for event in rx.iter().flatten() {
-            react_to_file_event(&kernel, &root, &event);
-        }
-    });
+    if let Ok(watch) = WorkspaceWatch::start(Arc::downgrade(&kernel), root) {
+        // The REPL and the daemon watch for as long as the process runs, which is what the
+        // detached thread this replaced did; nothing would ever drop the handle earlier.
+        std::mem::forget(watch);
+    }
+}
+
+/// A filesystem watch over a workspace root on behalf of one kernel: on every out-of-band
+/// change under the root (an editor, a deploy replacing a stylesheet, `git checkout`), it
+/// cuts the `urn:file:<rel>` golden thread the change names, so the kernel's cached read of
+/// that file, and every composite over it, recomputes on the next request. A `Sink` through
+/// the kernel already does that for writes it can see; this is the half it cannot.
+///
+/// **Dropping it stops the watch.** It holds the platform watcher (FSEvents / inotify), whose
+/// own thread delivers each change and applies the cut, and it holds the kernel only weakly,
+/// so it neither keeps a kernel alive nor keeps a process (or a test) running. A served
+/// process starts ONE with [`watch_workspace`] and holds it for as long as it serves, however
+/// many doors share that kernel.
+#[must_use = "the watch stops when this is dropped: hold it for as long as the kernel serves"]
+pub struct WorkspaceWatch {
+    /// Canonical, so it prefixes the paths `notify` reports (see [`Self::start`]).
+    root: PathBuf,
+    /// Held for the watch's lifetime: dropping it ends the platform watch.
+    _watcher: notify::RecommendedWatcher,
+}
+
+impl WorkspaceWatch {
+    /// Start watching `root` on `kernel`'s behalf.
+    fn start(kernel: std::sync::Weak<Kernel>, root: PathBuf) -> std::result::Result<Self, String> {
+        // Canonicalize so the prefix matches the paths `notify` reports — it resolves
+        // symlinks (notably macOS maps `/var` → `/private/var`), and the relative path
+        // is what becomes the `urn:file:<rel>` thread.
+        let root = root.canonicalize().unwrap_or(root);
+        let prefix = root.clone();
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            // A watcher error names no path, so there is nothing to cut; a kernel already
+            // dropped has no cache left to invalidate.
+            let (Ok(event), Some(kernel)) = (res, kernel.upgrade()) else {
+                return;
+            };
+            react_to_file_event(&kernel, &prefix, &event);
+        })
+        .map_err(|e| e.to_string())?;
+        watcher
+            .watch(&root, RecursiveMode::Recursive)
+            .map_err(|e| format!("{}: {e}", root.display()))?;
+        Ok(Self {
+            root,
+            _watcher: watcher,
+        })
+    }
+
+    /// The directory being watched, canonical.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
+/// Watch the workspace ([`file_root`]) on behalf of a SERVED kernel, so a file changed on
+/// disk outside the kernel is served fresh on the next request rather than from the cached
+/// read until the process restarts (ledger #246, #1425).
+///
+/// The served constructors ([`kernel_for_with_mounts`], [`served_kernel_hosting`],
+/// [`trusted_kernel_with_mounts`] and their shorter forms) bind the cacheable `urn:file:*`,
+/// whose reads are `.cacheable().depends_on(target)`, and start no watcher themselves: a
+/// constructor is called once per kernel, and a process wants one watcher however many doors
+/// share its kernel and however many kernels a test builds. So the HOST starts one here,
+/// once, after it has shared its kernel, and holds the handle for as long as it serves.
+///
+/// `Ok(None)` when the kernel binds no `urn:file:` at all (the calendar-only QUIC surface):
+/// there is nothing a change could make stale, so no watch is started. `Err` when the
+/// platform watcher cannot start or attach; the kernel still serves correctly for every write
+/// made through it, and the caller should say that out-of-band edits will not be seen.
+///
+/// The watch holds no capability: it only cuts threads, so the door's authority is unchanged.
+pub fn watch_workspace(
+    kernel: &Arc<Kernel>,
+) -> std::result::Result<Option<WorkspaceWatch>, String> {
+    let probe = Iri::parse("urn:file:probe").expect("a valid IRI");
+    if kernel.describe(&probe).is_none() {
+        return Ok(None);
+    }
+    WorkspaceWatch::start(Arc::downgrade(kernel), file_root()).map(Some)
 }
 
 /// What one watcher event cuts on `kernel`: the `urn:file:<rel>` thread of every path it
@@ -8709,6 +8775,45 @@ mod tests {
         assert!(text.contains("A literal `$` is written `$$`."), "{text}");
     }
 
+    /// Ledger #246, #1425: a serving host starts its workspace watch with `watch_workspace`,
+    /// and that starts one only for a kernel that binds `urn:file:` (the HTTP door's does, the
+    /// calendar-only QUIC surface's does not), over the workspace, holding the kernel WEAKLY:
+    /// a watch must neither keep a kernel alive nor keep a process (or a test) running. The
+    /// end-to-end half, a door serving a changed file fresh, is `tests/served_watch.rs` in
+    /// `ikigai-cli`, through the real binary.
+    #[test]
+    fn watch_workspace_starts_only_for_a_kernel_that_binds_files_and_holds_it_weakly() {
+        let door = Arc::new(kernel_for("Test (HTTP)"));
+        let watch = watch_workspace(&door)
+            .expect("the platform watcher starts on the test workspace")
+            .expect("the HTTP door binds urn:file:, so it is watched");
+        assert_eq!(
+            watch.root(),
+            file_root().canonicalize().unwrap(),
+            "the watch is over the workspace the door's file module is jailed to"
+        );
+        assert_eq!(
+            Arc::strong_count(&door),
+            1,
+            "the watch holds the kernel weakly, so dropping the door's handle frees it"
+        );
+        drop(watch);
+
+        let calendar = Arc::new(served_kernel(
+            "Test (QUIC)",
+            ServedSurface {
+                personal: true,
+                ..ServedSurface::default()
+            },
+        ));
+        assert!(
+            watch_workspace(&calendar)
+                .expect("no watcher is attempted")
+                .is_none(),
+            "the calendar-only surface binds no urn:file:, so nothing is watched"
+        );
+    }
+
     #[test]
     fn file_thread_maps_a_changed_path_to_its_urn() {
         let root = Path::new("/ws");
@@ -8927,8 +9032,8 @@ mod tests {
     /// Touch `name` under `root` OUT OF BAND (not through the kernel) and wait for the watcher
     /// to cut its thread, observed as the cached read going away. Re-touches every 250 ms,
     /// because a write that lands before the watch is established is LOST, not delayed (the
-    /// first barrier touch usually is: `watch_root` returns before its thread has called
-    /// `watch()`); a touch is idempotent, so touching again early costs nothing. Gives up at a
+    /// first barrier touch can be: `watch()` has returned, but a stream may not report a write
+    /// made just as it starts); a touch is idempotent, so touching again early costs nothing. Gives up at a
     /// 30 s deadline, because delivery latency under load is unbounded. Answers whether the cut
     /// was seen.
     // Native-only test helper: the deadline bounds real FSEvents/inotify delivery, which is
@@ -8983,7 +9088,9 @@ mod tests {
 
         // A cacheable file space over the temp root, with the watcher behind it.
         let kernel = Arc::new(Kernel::new(Arc::new(ikigai_fs::cacheable_space(&root))));
-        watch_root(Arc::clone(&kernel), root.clone());
+        // Held to the end of the test and dropped there, which stops the watch.
+        let _watch = WorkspaceWatch::start(Arc::downgrade(&kernel), root.clone())
+            .expect("the platform watcher starts on the temp root");
         let cap = Capability::root();
         let source = |name: &str| {
             Request::new(
