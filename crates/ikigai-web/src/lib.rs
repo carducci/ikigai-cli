@@ -863,9 +863,23 @@ struct Resp {
     vary: Vec<&'static str>,
     /// Extra headers layered on by the edge policy (security headers, CORS).
     headers: Vec<(String, String)>,
+    /// An answer to HEAD: the head GET would carry, `Content-Length` included, and no
+    /// content (RFC 9110 §9.3.2). Set once, by [`into_head`](Self::into_head), after the answer
+    /// is complete, so every path that builds a body builds GET's and none has to know the
+    /// method.
+    head_only: bool,
 }
 
 impl Resp {
+    /// This answer as HEAD sends it: the same status and headers, `Content-Length` the length
+    /// of the content GET would send, and no content. The length used to be 0 on every HEAD,
+    /// reads included, because each read path emptied its body before the head was written
+    /// (ledger #118).
+    fn into_head(mut self) -> Resp {
+        self.head_only = true;
+        self
+    }
+
     /// An empty response (no body/headers) with the given status — the base every
     /// constructor fills in.
     fn status(status: u16, reason: &'static str) -> Resp {
@@ -879,6 +893,7 @@ impl Resp {
             cache_control: None,
             vary: Vec::new(),
             headers: Vec::new(),
+            head_only: false,
         }
     }
 
@@ -1182,6 +1197,9 @@ async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::
     }
     let matched = table.match_path(&req.path);
     let mut resp = respond(&shared, &req, matched.as_ref()).await;
+    if req.method == "HEAD" {
+        resp = resp.into_head();
+    }
     apply_edge_policy(&mut resp, &shared.config, &req, matched.as_ref());
     write_within(&mut sock, resp, wt).await
 }
@@ -1237,12 +1255,7 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
             .as_ref()
             .map(|d| offered_actions(kernel, &iri, d, &cap))
             .unwrap_or_default();
-        return describe_response(
-            described.as_ref(),
-            &offered,
-            &req.path,
-            req.method == "HEAD",
-        );
+        return describe_response(described.as_ref(), &offered, &req.path);
     }
 
     if req.method == "OPTIONS" {
@@ -1716,7 +1729,7 @@ fn method_not_allowed(allow: String) -> Resp {
 /// A read response: 200 with the representation + a strong `ETag`, the projected
 /// `Cache-Control` and the `Vary` that names what selected it; `304 Not Modified` (headers
 /// only, the SAME validator, `Cache-Control` and `Vary`, per RFC 9110 §15.4.5) when
-/// `If-None-Match` matches; HEAD carries the same headers with no body.
+/// `If-None-Match` matches. A HEAD is answered from this same response (see [`Resp::into_head`]).
 fn read_resp(
     req: &HttpRequest,
     repr: ikigai_core::Representation,
@@ -1743,10 +1756,9 @@ fn read_resp(
             };
         }
     }
-    let head_only = req.method == "HEAD";
     Resp {
         content_type: media_type_of(&repr),
-        body: if head_only { Vec::new() } else { repr.bytes },
+        body: repr.bytes,
         etag: Some(etag),
         cache_control: cc,
         vary,
@@ -2522,23 +2534,17 @@ fn describe_response(
     desc: Option<&ikigai_core::Description>,
     offered: &[ikigai_core::ActionSpec],
     path: &str,
-    head_only: bool,
 ) -> Resp {
     let projectable = offered
         .iter()
         .any(|a| matches!(a.verb, Verb::Source | Verb::Sink | Verb::Delete));
     let Some(desc) = desc.filter(|_| projectable) else {
-        let mut resp = Resp::text(404, "Not Found", "no such resource to describe");
-        // HEAD carries no body on the refusal either; `Resp::text` does not know the method.
-        if head_only {
-            resp.body.clear();
-        }
-        return resp;
+        return Resp::text(404, "Not Found", "no such resource to describe");
     };
     let body = serde_json::to_vec_pretty(&openapi_of(desc, offered, path)).unwrap_or_default();
     Resp {
         content_type: "application/vnd.oai.openapi+json; charset=utf-8".to_string(),
-        body: if head_only { Vec::new() } else { body },
+        body,
         etag: None,
         ..Resp::status(200, "OK")
     }
@@ -2919,7 +2925,9 @@ async fn write_within<S: AsyncWrite + Unpin>(
 async fn write<S: AsyncWrite + Unpin>(sock: &mut S, resp: Resp) -> std::io::Result<()> {
     let head = head_of(&resp, Some(resp.body.len()));
     sock.write_all(head.as_bytes()).await?;
-    sock.write_all(&resp.body).await?;
+    if !resp.head_only {
+        sock.write_all(&resp.body).await?;
+    }
     sock.flush().await
 }
 
@@ -3715,16 +3723,36 @@ mod tests {
         );
     }
 
+    /// HEAD carries the head GET would, and no content: `Content-Length` is the length of
+    /// the representation GET sends (2, for `hi`), not 0 (ledger #118; RFC 9110 §9.3.2).
     #[tokio::test]
     async fn head_returns_headers_no_body() {
         let addr = start().await;
         let resp = roundtrip(addr, "HEAD /test/id/hello HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
         assert!(
-            resp.contains("Content-Length: 0"),
-            "HEAD has no body, got: {resp}"
+            resp.contains("Content-Length: 2\r\n"),
+            "HEAD names the length GET sends, got: {resp}"
         );
-        assert!(!resp.ends_with("hi"));
+        let (_, body) = resp.split_once("\r\n\r\n").unwrap_or((&resp, ""));
+        assert!(body.is_empty(), "HEAD has no content, got: {resp}");
+    }
+
+    /// The same holds when the answer is a refusal: a HEAD of a name nothing binds is GET's
+    /// 404 head, its length included, with no content behind it.
+    #[tokio::test]
+    async fn head_of_a_refusal_has_get_s_length_and_no_content() {
+        let addr = start().await;
+        let get = roundtrip(addr, "GET /test/nowhere HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        let head = roundtrip(addr, "HEAD /test/nowhere HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        let (get_head, get_body) = get.split_once("\r\n\r\n").unwrap();
+        let (head_head, head_body) = head.split_once("\r\n\r\n").unwrap();
+        assert!(
+            !get_body.is_empty(),
+            "GET of a missing name explains: {get}"
+        );
+        assert_eq!(get_head, head_head, "HEAD carries GET's head exactly");
+        assert!(head_body.is_empty(), "HEAD has no content, got: {head}");
     }
 
     #[tokio::test]
@@ -4892,17 +4920,77 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
     }
 
+    /// ★ The fail-closed path of `?description` (ledger #118): a name that RESOLVES, through a
+    /// space whose manifold row is not that name — a mount listing one representative IRI for
+    /// a family it serves by prefix — offers no action for the name, so it is described as
+    /// missing (404) even though a plain GET of it answers. Failing closed is the safe
+    /// direction, which is exactly why a defect here would be silent: this pins it, and the
+    /// control (the row's own name IS described) shows the 404 is the row match and not the
+    /// space.
+    #[tokio::test]
+    async fn a_mounted_name_its_rows_do_not_name_is_not_described() {
+        use ikigai_core::{Bindings, Resolution, Resolved, Scope, Space, SpaceEntry};
+        /// Serves every `urn:test:mnt:…` name, and enumerates one row for all of them.
+        struct Mounted(Arc<dyn ikigai_core::Endpoint>);
+        impl Space for Mounted {
+            fn resolve(&self, request: &Request, _scope: &Scope) -> Resolution {
+                if request.target.as_str().starts_with("urn:test:mnt:") {
+                    Resolution::Hit(Resolved::new(Arc::clone(&self.0), Bindings::new()))
+                } else {
+                    Resolution::Miss
+                }
+            }
+            fn entries(&self) -> Option<Vec<SpaceEntry>> {
+                Some(vec![
+                    SpaceEntry::new("urn:test:mnt:root", "mnt").with_origin("peer")
+                ])
+            }
+        }
+        let endpoint = FnEndpoint::new("mnt", |_inv: &Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"mounted".to_vec(),
+            ))
+        })
+        .with_description(
+            Description::new("mnt").action(ActionSpec::new(Verb::Source).summary("read it")),
+        );
+        let kernel = Arc::new(Kernel::new(Arc::new(Mounted(Arc::new(endpoint)))));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ =
+                serve_with_listener(kernel, public_cap(), listener, EdgeConfig::default()).await;
+        });
+
+        let named = roundtrip(addr, &raw_request("GET", "/test/mnt/root?description", "x")).await;
+        assert!(
+            named.starts_with("HTTP/1.1 200 OK"),
+            "the row's own name: {named}"
+        );
+        let other = roundtrip(
+            addr,
+            &raw_request("GET", "/test/mnt/other?description", "x"),
+        )
+        .await;
+        assert!(
+            other.starts_with("HTTP/1.1 404 Not Found"),
+            "no row names it, so nothing is offered: {other}"
+        );
+        let read = roundtrip(addr, &raw_request("GET", "/test/mnt/other", "x")).await;
+        assert!(
+            read.starts_with("HTTP/1.1 200 OK") && read.ends_with("mounted"),
+            "the name itself resolves, so the 404 above is the row match: {read}"
+        );
+    }
+
     #[tokio::test]
     async fn head_on_a_description_matches_get() {
-        /// Status line and headers, minus `Content-Length` (this transport sends 0 on every
-        /// HEAD, reads included), plus the body.
+        /// Status line and headers, `Content-Length` included (HEAD names GET's length,
+        /// ledger #118), plus the body.
         fn parts(resp: &str) -> (Vec<&str>, &str) {
             let (head, body) = resp.split_once("\r\n\r\n").unwrap_or((resp, ""));
-            let lines = head
-                .split("\r\n")
-                .filter(|l| !l.to_ascii_lowercase().starts_with("content-length:"))
-                .collect();
-            (lines, body)
+            (head.split("\r\n").collect(), body)
         }
         let addr = start_with_cap(
             EdgeConfig::default(),
