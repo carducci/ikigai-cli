@@ -1077,7 +1077,8 @@ mod endpoint_tests {
     }
 
     fn world(name: &str) -> World {
-        let dir = std::env::temp_dir().join(format!("ikigai-contactblock-{name}"));
+        let dir =
+            std::env::temp_dir().join(format!("ikigai-contactblock-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let key = SigningKey::from_bytes(&[11u8; 32]);

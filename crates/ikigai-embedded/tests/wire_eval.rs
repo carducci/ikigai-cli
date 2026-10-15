@@ -38,11 +38,12 @@ fn the_served_eval_is_governed_clamped_and_absent_without_optin() {
     // they would create and bind the developer's real `~/.ikigai/workspace`. `cfg(test)`
     // does not reach an integration test — it links the crate compiled without it — so the
     // hermetic root has to be asked for here.
-    let workspace = std::env::temp_dir().join("ikigai-wire-eval-workspace");
+    let workspace =
+        std::env::temp_dir().join(format!("ikigai-wire-eval-workspace-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&workspace);
     std::fs::create_dir_all(&workspace).expect("workspace root");
     ikigai_embedded::set_file_root(workspace);
-    let dir = std::env::temp_dir().join("ikigai-code-signers-test");
+    let dir = std::env::temp_dir().join(format!("ikigai-code-signers-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("signers dir");
     std::fs::write(dir.join("k1.pub"), K1_PUB).expect("write pub key");

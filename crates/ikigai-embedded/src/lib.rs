@@ -6200,16 +6200,76 @@ fn watch_root(kernel: Arc<Kernel>, root: PathBuf) {
         // `watcher` is held to the end of this scope, keeping the watch (and the
         // channel) alive; the loop blocks until the process exits.
         for event in rx.iter().flatten() {
-            if event.kind.is_access() {
-                continue; // a read doesn't change content
-            }
-            for path in &event.paths {
-                if let Some(thread) = file_thread(&root, path) {
-                    kernel.cut(thread);
-                }
-            }
+            react_to_file_event(&kernel, &root, &event);
         }
     });
+}
+
+/// What one watcher event cuts on `kernel`: the `urn:file:<rel>` thread of every path it
+/// names under `root`, or, when the event is a RESCAN, every `urn:file:` thread a cached
+/// entry hangs from.
+///
+/// ★ A rescan says events were DROPPED and names no file that changed: FSEvents reports
+/// `MustScanSubDirs` (with `UserDropped`/`KernelDropped` when its queue overflowed) on the
+/// directory to rescan, and inotify reports `IN_Q_OVERFLOW` with no path at all; `notify`
+/// delivers both as an event flagged [`Flag::Rescan`](notify::event::Flag::Rescan). Cutting
+/// only the paths it names cut at most a directory's thread, so every cached read of a file
+/// changed during the overflow stayed stale until that file changed again (ledger #1534). Any
+/// file under the root may have changed, so every file thread the cache holds is cut. The
+/// root is the whole `urn:file:` space, so that is every `urn:file:` thread; a rescan is
+/// rare, and a cut costs one recompute of what hung from it.
+fn react_to_file_event(kernel: &Kernel, root: &Path, event: &notify::Event) {
+    if event.need_rescan() {
+        for thread in cached_file_threads(kernel) {
+            kernel.cut(thread);
+        }
+        return;
+    }
+    if event.kind.is_access() {
+        return; // a read doesn't change content
+    }
+    for path in &event.paths {
+        if let Some(thread) = file_thread(root, path) {
+            kernel.cut(thread);
+        }
+    }
+}
+
+/// Every `urn:file:` golden thread a resident cache entry hangs from, read from the cache's
+/// own graph face (`urn:kernel:cache as=text/turtle` names each thread with `ik:threadName`).
+/// The kernel offers no enumeration of its threads beyond that face, and no cut by prefix.
+/// A read that fails cuts nothing, and says so: the staleness it leaves is what a rescan is
+/// for, so it must not be silent.
+fn cached_file_threads(kernel: &Kernel) -> Vec<String> {
+    const THREAD_NAME: &str = "https://ikigai-rs.dev/ns#threadName";
+    let request = Request::new(
+        Verb::Source,
+        Iri::parse("urn:kernel:cache").expect("valid IRI"),
+    )
+    .with_arg("as", ArgRef::Inline(b"text/turtle".to_vec()));
+    let turtle = match ikigai_resolve::Resolver::issue(kernel, request) {
+        Ok((representation, _)) => representation.bytes,
+        Err(e) => {
+            eprintln!(
+                "{} ikigai: file watcher rescan could not read the cache, so it cut nothing: {e}",
+                stamp()
+            );
+            return Vec::new();
+        }
+    };
+    let mut threads = Vec::new();
+    for quad in oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle).for_slice(&turtle) {
+        let Ok(quad) = quad else { continue };
+        if quad.predicate.as_str() != THREAD_NAME {
+            continue;
+        }
+        if let oxrdf::Term::Literal(name) = &quad.object {
+            if name.value().starts_with("urn:file:") {
+                threads.push(name.value().to_string());
+            }
+        }
+    }
+    threads
 }
 
 /// Watch the org directory and trigger a consolidated-view derivation when an
@@ -8361,7 +8421,8 @@ mod tests {
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("ikigai-client-test-{name}"));
+        let dir =
+            std::env::temp_dir().join(format!("ikigai-client-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -8920,6 +8981,78 @@ mod tests {
         );
         std::fs::remove_dir_all(&root).ok();
     }
+
+    /// Ledger #1534: a RESCAN event (an FSEvents or inotify queue overflow) names no file that
+    /// changed, so it must cut every cached file read under the root, not the paths it names.
+    /// Driven directly with a synthesized event, so it needs no real overflow: the file changes
+    /// out of band with no watcher running, which is what an overflow leaves behind.
+    #[test]
+    fn a_rescan_event_cuts_every_cached_file_read() {
+        use notify::event::{Event, EventKind, Flag};
+        let root = std::env::temp_dir().join(format!("ikigai-rescan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("notes.txt"), b"v1").unwrap();
+        std::fs::write(root.join("docs").join("a.txt"), b"a1").unwrap();
+        let root = root.canonicalize().unwrap();
+
+        let kernel = Kernel::new(Arc::new(ikigai_fs::cacheable_space(&root)));
+        let cap = Capability::root();
+        let source = |name: &str| {
+            Request::new(
+                Verb::Source,
+                Iri::parse(format!("urn:file:{name}")).unwrap(),
+            )
+        };
+        let read = |name: &str| block_on(kernel.issue(source(name), &cap)).unwrap().bytes;
+        assert_eq!(read("notes.txt"), b"v1");
+        assert_eq!(read("docs/a.txt"), b"a1");
+        assert!(kernel.is_cached(&source("notes.txt"), &cap));
+        assert!(kernel.is_cached(&source("docs/a.txt"), &cap));
+
+        // Both files change while the watcher's events are being dropped.
+        std::fs::write(root.join("notes.txt"), b"v2").unwrap();
+        std::fs::write(root.join("docs").join("a.txt"), b"a2").unwrap();
+
+        // An ordinary event about something else cuts only its own thread.
+        react_to_file_event(
+            &kernel,
+            &root,
+            &Event::new(EventKind::Any).add_path(root.join("other.txt")),
+        );
+        assert!(kernel.is_cached(&source("notes.txt"), &cap));
+
+        // FSEvents' form: the rescan names the DIRECTORY to rescan (here the root itself).
+        react_to_file_event(
+            &kernel,
+            &root,
+            &Event::new(EventKind::Other)
+                .set_flag(Flag::Rescan)
+                .add_path(root.clone()),
+        );
+        assert!(
+            !kernel.is_cached(&source("notes.txt"), &cap),
+            "a rescan cuts a file it does not name"
+        );
+        assert!(
+            !kernel.is_cached(&source("docs/a.txt"), &cap),
+            "a rescan cuts files in subdirectories too"
+        );
+        assert_eq!(read("notes.txt"), b"v2");
+        assert_eq!(read("docs/a.txt"), b"a2");
+
+        // inotify's form: IN_Q_OVERFLOW carries no path at all.
+        std::fs::write(root.join("notes.txt"), b"v3").unwrap();
+        assert!(kernel.is_cached(&source("notes.txt"), &cap));
+        react_to_file_event(
+            &kernel,
+            &root,
+            &Event::new(EventKind::Other).set_flag(Flag::Rescan),
+        );
+        assert_eq!(read("notes.txt"), b"v3");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     // ---------- the public booking door: what it offers and what it accepts ----------
 
     /// A stand-in booking space that records the tuples dropped into it.
