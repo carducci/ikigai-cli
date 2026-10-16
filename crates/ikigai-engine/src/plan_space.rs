@@ -46,6 +46,7 @@ use ikigai_core::{
     space_iri, ArgRef, ArgSpec, AsyncFnEndpoint, ContentId, Description, EndpointSpace, Error,
     Exact, Invocation, Iri, Provenance, ReprType, Representation, Request, Result, Verb,
 };
+use oxigraph::io::RdfFormat;
 use oxrdf::{Literal, NamedNode, NamedOrBlankNode, Term, Triple};
 use oxttl::{TurtleParser, TurtleSerializer};
 
@@ -220,11 +221,22 @@ async fn arg_text(inv: &Invocation<'_>, name: &str) -> Result<Option<String>> {
         })
 }
 
-/// The plan, as Turtle.
+/// The plan, as Turtle, refused as a typed `InvalidArgument` on `in` if it nests RDF 1.2
+/// triple terms deeper than `ikigai_store::depth::MAX_RDF_NESTING` (64), before anything
+/// parses it (ledger #992).
+///
+/// All three doors read the plan through here, and each parses it on the request's own
+/// thread: oxttl builds a nested triple term, and oxrdf copies and drops it, recursively,
+/// once per level, so a plan a few thousand levels deep (about 70 KB) overflowed the stack
+/// and aborted the whole host. The scan is the store's, which reads the text the way oxttl's
+/// STRICT Turtle lexer does, the mode `TurtleParser::new()` parses in. A real plan nests no
+/// triple terms at all: the reader refuses anything but IRIs and literals as objects.
 async fn plan_text(inv: &Invocation<'_>) -> Result<String> {
-    arg_text(inv, "in")
+    let plan = arg_text(inv, "in")
         .await?
-        .ok_or_else(|| Error::MissingArgument("in".to_string()))
+        .ok_or_else(|| Error::MissingArgument("in".to_string()))?;
+    ikigai_store::depth::check_rdf_nesting(plan.as_bytes(), RdfFormat::Turtle, "in")?;
+    Ok(plan)
 }
 
 /// The requested face of a report: `text/plain` unless `as` says `text/turtle`.

@@ -25,6 +25,18 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # oxttl pins `oxrdf = "=0.3.4"`, so the pin here is that exact version.
 oxttl = { workspace = true, optional = true }
 oxrdf = { workspace = true, optional = true }
+# The bound on a plan's triple-term nesting (ledger #992): a plan is caller Turtle, and in a
+# build with RDF 1.2 on (this workspace, through rudof) oxttl and oxrdf copy and drop a nested
+# triple term recursively, so a few thousand levels of `<<( … )>>` aborted the host at every
+# plan door. `ikigai_store::depth::check_rdf_nesting` is the scan that mirrors oxttl's STRICT
+# Turtle lexer, which is how `TurtleParser::new()` parses a plan. Its API floor is 0.2.10; the
+# version is the root's and `ikigai-intray`'s so the pins cannot resolve apart. No features:
+# `persistent` (RocksDB) is the host's, and nothing here opens a store. Optional with the
+# reader, so a wasm build (plan-reader off) does not get oxigraph.
+ikigai-store = { version = "0.2.21", optional = true }
+# Only for the `RdfFormat` that scan takes (the store re-exports none of oxigraph's io types),
+# so it is the store's own oxigraph line. Without default features: the default is RocksDB.
+oxigraph = { version = "0.5", default-features = false, optional = true }
 # block_on + join_all for the parallel fork/map path. Only block_on/join_all are
 # used (no ThreadPool), so the engine still compiles to wasm; without an injected
 # spawner the parallel path is never taken (sequential fallback).
@@ -44,7 +56,7 @@ futures = { workspace = true }
 # wasm32-unknown-unknown` passes on main and failed with these deps unconditional. The
 # `wasm32 lib clippy` job in ci.yml now runs exactly that, so the claim is a gate.
 default = []
-plan-reader = ["dep:oxttl", "dep:oxrdf"]
+plan-reader = ["dep:oxttl", "dep:oxrdf", "dep:ikigai-store", "dep:oxigraph"]
 
 [dev-dependencies]
 # End-to-end `sink`/`source`/`cap` tests mount the real file module.
