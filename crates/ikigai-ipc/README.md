@@ -42,6 +42,31 @@ kernel's own `Resolver` impl until the peer hangs up — so cache status is comp
 exactly as the embedded path computes it, and two clients sharing a server see each
 other's cached results.
 
+## One server per socket, and bounded connections
+
+`bind` never takes a socket from a live server. It dials the path first: a server that
+answers is still serving, and `bind` refuses with `AddrInUse`, naming the path and that
+server's process id. Only a socket nobody listens on is removed, and a file that is not a
+socket is never removed. The dial, the removal and the bind run under an `flock` on
+`<path>.lock` (held only for those steps), so two servers starting at once cannot each
+remove the other's socket. Before this, a second `ikigai serve` on the same path unlinked
+the first one's socket, and the first kept running with no error and no way to reach it.
+
+A door also bounds its connections (`Limits`, `serve_shared_on_with`; the other `serve_*`
+functions use the defaults):
+
+| bound | default | past it |
+| --- | --- | --- |
+| connections at once | 128 (`MAX_CONNECTIONS`) | the first call is answered with a typed `Unavailable` naming the cap |
+| a new connection's hello | 10 s (`HELLO_TIMEOUT`) | the connection is closed |
+| silence between calls, or a stalled reply write | 10 min (`IDLE_TIMEOUT`) | the connection is closed |
+
+128 leaves half of launchd's default 256-descriptor soft limit for the rest of the host,
+and is far above any fan-in seen in use. Ten minutes matches the QUIC door's
+`quic.max_connection_age`. An `IpcResolver` heals across an idle close: its next call meets
+the closed socket on its write, redials, and replays. A client that does not redial sees
+its next call fail.
+
 `serve` gives no readiness signal: it does not return while it serves, and the socket is
 bound somewhere inside it. A host that prints a banner, or a test that dials the door, calls
 `bind` (which returns a listening socket) and then `serve_on`; a connection made in between
