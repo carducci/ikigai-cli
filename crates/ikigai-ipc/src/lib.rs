@@ -21,6 +21,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -35,9 +36,9 @@ use ikigai_wire::{
 pub use ikigai_wire::HelloMode;
 
 /// Run `kernel` as a server on `path` until the listener itself fails: [`bind`] the socket
-/// (replacing a stale one, restricted to `0600`), then [`serve_on`] it, each same-user
-/// connection on its own thread. Connections from another UID are refused — defense in
-/// depth over the `0700` directory.
+/// (replacing a stale one, refusing a live one, restricted to `0600`), then [`serve_on`] it,
+/// each same-user connection on its own thread, under the default [`Limits`]. Connections from
+/// another UID are refused — defense in depth over the `0700` directory.
 ///
 /// Returns only on a dead listener (`EBADF`, `EINVAL`, …). One connection's accept
 /// error is skipped, and running out of descriptors or threads is backed off and
@@ -60,11 +61,26 @@ pub fn serve_shared(kernel: Arc<Kernel>, path: &Path) -> io::Result<()> {
     serve_shared_on(kernel, bind(path)?)
 }
 
-/// Bind the server socket at `path`: remove a stale socket file, bind, and restrict the socket
+/// Bind the server socket at `path`: remove a STALE socket file, bind, and restrict the socket
 /// to `0600`. The listener is LISTENING when this returns, so a client that connects from then
 /// on waits in its backlog until [`serve_on`] accepts it rather than being refused: a host can
 /// announce the door the moment this returns, and a test can dial it without polling
 /// (ledger #1051, #430).
+///
+/// ★ **A live server's socket is never replaced** (ledger #1665). The path is dialed first: a
+/// server that answers is still serving, and this refuses with [`AddrInUse`](io::ErrorKind::AddrInUse),
+/// naming the path and the server's process id. Only a socket nobody listens on (the dial is
+/// refused) is removed. Before this, a second server on the same path unlinked the first one's
+/// socket and bound its own, and the first went on running with no error and no way to be
+/// reached. Anything at `path` that is not a socket (or a link to one) is refused too, never
+/// removed.
+///
+/// The dial, the removal and the bind run under an exclusive lock on `<path>.lock` (an `flock`,
+/// held only for those three steps and released when this returns), so two servers starting at
+/// once cannot both find the old socket dead and remove each other's: the second waits, then
+/// finds the first one listening. The lock file stays beside the socket; removing it would
+/// reopen that race. ⚠ It orders only binders that take it: this function, in any version
+/// since ledger #1665. An older ikigai, or another program, still replaces the socket blindly.
 ///
 /// ```no_run
 /// use std::sync::Arc;
@@ -78,10 +94,217 @@ pub fn serve_shared(kernel: Arc<Kernel>, path: &Path) -> io::Result<()> {
 /// # Ok::<(), std::io::Error>(())
 /// ```
 pub fn bind(path: &Path) -> io::Result<UnixListener> {
-    let _ = std::fs::remove_file(path); // a leftover socket would fail the bind
+    let _held = bind_lock(path)?;
+    clear_stale(path)?;
     let listener = UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(listener)
+}
+
+/// Take the exclusive lock that orders binders of `path` (see [`bind`]): `<path>.lock`, created
+/// `0600` if absent. The lock is released when the returned file drops.
+fn bind_lock(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    let lock_path = PathBuf::from(name);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("could not open the bind lock {}: {e}", lock_path.display()),
+            )
+        })?;
+    file.lock().map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("could not lock {}: {e}", lock_path.display()),
+        )
+    })?;
+    Ok(file)
+}
+
+/// Make `path` free for a bind without taking it from anyone: nothing there is fine; a socket
+/// (or a link) nobody answers on is removed; a live server, or a file that is not a socket, is
+/// an error. Called under [`bind_lock`].
+fn clear_stale(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    let kind = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta.file_type(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if !(kind.is_socket() || kind.is_symlink()) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "{} exists and is not a socket; refusing to replace it",
+                path.display()
+            ),
+        ));
+    }
+    match UnixStream::connect(path) {
+        Ok(probe) => {
+            let who = peer_pid(&probe).map_or_else(
+                || "a process whose id could not be read".to_string(),
+                |pid| format!("process {pid}"),
+            );
+            Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!(
+                    "a kernel server is already listening on {} ({who}); stop it, or serve on \
+                     another path",
+                    path.display()
+                ),
+            ))
+        }
+        // Nobody listens: a socket left by a server that exited (or a dangling link).
+        // ⚠ On macOS a LIVE listener whose accept backlog is full also refuses a dial, so a
+        // server stuck that far behind reads as dead here. The door's accept loop takes every
+        // connection it can (past the cap it answers and closes them), so its backlog stays
+        // short unless the loop itself is stalled.
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            ) =>
+        {
+            match std::fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(io::Error::new(
+                    e.kind(),
+                    format!("could not remove the stale socket {}: {e}", path.display()),
+                )),
+            }
+        }
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!(
+                "could not tell whether a server is listening on {}: {e}",
+                path.display()
+            ),
+        )),
+    }
+}
+
+/// The most connections one socket door serves at once: [`Limits::default`]'s cap.
+///
+/// ★ **128, and why.** Each connection is one OS thread and one file descriptor, and a process
+/// launchd starts gets a soft limit of **256** descriptors unless its plist raises it
+/// (`launchctl limit maxfiles`, measured on plasma 2026-10-16), so 128 leaves half of that for
+/// the rest of the host: its own files, its watcher, its other doors. It is far above any
+/// legitimate fan-in seen: on 2026-10-16 gonk's door held 2 connections and plasma's
+/// `ikigai serve` 1. And a connection is one resolution at a time, so 128 concurrent
+/// resolutions is already several times what an 18-core machine can run usefully. Past it a
+/// client gets a typed [`Unavailable`](Error::Unavailable) (see [`serve_shared_on_with`]).
+pub const MAX_CONNECTIONS: usize = 128;
+
+/// How long a connection may stay silent BETWEEN calls before the door closes it:
+/// [`Limits::default`]'s idle timeout. It also bounds each write of a reply to a client that
+/// stopped reading.
+///
+/// ★ **Ten minutes, and why.** It is the same bound the QUIC door already puts on a whole
+/// connection (`quic.max_connection_age`, 600 s), so a client of either door already has to
+/// expect a standing connection to end. [`IpcResolver`] heals on use: its next call meets the
+/// closed socket on its WRITE, which proves nothing ran, so it redials and replays any verb.
+/// The one window that costs a call is a request written in the instant the door closes the
+/// connection: that reads as a hang-up after the write, so a `Sink` or `Delete` is not replayed
+/// and its caller gets a typed transient to retry. ⚠ A client that does not redial (a hand-held
+/// socket) sees its next call fail after ten idle minutes.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How long a new connection has to send its version hello: [`Limits::default`]'s hello
+/// timeout. Every client sends the hello the moment it connects, so this only ends a connection
+/// that sends NOTHING, which used to hold its thread for as long as it stayed open.
+pub const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the door waits on each step of turning away a connection past the cap (its hello,
+/// then its first call). This runs on the accept loop itself, so it is short: a refusal must
+/// not hold up the door.
+const REFUSAL_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// The bounds a socket door serves under ([`serve_shared_on_with`]). [`Limits::default`] is
+/// [`MAX_CONNECTIONS`], [`IDLE_TIMEOUT`] and [`HELLO_TIMEOUT`], and it is what [`serve`] and
+/// the other `serve_*` functions use.
+///
+/// ```
+/// use std::time::Duration;
+///
+/// let limits = ikigai_ipc::Limits::default();
+/// assert_eq!(limits.max_connections(), 128);
+/// assert_eq!(limits.idle_timeout(), Duration::from_secs(600));
+/// assert_eq!(limits.hello_timeout(), Duration::from_secs(10));
+///
+/// let tight = limits.with_max_connections(4).with_idle_timeout(Duration::from_secs(30));
+/// assert_eq!((tight.max_connections(), tight.idle_timeout()), (4, Duration::from_secs(30)));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    max_connections: usize,
+    idle_timeout: Duration,
+    hello_timeout: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            max_connections: MAX_CONNECTIONS,
+            idle_timeout: IDLE_TIMEOUT,
+            hello_timeout: HELLO_TIMEOUT,
+        }
+    }
+}
+
+impl Limits {
+    /// Serve at most `n` connections at once. Panics on zero, which would refuse everyone.
+    pub fn with_max_connections(mut self, n: usize) -> Self {
+        assert!(n > 0, "a socket door must serve at least one connection");
+        self.max_connections = n;
+        self
+    }
+
+    /// Close a connection silent for `timeout` between calls. Panics on zero, which a socket
+    /// cannot take as a timeout.
+    pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
+        assert!(
+            !timeout.is_zero(),
+            "an idle timeout must be longer than zero"
+        );
+        self.idle_timeout = timeout;
+        self
+    }
+
+    /// Close a new connection that has not sent its hello within `timeout`. Panics on zero.
+    pub fn with_hello_timeout(mut self, timeout: Duration) -> Self {
+        assert!(
+            !timeout.is_zero(),
+            "a hello timeout must be longer than zero"
+        );
+        self.hello_timeout = timeout;
+        self
+    }
+
+    /// The connection cap.
+    pub fn max_connections(&self) -> usize {
+        self.max_connections
+    }
+
+    /// The idle timeout between calls.
+    pub fn idle_timeout(&self) -> Duration {
+        self.idle_timeout
+    }
+
+    /// The timeout for a new connection's hello.
+    pub fn hello_timeout(&self) -> Duration {
+        self.hello_timeout
+    }
 }
 
 /// [`serve`] on a listener the caller already bound — with [`bind`], which sets the socket's
@@ -90,10 +313,38 @@ pub fn serve_on(kernel: Kernel, listener: UnixListener) -> io::Result<()> {
     serve_shared_on(Arc::new(kernel), listener)
 }
 
-/// [`serve_shared`] on a listener the caller already bound (see [`serve_on`]).
+/// [`serve_shared`] on a listener the caller already bound (see [`serve_on`]), under the
+/// default [`Limits`].
 pub fn serve_shared_on(kernel: Arc<Kernel>, listener: UnixListener) -> io::Result<()> {
+    serve_shared_on_with(kernel, listener, Limits::default())
+}
+
+/// [`serve_shared_on`] under explicit [`Limits`] (ledger #1665).
+///
+/// - **A connection cap.** At most `limits.max_connections()` connections are served at once.
+///   One past it is answered, not dropped: the door reads its hello and its first call, each
+///   within a second, and answers that call with a typed
+///   [`Unavailable`](Error::Unavailable) naming the cap, a transient a Retry overlay acts on.
+///   (A connection closed without a word reads to the client as a server that predates wire
+///   v6, which would misreport a busy door.) That exchange runs on the accept loop, so while
+///   the door is full it takes at most about two seconds per refused connection, and it spawns
+///   no thread.
+/// - **A hello timeout.** A connection that has not sent its hello within
+///   `limits.hello_timeout()` is closed.
+/// - **An idle timeout.** A connection silent between calls for `limits.idle_timeout()` is
+///   closed, and so is one whose reply cannot be written for that long.
+///
+/// Every per-message bound is unchanged: a frame is still refused past the wire's size limit.
+pub fn serve_shared_on_with(
+    kernel: Arc<Kernel>,
+    listener: UnixListener,
+    limits: Limits,
+) -> io::Result<()> {
     let me = own_uid();
     let mut backoff = accept::Backoff::default();
+    // The connections being served. Only this loop adds to it, so reading it and then adding
+    // cannot overshoot; a finishing connection subtracts (its `Slot` drops).
+    let live = Arc::new(AtomicUsize::new(0));
     loop {
         let stream = match listener.accept() {
             Ok((stream, _)) => stream,
@@ -109,15 +360,64 @@ pub fn serve_shared_on(kernel: Arc<Kernel>, listener: UnixListener) -> io::Resul
         if peer_uid(&stream) != Some(me) {
             continue; // not our user — drop it
         }
+        if live.load(Ordering::SeqCst) >= limits.max_connections {
+            refuse_over_capacity(stream, limits.max_connections);
+            continue;
+        }
+        let slot = Slot::take(&live);
         let kernel = Arc::clone(&kernel);
-        match std::thread::Builder::new().spawn(move || handle_connection(&kernel, stream)) {
+        let spawned = std::thread::Builder::new().spawn(move || {
+            let _slot = slot;
+            serve_connection(&kernel, stream, &limits)
+        });
+        match spawned {
             Ok(_) => backoff.succeeded(),
             // Out of threads (`EAGAIN`). The stream went down with the closure, so the client
             // sees a hang-up and redials; `thread::spawn` would have PANICKED here instead,
             // taking the whole accept loop with it.
+            // The slot went down with the closure too, so it is free again.
             Err(e) => std::thread::sleep(backoff.failed(&e)),
         }
     }
+}
+
+/// One served connection's place under the cap: counted when taken, given back on drop, so a
+/// connection that ends any way at all (a hang-up, a panic, a failed spawn) frees its place.
+struct Slot(Arc<AtomicUsize>);
+
+impl Slot {
+    fn take(live: &Arc<AtomicUsize>) -> Slot {
+        live.fetch_add(1, Ordering::SeqCst);
+        Slot(Arc::clone(live))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Turn away a connection that arrived with the door full: answer its hello, then answer its
+/// first call with a typed [`Unavailable`](Error::Unavailable), then close. Each step waits at
+/// most [`REFUSAL_TIMEOUT`], since this runs on the accept loop. A client that sends no call in
+/// that time finds the socket closed when it does, and a healing [`IpcResolver`] redials and
+/// replays straight into this refusal, so it still reads the typed answer.
+fn refuse_over_capacity(stream: UnixStream, cap: usize) {
+    let _ = stream.set_read_timeout(Some(REFUSAL_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(REFUSAL_TIMEOUT));
+    let mut stream = &stream;
+    let Some(version) = answer_hello(&mut stream) else {
+        return;
+    };
+    if read_message::<_, Call>(&mut stream).is_err() {
+        return;
+    }
+    let refusal = Error::Unavailable(format!(
+        "the kernel server is at its limit of {cap} connections; try again shortly"
+    ));
+    let reply = Reply::ErrorTyped(WireError::from(&refusal)).for_peer(version);
+    let _ = write_message(&mut stream, &reply);
 }
 
 /// The default socket read/write deadline. Without it, a hung or vanished server
@@ -952,8 +1252,39 @@ impl Resolver for IpcResolver {
     }
 }
 
+/// Serve one connection under the default [`Limits`] (the tests' entry point).
+#[cfg(test)]
+fn handle_connection(kernel: &Kernel, stream: UnixStream) {
+    serve_connection(kernel, stream, &Limits::default())
+}
+
 /// Serve one connection: the version hello first, then calls until the peer
-/// hangs up (or a wire error).
+/// hangs up, falls silent past `limits` (see [`serve_shared_on_with`]), or sends a wire error.
+fn serve_connection(kernel: &Kernel, stream: UnixStream, limits: &Limits) {
+    // Ignored on failure: a socket the peer already closed refuses `setsockopt` on macOS, and
+    // the read below reports that death properly.
+    let _ = stream.set_read_timeout(Some(limits.hello_timeout));
+    let _ = stream.set_write_timeout(Some(limits.idle_timeout));
+    let mut stream = &stream;
+    let Some(peer_version) = answer_hello(&mut stream) else {
+        return;
+    };
+    let _ = stream.set_read_timeout(Some(limits.idle_timeout));
+    loop {
+        let call: Call = match read_message(&mut stream) {
+            Ok(call) => call,
+            // EOF, a malformed frame, or silence past the idle timeout ends the session.
+            Err(_) => return,
+        };
+        let reply = dispatch(kernel, call).for_peer(peer_version);
+        if write_message(&mut stream, &reply).is_err() {
+            return;
+        }
+    }
+}
+
+/// Read and answer a connection's version hello, returning the version to serve it at, or
+/// `None` when the connection ends here.
 ///
 /// The FIRST frame decides the connection's era. A hello (magic-prefixed) in the
 /// spoken range is answered with the CLIENT's version and served AT it — every
@@ -961,13 +1292,9 @@ impl Resolver for IpcResolver {
 /// variant. A hello outside the range gets our own version (so the CLIENT can
 /// name both in its error) and a close. A frame WITHOUT the magic is a ≤v5
 /// client and is refused.
-fn handle_connection(kernel: &Kernel, stream: UnixStream) {
-    let mut stream = &stream;
-    let first = match read_frame(&mut stream) {
-        Ok(payload) => payload,
-        Err(_) => return,
-    };
-    let peer_version = match decode_hello(&first) {
+fn answer_hello(stream: &mut &UnixStream) -> Option<u32> {
+    let first = read_frame(stream).ok()?;
+    match decode_hello(&first) {
         Some(hello) => {
             // The mode is a hint for prefix-canonical peers; this server's
             // kernel speaks canonical IRIs either way, so it is read and
@@ -976,13 +1303,9 @@ fn handle_connection(kernel: &Kernel, stream: UnixStream) {
                 version: answer_to(hello.version),
                 mode: HelloMode::Verbatim,
             };
-            if write_hello(&mut stream, &answer).is_err() {
-                return;
-            }
-            if !speaks(hello.version) {
-                return; // the client renders the mismatch; nothing more to say
-            }
-            hello.version
+            write_hello(stream, &answer).ok()?;
+            // Out of range: the client renders the mismatch; nothing more to say.
+            speaks(hello.version).then_some(hello.version)
         }
         None => {
             // v7: the hello is REQUIRED. A first frame without the magic is a
@@ -992,17 +1315,7 @@ fn handle_connection(kernel: &Kernel, stream: UnixStream) {
                 "ikigai: refused a client that connected without the version hello \
                  (wire ≤v5; v{PROTOCOL_VERSION} requires it). Update the client."
             );
-            return;
-        }
-    };
-    loop {
-        let call: Call = match read_message(&mut stream) {
-            Ok(call) => call,
-            Err(_) => return, // EOF or a malformed frame ends the session
-        };
-        let reply = dispatch(kernel, call).for_peer(peer_version);
-        if write_message(&mut stream, &reply).is_err() {
-            return;
+            None
         }
     }
 }
@@ -1106,6 +1419,53 @@ fn peer_uid(stream: &UnixStream) -> Option<u32> {
     (rc == 0).then_some(uid)
 }
 
+/// The connected peer's process id, for naming a live server [`bind`] will not replace —
+/// `None` where it cannot be read.
+#[cfg(target_os = "linux")]
+fn peer_pid(stream: &UnixStream) -> Option<i32> {
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: a valid fd and correctly-sized out-params for SO_PEERCRED.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    (rc == 0 && cred.pid > 0).then_some(cred.pid)
+}
+
+/// The connected peer's process id (macOS: `LOCAL_PEERPID`).
+#[cfg(target_vendor = "apple")]
+fn peer_pid(stream: &UnixStream) -> Option<i32> {
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: a valid fd and a correctly-sized out-param for LOCAL_PEERPID.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut len,
+        )
+    };
+    (rc == 0 && pid > 0).then_some(pid)
+}
+
+/// Elsewhere the peer's process id is not read; the refusal says so.
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+fn peer_pid(_stream: &UnixStream) -> Option<i32> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1181,6 +1541,234 @@ mod tests {
         assert_eq!(client.issue(upper("ready")).unwrap().0.bytes, b"READY");
         drop(client);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Remove a test socket and the bind lock beside it.
+    fn remove_socket(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let mut lock = path.as_os_str().to_owned();
+        lock.push(".lock");
+        let _ = std::fs::remove_file(PathBuf::from(lock));
+    }
+
+    /// Serve `kernel` on `path` under `limits`, bound before this returns.
+    fn serve_limited(path: &Path, limits: Limits) {
+        remove_socket(path);
+        let listener = bind(path).unwrap();
+        thread::spawn(move || {
+            let _ = serve_shared_on_with(Arc::new(kernel()), listener, limits);
+        });
+    }
+
+    /// ledger #1665: a second server on a live server's path is REFUSED, naming the path and
+    /// the live server's process, and the first server keeps its socket. Before, the second
+    /// bind unlinked the first one's socket and took the path, and the first went on running
+    /// with no error and no way to be reached.
+    #[test]
+    fn a_second_bind_refuses_a_live_server_and_names_it() {
+        let path = socket_path("live-twice");
+        remove_socket(&path);
+        let first = bind(&path).unwrap();
+        thread::spawn(move || {
+            let _ = serve_on(kernel(), first);
+        });
+
+        let refused = bind(&path).expect_err("a live server's socket is not replaced");
+        assert_eq!(refused.kind(), io::ErrorKind::AddrInUse, "{refused}");
+        let message = refused.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(
+            message.contains(&format!("process {}", std::process::id())),
+            "the refusal names the live server's process: {message}"
+        );
+
+        // The first server still answers on the path.
+        let client = connect(&path).unwrap();
+        assert_eq!(client.issue(upper("still")).unwrap().0.bytes, b"STILL");
+        drop(client);
+        remove_socket(&path);
+    }
+
+    /// A socket nobody listens on (its server exited) is still replaced.
+    #[test]
+    fn a_stale_socket_is_replaced() {
+        let path = socket_path("stale");
+        remove_socket(&path);
+        drop(UnixListener::bind(&path).unwrap()); // the file stays; nobody listens
+        assert!(path.exists(), "the stale socket file is there");
+
+        let listener = bind(&path).expect("a dead socket is replaced");
+        thread::spawn(move || {
+            let _ = serve_on(kernel(), listener);
+        });
+        let client = connect(&path).unwrap();
+        assert_eq!(client.issue(upper("fresh")).unwrap().0.bytes, b"FRESH");
+        drop(client);
+        remove_socket(&path);
+    }
+
+    /// ledger #1665: a file at the path that is not a socket is refused and left alone; the
+    /// old bind removed whatever was there.
+    #[test]
+    fn a_file_that_is_not_a_socket_is_not_removed() {
+        let path = socket_path("not-a-socket");
+        remove_socket(&path);
+        std::fs::write(&path, b"keep me").unwrap();
+
+        let refused = bind(&path).expect_err("a regular file is not a socket to replace");
+        assert_eq!(refused.kind(), io::ErrorKind::AlreadyExists, "{refused}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"keep me",
+            "the file is untouched"
+        );
+        remove_socket(&path);
+    }
+
+    /// ledger #1665: [`bind`] waits for the bind lock and probes AFTER taking it, so two
+    /// servers starting at once cannot both find the old socket dead and remove each other's.
+    /// Here another binder holds the lock and binds while this one waits; when the lock is
+    /// released, this one finds that server listening and refuses.
+    #[test]
+    fn bind_waits_for_the_lock_then_finds_the_other_server() {
+        let path = socket_path("lock-race");
+        remove_socket(&path);
+        let mut lock_name = path.as_os_str().to_owned();
+        lock_name.push(".lock");
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(PathBuf::from(lock_name))
+            .unwrap();
+        held.lock().unwrap();
+
+        let racer = path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(bind(&racer).map(|_| ()));
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "bind does not touch the path while another binder holds the lock"
+        );
+
+        // The other binder, still holding the lock, binds and serves.
+        let other = UnixListener::bind(&path).unwrap();
+        thread::spawn(move || {
+            let _ = serve_on(kernel(), other);
+        });
+        drop(held);
+
+        let raced = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("bind returns once the lock is free");
+        let refused = raced.expect_err("the server bound under the lock is live");
+        assert_eq!(refused.kind(), io::ErrorKind::AddrInUse, "{refused}");
+        let client = connect(&path).unwrap();
+        assert_eq!(client.issue(upper("kept")).unwrap().0.bytes, b"KEPT");
+        drop(client);
+        remove_socket(&path);
+    }
+
+    /// ledger #1665: past the connection cap a client gets a TYPED `Unavailable` naming the
+    /// cap, and once a served connection ends its place is free again.
+    #[test]
+    fn a_connection_past_the_cap_is_refused_typed_and_the_place_comes_back() {
+        let path = socket_path("cap");
+        serve_limited(&path, Limits::default().with_max_connections(1));
+
+        let holder = connect(&path).unwrap();
+        assert_eq!(holder.issue(upper("one")).unwrap().0.bytes, b"ONE");
+
+        let turned_away = connect(&path).expect("the hello is answered past the cap");
+        match turned_away.issue(upper("two")) {
+            Err(Error::Unavailable(message)) => {
+                assert!(message.contains("limit of 1 connections"), "{message}")
+            }
+            other => panic!("expected a typed Unavailable past the cap, got {other:?}"),
+        }
+
+        drop(holder); // its thread reads EOF and gives the place back
+        let mut served = None;
+        for _ in 0..100 {
+            match turned_away.issue(upper("two")) {
+                Ok((representation, _)) => {
+                    served = Some(representation.bytes);
+                    break;
+                }
+                Err(Error::Unavailable(_)) => thread::sleep(Duration::from_millis(20)),
+                Err(other) => panic!("unexpected error while the place frees: {other:?}"),
+            }
+        }
+        assert_eq!(
+            served.as_deref(),
+            Some(&b"TWO"[..]),
+            "the freed place is served"
+        );
+        drop(turned_away);
+        remove_socket(&path);
+    }
+
+    /// ledger #1665: a connection that never sends its hello is closed after the hello
+    /// timeout. Before, it held its thread for as long as it stayed open.
+    #[test]
+    fn a_connection_that_sends_nothing_is_closed() {
+        let path = socket_path("silent");
+        serve_limited(
+            &path,
+            Limits::default().with_hello_timeout(Duration::from_millis(200)),
+        );
+        let silent = UnixStream::connect(&path).unwrap();
+        silent
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        let read = io::Read::read(&mut &silent, &mut byte);
+        assert!(
+            matches!(read, Ok(0)),
+            "the door hangs up on a connection that says nothing: {read:?}"
+        );
+        remove_socket(&path);
+    }
+
+    /// ledger #1665: a connection idle between calls past the idle timeout is closed, and an
+    /// [`IpcResolver`] heals across it: its next call redials and is served.
+    #[test]
+    fn an_idle_connection_is_closed_and_the_resolver_heals() {
+        let path = socket_path("idle");
+        serve_limited(
+            &path,
+            Limits::default().with_idle_timeout(Duration::from_millis(200)),
+        );
+
+        // A raw client: hello, then silence. The door hangs up after the idle timeout.
+        let raw = UnixStream::connect(&path).unwrap();
+        raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        write_hello(
+            &mut &raw,
+            &Hello {
+                version: PROTOCOL_VERSION,
+                mode: HelloMode::Verbatim,
+            },
+        )
+        .unwrap();
+        read_frame(&mut &raw).expect("the hello is answered");
+        let mut byte = [0u8; 1];
+        let read = io::Read::read(&mut &raw, &mut byte);
+        assert!(
+            matches!(read, Ok(0)),
+            "the door hangs up on an idle connection: {read:?}"
+        );
+
+        // A resolver idle past the timeout redials on its next call.
+        let client = connect(&path).unwrap();
+        assert_eq!(client.issue(upper("before")).unwrap().0.bytes, b"BEFORE");
+        thread::sleep(Duration::from_millis(500));
+        assert_eq!(client.issue(upper("after")).unwrap().0.bytes, b"AFTER");
+        drop(client);
+        remove_socket(&path);
     }
 
     /// ledger #593: [`serve_shared`] puts the CALLER's kernel behind the door, so the door and
