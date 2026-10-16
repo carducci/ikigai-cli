@@ -312,6 +312,14 @@ an over-bound request is **refused rather than trimmed to fit**:
   past the cap is answered `503` with `Retry-After: 1` without its request being
   handled, then closed after draining what it sent, so the answer arrives instead of
   a reset.
+- **Per-client rates (opt-in).** `source_limits` (a `SourceLimits` of `SourceRate`
+  rules, each an IRI prefix and `max` requests per `window`) counts every request to a
+  governed resource by its client: the socket peer, or the `X-Forwarded-For` hop the
+  proxy appended under `trust_proxy`, with an IPv6 client counted as its /64. Past the
+  budget the answer is `429` with `Retry-After` and the resource does not run. The
+  limiter's own table is bounded (`max_sources`, default 4096): emptied windows are
+  reclaimed first, and past it a new client is refused rather than let through
+  untracked.
 - **The target is decoded as bytes, and a malformed escape is a `400`.** `%` must be
   followed by two hex digits (`%`, `%4`, `%zz` and `%+1` are refused, never guessed
   at), and the decoded bytes must be UTF-8. The **path** is split on `/` first and

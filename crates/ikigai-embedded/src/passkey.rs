@@ -193,11 +193,133 @@ fn enroll_window_path() -> std::path::PathBuf {
 // =====================================================================================
 // The challenge store — process-global, in-memory. A restart just invalidates outstanding
 // challenges (the user taps again); nothing here is worth persisting.
+//
+// BOUNDED (ledger #1717, threat model S1 gap 3). `urn:passkey:challenge` is capability-free and
+// reachable by anyone on the public HTTP door and by every participant on a layer door, and each
+// read used to add an entry that only the next read's sweep of EXPIRED entries could drop: the
+// map held request rate × the TTL, with no ceiling. Now it holds at most [`max_challenges`].
+//
+// ★ Past the bound a NEW challenge is REFUSED; no outstanding one is ever evicted. Eviction
+// (drop the oldest to make room) would let a flood push out the challenge of an honest ceremony
+// already under way, and the person who just touched the sensor would be refused at the POST with
+// no way to know why. A refusal costs the honest user a retry at worst, says why, and every
+// ceremony already holding a challenge still completes.
 // =====================================================================================
 
-fn challenges() -> &'static Mutex<HashMap<String, Instant>> {
-    static STORE: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+/// The most passkey challenges outstanding at once, unless `passkey.max_challenges` in the
+/// config home says otherwise. One person taps one challenge per decision; 4096 is far above
+/// any honest use and, at about a hundred bytes an entry, well under a megabyte. It is large on
+/// purpose: a refusal past the bound is also a refusal to the honest user, so the bound should
+/// take a flood to reach, not a burst.
+pub const DEFAULT_MAX_CHALLENGES: usize = 4096;
+
+/// The config-home key that overrides [`DEFAULT_MAX_CHALLENGES`].
+pub const MAX_CHALLENGES_KEY: &str = "passkey.max_challenges";
+
+/// The outstanding challenges, each with its expiry on the monotonic clock.
+#[derive(Default)]
+struct Challenges {
+    live: HashMap<String, Instant>,
+}
+
+impl Challenges {
+    /// Remember `challenge` until `now + CHALLENGE_TTL`, unless `max` are already outstanding.
+    /// Expired entries are reclaimed first, so only challenges still in date count.
+    fn issue(&mut self, challenge: String, now: Instant, max: usize) -> Result<()> {
+        self.live.retain(|_, exp| *exp > now);
+        if self.live.len() >= max {
+            // When the soonest outstanding challenge expires and frees a place.
+            let wait = self
+                .live
+                .values()
+                .min()
+                .map_or(CHALLENGE_TTL, |exp| exp.saturating_duration_since(now));
+            return Err(Error::Unavailable(format!(
+                "too many passkey challenges are outstanding ({max}); none is replaced, so a \
+                 sign-in already under way still completes. Try again in {}s",
+                wait.as_secs() + 1
+            )));
+        }
+        self.live.insert(challenge, now + CHALLENGE_TTL);
+        Ok(())
+    }
+
+    /// Spend `challenge`: true when it was issued here and is still in date. It is removed
+    /// either way, so it cannot be presented twice.
+    fn consume(&mut self, challenge: &str, now: Instant) -> bool {
+        match self.live.remove(challenge) {
+            Some(exp) => exp > now,
+            None => false,
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn challenges() -> &'static Mutex<Challenges> {
+    static STORE: OnceLock<Mutex<Challenges>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(Challenges::default()))
+}
+
+/// Under test each thread has its own store (each test runs on its own thread, and the gate is
+/// driven with a same-thread executor), so a test that fills the store to its bound cannot
+/// refuse a parallel test's ceremony.
+#[cfg(test)]
+fn challenges() -> &'static Mutex<Challenges> {
+    tests::test_challenges()
+}
+
+/// Read `passkey.max_challenges`: absent is the default, otherwise a whole number of at least 1
+/// (TOML's `_` separators allowed).
+///
+/// ```
+/// use ikigai_embedded::passkey::{max_challenges_from, DEFAULT_MAX_CHALLENGES};
+/// assert_eq!(max_challenges_from(None), Ok(DEFAULT_MAX_CHALLENGES));
+/// assert_eq!(max_challenges_from(Some("1_000")), Ok(1000));
+/// assert!(max_challenges_from(Some("0")).is_err());
+/// assert!(max_challenges_from(Some("lots")).is_err());
+/// ```
+pub fn max_challenges_from(value: Option<&str>) -> std::result::Result<usize, String> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_MAX_CHALLENGES);
+    };
+    let digits: String = value.chars().filter(|c| *c != '_').collect();
+    match digits.parse::<usize>() {
+        Ok(0) => Err(format!(
+            "`{MAX_CHALLENGES_KEY} = {value}`: the least it can be is 1"
+        )),
+        Ok(n) if digits.chars().all(|c| c.is_ascii_digit()) => Ok(n),
+        _ => Err(format!(
+            "`{MAX_CHALLENGES_KEY} = {value}` is not a whole number (a count of challenges)"
+        )),
+    }
+}
+
+/// Check `passkey.max_challenges` in the config home. A serving door calls this at start-up and
+/// refuses to start on an error, so a mistyped bound stops the door rather than being ignored.
+pub fn check_config() -> std::result::Result<(), String> {
+    max_challenges_from(crate::config::get(MAX_CHALLENGES_KEY).as_deref())
+        .map(|_| ())
+        .map_err(|e| format!("{e} (in {})", crate::config::config_path().display()))
+}
+
+/// The bound in force: the config home's `passkey.max_challenges`, read once. An invalid value
+/// is reported once on stderr and the default stands; a door that checked [`check_config`] at
+/// start-up never gets here with one.
+fn max_challenges() -> usize {
+    #[cfg(test)]
+    if let Some(max) = tests::test_max_challenges() {
+        return max;
+    }
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        match max_challenges_from(crate::config::get(MAX_CHALLENGES_KEY).as_deref()) {
+            Ok(max) => max,
+            Err(e) => {
+                eprintln!("ikigai passkey: {e}; the default {DEFAULT_MAX_CHALLENGES} stands");
+                DEFAULT_MAX_CHALLENGES
+            }
+        }
+    })
 }
 
 /// The monotonic clock challenges expire on. Native-only: the embedded host is a threaded,
@@ -210,7 +332,8 @@ fn monotonic_now() -> Instant {
     Instant::now()
 }
 
-/// Mint a fresh challenge, remember it with an expiry, and return its base64url text.
+/// Mint a fresh challenge, remember it with an expiry, and return its base64url text. Refused
+/// with a transient [`Error::Unavailable`] when [`max_challenges`] are already outstanding.
 fn issue_challenge() -> Result<String> {
     issue_challenge_at(monotonic_now())
 }
@@ -221,10 +344,10 @@ fn issue_challenge_at(now: Instant) -> Result<String> {
     getrandom::getrandom(&mut raw)
         .map_err(|e| Error::Endpoint(format!("no OS randomness for a challenge: {e}")))?;
     let challenge = b64().encode(raw);
+    let max = max_challenges();
     // Held across no await: every critical section on this lock is a few map operations.
     let mut store = challenges().lock().expect("challenge store poisoned");
-    store.retain(|_, exp| *exp > now); // opportunistic sweep so the map cannot grow without bound
-    store.insert(challenge.clone(), now + CHALLENGE_TTL);
+    store.issue(challenge.clone(), now, max)?;
     Ok(challenge)
 }
 
@@ -237,10 +360,7 @@ fn consume_challenge(challenge: &str) -> bool {
 /// [`consume_challenge`] at a given monotonic instant.
 fn consume_challenge_at(challenge: &str, now: Instant) -> bool {
     let mut store = challenges().lock().expect("challenge store poisoned");
-    match store.remove(challenge) {
-        Some(exp) => exp > now,
-        None => false,
-    }
+    store.consume(challenge, now)
 }
 
 // =====================================================================================
@@ -1247,6 +1367,21 @@ mod tests {
             const { std::cell::RefCell::new(None) };
         static TEST_RP: std::cell::RefCell<Option<RelyingParty>> =
             const { std::cell::RefCell::new(None) };
+        static TEST_CHALLENGES: std::cell::Cell<&'static Mutex<Challenges>> =
+            std::cell::Cell::new(Box::leak(Box::new(Mutex::new(Challenges::default()))));
+        static TEST_MAX_CHALLENGES: std::cell::Cell<Option<usize>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// This thread's challenge store (one leaked per test thread; see `challenges`). A test
+    /// that runs part of a ceremony on a second thread hands it this one.
+    pub(super) fn test_challenges() -> &'static Mutex<Challenges> {
+        TEST_CHALLENGES.with(std::cell::Cell::get)
+    }
+
+    /// This thread's override of the challenge bound, if a test set one.
+    pub(super) fn test_max_challenges() -> Option<usize> {
+        TEST_MAX_CHALLENGES.with(std::cell::Cell::get)
     }
 
     /// The current thread's override root, if a test set one. `store_root()` consults this.
@@ -1695,6 +1830,7 @@ mod tests {
     fn interleaved_assertions_never_lower_the_stored_counter() {
         isolate("race");
         let root = test_root().unwrap();
+        let store = test_challenges();
         let d = Device::new();
         d.register();
         let c_low = issue_challenge().unwrap();
@@ -1713,6 +1849,7 @@ mod tests {
                 let handle = std::thread::spawn(move || {
                     TEST_ROOT.with(|r| *r.borrow_mut() = Some(root));
                     TEST_RP.with(|r| *r.borrow_mut() = Some(test_relying_party()));
+                    TEST_CHALLENGES.with(|c| c.set(store));
                     let r = run_gate(&high);
                     let _ = done_tx.send(());
                     r
@@ -1874,6 +2011,108 @@ mod tests {
         )
         .is_ok());
         assert!(is_enrolled());
+    }
+
+    /// Ledger #1717: past the bound a new challenge is refused with a TRANSIENT error that says
+    /// when to retry, and nothing outstanding is evicted to make room.
+    #[test]
+    fn past_the_bound_a_new_challenge_is_refused_and_none_is_evicted() {
+        let mut store = Challenges::default();
+        let t0 = monotonic_now();
+        for n in 0..3 {
+            store
+                .issue(format!("c{n}"), t0 + Duration::from_secs(n), 3)
+                .expect("under the bound");
+        }
+        let refused = store
+            .issue("c3".into(), t0 + Duration::from_secs(10), 3)
+            .expect_err("the fourth outstanding challenge is refused");
+        assert!(refused.is_transient(), "a retry can succeed: {refused}");
+        assert!(matches!(refused, Error::Unavailable(_)), "{refused:?}");
+        // The soonest one (c0, issued at t0) frees a place at t0 + TTL: 110 s from t0 + 10.
+        let wait = CHALLENGE_TTL.as_secs() - 10 + 1;
+        assert!(
+            refused
+                .to_string()
+                .contains(&format!("Try again in {wait}s")),
+            "{refused}"
+        );
+        assert_eq!(store.live.len(), 3, "the refusal stored nothing");
+        for n in 0..3 {
+            assert!(
+                store.consume(&format!("c{n}"), t0 + Duration::from_secs(11)),
+                "c{n} was not evicted: an honest ceremony holding it still completes"
+            );
+        }
+    }
+
+    /// Expired challenges are reclaimed before the bound is judged, so a full store frees
+    /// itself as its challenges age out, with no sweeper.
+    #[test]
+    fn expired_challenges_are_reclaimed_before_the_bound_is_judged() {
+        let mut store = Challenges::default();
+        let t0 = monotonic_now();
+        store.issue("a".into(), t0, 2).unwrap();
+        store
+            .issue("b".into(), t0 + Duration::from_secs(60), 2)
+            .unwrap();
+        assert!(store
+            .issue("c".into(), t0 + Duration::from_secs(61), 2)
+            .is_err());
+        // At t0 + TTL, `a` has expired: its place is free again, and only `a`'s.
+        store.issue("c".into(), t0 + CHALLENGE_TTL, 2).unwrap();
+        assert_eq!(store.live.len(), 2);
+        assert!(
+            !store.live.contains_key("a"),
+            "the expired one was reclaimed"
+        );
+        assert!(store.issue("d".into(), t0 + CHALLENGE_TTL, 2).is_err());
+    }
+
+    /// The whole ceremony on a full store, through the endpoint and the gate: the challenge an
+    /// honest device was handed before the flood still signs in; the flood's next read is
+    /// refused at the endpoint (a 503 at the door: transient); and once the flood's challenges
+    /// age out, a fresh read and sign-in work again.
+    #[test]
+    fn an_honest_ceremony_completes_on_a_full_store_and_the_endpoint_refuses_past_it() {
+        isolate("bounded");
+        TEST_MAX_CHALLENGES.with(|m| m.set(Some(8)));
+        let d = Device::new();
+        d.register();
+        let read = || {
+            call(
+                "urn:passkey:challenge",
+                PasskeyChallenge,
+                Verb::Source,
+                None,
+            )
+        };
+        let challenge_of = |repr: Representation| -> String {
+            let v: serde_json::Value = serde_json::from_slice(&repr.bytes).unwrap();
+            v["challenge"].as_str().unwrap().to_string()
+        };
+        let honest = challenge_of(read().expect("an empty store issues"));
+        // The flood: everything up to the bound is issued, and the next read is refused.
+        for _ in 0..7 {
+            read().expect("under the bound");
+        }
+        let refused = read().expect_err("the bound refuses the ninth");
+        assert!(refused.is_transient(), "{refused}");
+        // The honest device completes its sign-in with the challenge it already holds.
+        assert!(
+            run_gate(&d.assert_fields(&honest, 0x05, 1)).is_ok(),
+            "an honest ceremony under way is not broken by the bound"
+        );
+        // Its place is free again, so the next honest read is served.
+        let next = challenge_of(read().expect("a spent challenge frees its place"));
+        assert!(run_gate(&d.assert_fields(&next, 0x05, 2)).is_ok());
+        // And a store full of the flood's challenges frees itself once they expire.
+        read().expect("the place the second sign-in spent");
+        assert!(read().is_err(), "full again");
+        let later = monotonic_now() + CHALLENGE_TTL;
+        let after = issue_challenge_at(later).expect("expired entries are reclaimed");
+        assert!(consume_challenge_at(&after, later));
+        TEST_MAX_CHALLENGES.with(|m| m.set(None));
     }
 
     #[test]

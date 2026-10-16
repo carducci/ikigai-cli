@@ -39,6 +39,9 @@
 //! - **HEAD**: the head GET would carry and no content, on every path, refusals included.
 //! - **a write's answer**: a Sink or Delete whose endpoint answers with a representation is
 //!   `200` with it (a take returns what it took); an empty answer is `204`.
+//! - **per-source rate limits**: with [`EdgeConfig::source_limits`] set, one client past a
+//!   rule's budget is answered `429` with `Retry-After` before the resource runs; see
+//!   [`SourceLimits`].
 //! - **server push**: with [`EdgeConfig::push`] set, one `GET` of the push path holds an
 //!   event stream open and tells the page when a golden thread its reads rest on is cut —
 //!   see [`push`].
@@ -52,11 +55,13 @@ mod accept;
 mod entity;
 mod error_page;
 pub mod push;
+mod source_limit;
 pub use entity::{
     with_headers, EndpointHeader, HeaderRefusal, HTTP_ENTITY, MAX_HEADER_BLOCK, MAX_HEADER_LINES,
     MAX_HEADER_VALUE,
 };
 pub use push::{PushConfig, DEFAULT_PUSH_PATH};
+pub use source_limit::{source_key, SourceLimits, SourceRate, DEFAULT_MAX_SOURCES};
 
 use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request, Verb};
 use std::net::{IpAddr, SocketAddr};
@@ -384,6 +389,11 @@ pub struct EdgeConfig {
     /// [`EndpointHeader::DEFAULTS`], which leaves out `Set-Cookie`: add it on a door whose
     /// endpoints mint sessions.
     pub endpoint_headers: Vec<EndpointHeader>,
+    /// Per-source rate limits (see [`SourceLimits`]): a client past a rule's budget is answered
+    /// `429 Too Many Requests` with `Retry-After`, before the resource is invoked. The source is
+    /// the connection's peer, or the `X-Forwarded-For` hop the proxy appended when
+    /// [`trust_proxy`](Self::trust_proxy) is set. `None` (the default) limits nothing.
+    pub source_limits: Option<SourceLimits>,
 }
 
 /// How a typed kernel error is rendered into a response body. See [`EdgeConfig::error_body`].
@@ -495,6 +505,7 @@ impl Default for EdgeConfig {
             push: None,
             error_body: ErrorBody::Text,
             endpoint_headers: EndpointHeader::DEFAULTS.to_vec(),
+            source_limits: None,
         }
     }
 }
@@ -1386,6 +1397,15 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
     if !declared.is_empty() && !declared.contains(&verb) {
         return method_not_allowed(allow);
     }
+    // PER-SOURCE RATE LIMIT (ledger #1717): counted once the request is one the resource would
+    // run, and refused before anything is built or invoked. `OPTIONS` and `?description` have
+    // answered above and are never counted.
+    if let Some(limits) = config.source_limits.as_ref() {
+        let source = source_key(client_ip(req, config).as_deref());
+        if let Some(limited) = limits.check(&iri_str, &source) {
+            return rate_limited(config, &limited);
+        }
+    }
 
     // Build the request. Query params are inspectable inputs (filters/data) the
     // composition can read; a write verb carries the body as the piped `content`,
@@ -1853,6 +1873,30 @@ fn tombstoned(shared: &Shared, key: &TombstoneKey) -> bool {
         }
     }
     false
+}
+
+/// The `429` a request past its per-source budget is answered with: `Retry-After` in whole
+/// seconds, and the refusal as a sentence (a page for a browser, through [`finish`]) or, under
+/// [`ErrorBody::Json`], as `{"kind":"rate-limited","message":…,"retry_after":…}`.
+fn rate_limited(config: &EdgeConfig, limited: &source_limit::Limited) -> Resp {
+    let retry_after = limited.retry_after_secs();
+    let mut resp = match config.error_body {
+        ErrorBody::Json => Resp {
+            content_type: "application/json".to_string(),
+            body: serde_json::json!({
+                "kind": "rate-limited",
+                "message": limited.message(),
+                "retry_after": retry_after,
+            })
+            .to_string()
+            .into_bytes(),
+            ..Resp::status(429, "Too Many Requests")
+        },
+        ErrorBody::Text => Resp::text(429, "Too Many Requests", &limited.message()),
+    };
+    resp.headers
+        .push(("Retry-After".to_string(), retry_after.to_string()));
+    resp
 }
 
 /// A `405` carrying the resource's `Allow` list.
@@ -4140,6 +4184,152 @@ mod tests {
             out.contains("client=203.0.113.9") && !out.contains("6.6.6.6"),
             "the rightmost hop is the one our proxy observed: {out}"
         );
+    }
+
+    /// A door whose only resource, `urn:test:counted`, is a Sink that counts its invocations,
+    /// served under per-source limits of two requests an hour.
+    async fn counted_door(
+        trust_proxy: bool,
+        error_body: ErrorBody,
+    ) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&runs);
+        let counted = FnEndpoint::new("counted", move |_inv: &Invocation<'_>| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"ok".to_vec(),
+            ))
+        })
+        .with_description(Description::new("counted").verb(Verb::Sink));
+        let kernel = Arc::new(Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:counted"), counted),
+        )));
+        let config = EdgeConfig {
+            trust_proxy,
+            error_body,
+            source_limits: Some(SourceLimits::new(vec![SourceRate::new(
+                "urn:test:counted",
+                2,
+                std::time::Duration::from_secs(3600),
+            )])),
+            ..EdgeConfig::default()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = serve_with_listener(kernel, public_cap(), listener, config).await;
+        });
+        (addr, runs)
+    }
+
+    fn post_counted(forwarded_for: &str, accept: &str) -> String {
+        format!(
+            "POST /test/counted HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: {forwarded_for}\r\n\
+             Accept: {accept}\r\nContent-Length: 2\r\n\r\nhi"
+        )
+    }
+
+    /// The `Retry-After` value of a raw response, in seconds.
+    fn retry_after(resp: &str) -> u64 {
+        resp.lines()
+            .find_map(|l| l.strip_prefix("Retry-After: "))
+            .unwrap_or_else(|| panic!("a Retry-After header: {resp}"))
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    /// Ledger #1717: one client past its budget is answered 429 with Retry-After and the
+    /// resource does not run; the client is the hop OUR proxy appended, so a forged leftmost
+    /// `X-Forwarded-For` buys no fresh budget; another client keeps its own; a browser gets the
+    /// refusal as a page; and `OPTIONS` is never counted.
+    #[tokio::test]
+    async fn a_source_past_its_budget_is_429_with_retry_after_and_the_resource_does_not_run() {
+        let (addr, runs) = counted_door(true, ErrorBody::Text).await;
+        let runs_now = || runs.load(std::sync::atomic::Ordering::SeqCst);
+        for n in 0..2 {
+            let ok = roundtrip(addr, &post_counted("203.0.113.9", "*/*")).await;
+            assert!(
+                ok.starts_with("HTTP/1.1 200 "),
+                "request {n} is in budget: {ok}"
+            );
+        }
+        assert_eq!(runs_now(), 2);
+        let refused = roundtrip(addr, &post_counted("203.0.113.9", "*/*")).await;
+        assert!(
+            refused.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
+            "{refused}"
+        );
+        let wait = retry_after(&refused);
+        assert!((3590..=3600).contains(&wait), "about an hour: {refused}");
+        assert!(
+            refused.contains("rate-limited: `urn:test:counted`"),
+            "{refused}"
+        );
+        assert_eq!(
+            runs_now(),
+            2,
+            "the refused request never reached the resource"
+        );
+
+        // A forged leftmost hop is not the client: the proxy's appended hop still counts.
+        let forged = roundtrip(addr, &post_counted("6.6.6.6, 203.0.113.9", "*/*")).await;
+        assert!(forged.starts_with("HTTP/1.1 429 "), "{forged}");
+        // A browser is told the same thing as a page.
+        let page = roundtrip(
+            addr,
+            &post_counted("203.0.113.9", "text/html,application/xhtml+xml"),
+        )
+        .await;
+        assert!(page.starts_with("HTTP/1.1 429 "), "{page}");
+        assert!(page.contains("Retry-After: "), "{page}");
+        assert!(page.contains("<h1>429 Too Many Requests</h1>"), "{page}");
+        // Another client has its own budget.
+        let other = roundtrip(addr, &post_counted("198.51.100.7", "*/*")).await;
+        assert!(other.starts_with("HTTP/1.1 200 "), "{other}");
+        assert_eq!(runs_now(), 3);
+        // OPTIONS answers without being counted or refused.
+        let options = roundtrip(
+            addr,
+            "OPTIONS /test/counted HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 203.0.113.9\r\n\r\n",
+        )
+        .await;
+        assert!(options.starts_with("HTTP/1.1 204 "), "{options}");
+    }
+
+    /// Without `trust_proxy` the source is the socket peer, so a client cannot buy a fresh
+    /// budget by writing a different `X-Forwarded-For` on each request.
+    #[tokio::test]
+    async fn an_untrusted_forwarded_for_buys_no_fresh_budget() {
+        let (addr, runs) = counted_door(false, ErrorBody::Text).await;
+        for hop in ["1.1.1.1", "2.2.2.2"] {
+            let ok = roundtrip(addr, &post_counted(hop, "*/*")).await;
+            assert!(ok.starts_with("HTTP/1.1 200 "), "{ok}");
+        }
+        let refused = roundtrip(addr, &post_counted("3.3.3.3", "*/*")).await;
+        assert!(refused.starts_with("HTTP/1.1 429 "), "{refused}");
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// Under `ErrorBody::Json` the refusal is typed: `kind` is `rate-limited` and
+    /// `retry_after` repeats the header.
+    #[tokio::test]
+    async fn a_json_door_types_the_rate_limit_refusal() {
+        let (addr, _) = counted_door(true, ErrorBody::Json).await;
+        for _ in 0..2 {
+            roundtrip(addr, &post_counted("203.0.113.9", "*/*")).await;
+        }
+        let refused = roundtrip(addr, &post_counted("203.0.113.9", "*/*")).await;
+        assert!(refused.starts_with("HTTP/1.1 429 "), "{refused}");
+        let (_, body) = refused.split_once("\r\n\r\n").unwrap();
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(json["kind"], "rate-limited", "{body}");
+        assert_eq!(json["retry_after"].as_u64(), Some(retry_after(&refused)));
+        assert!(json["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("rate-limited: "));
     }
 
     #[tokio::test]

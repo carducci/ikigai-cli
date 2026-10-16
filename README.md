@@ -621,6 +621,22 @@ plain link, since a link has no `Accept`). The source must sit
 under a `urn:cap:net:<host>` grant on the unit, so the allowlist is the capability,
 not code in the endpoint.
 
+**Per-client rate limits, on by default.** One client (the connection's peer, or, under
+`--trust-proxy`, the hop the proxy appended to `X-Forwarded-For`; an IPv6 client counts as its
+/64) may reach a limited resource only so often. Past its budget it is answered **`429 Too Many
+Requests` with `Retry-After`** (whole seconds until its oldest counted request ages out), and the
+resource does not run. The body is a sentence beginning `rate-limited:`, a page for a browser;
+`OPTIONS` and `?description` are never counted. The defaults, and the `config.toml` keys that
+change them (a bad line stops the door at start-up, naming it):
+
+| key | default | what it does |
+|---|---|---|
+| `http.rate_limit` | `urn:contact:submit 10/3600`, `urn:booking:submit 10/3600`, `urn:passkey:challenge 30/120` | one line per rule, `"<IRI prefix> <requests>/<seconds>"`; a line replaces the default for its prefix, and `"<IRI prefix> off"` drops it |
+| `http.rate_limit_sources` | 4096 | how many client windows the door tracks at once. Emptied windows are reclaimed first; past it a NEW client is refused (`429`), never let through untracked |
+| `passkey.max_challenges` | 4096 | passkey challenges outstanding at once (each lives 120 s). Past it a new challenge is refused with a transient error (`503`); none is evicted, so a sign-in already under way still completes. It bounds the challenge store on every door that serves `urn:passkey:challenge`, a layer door included |
+
+The banner names the limits in force (`rate limits per client: …`).
+
 > **Renamed in 0.1.20.** This shipped as a bare `urn:foaf` in 0.1.19 — an invented
 > top-level namespace rather than one we own. The old name still resolves, through an
 > `exact` rule in the host's alias table (`urn:kernel:aliases` lists it), so an existing

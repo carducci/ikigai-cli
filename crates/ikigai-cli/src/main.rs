@@ -21,6 +21,8 @@ mod front;
 mod layer;
 #[cfg(feature = "quic")]
 mod quic;
+#[cfg(all(feature = "embedded", feature = "web"))]
+mod rate_limits;
 mod repl;
 #[cfg(feature = "web")]
 mod route_load;
@@ -4450,6 +4452,28 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
     if push {
         config.push = Some(ikigai_web::PushConfig::default());
     }
+    // PER-CLIENT RATE LIMITS (ledger #1717), from the config home and on by default: the
+    // public intake (every contact or booking submission is an email to a person) and the
+    // passkey challenge. A line that does not parse stops the door, naming it; so does a bad
+    // `passkey.max_challenges`, the bound on the challenge store the limit protects.
+    let limits = match rate_limits::limits_from(&ikigai_embedded::config::entries_under(
+        rate_limits::RULE_KEY,
+    )) {
+        Ok(limits) => limits,
+        Err(e) => {
+            eprintln!(
+                "ikigai: {e} (in {})",
+                ikigai_embedded::config::config_path().display()
+            );
+            std::process::exit(2);
+        }
+    };
+    if let Err(e) = ikigai_embedded::passkey::check_config() {
+        eprintln!("ikigai: {e}");
+        std::process::exit(2);
+    }
+    let limits_note = rate_limits::describe(limits.as_ref());
+    config.source_limits = limits;
     // Build the async runtime up front — route loading (a kernel SPARQL query) is async too.
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -4567,7 +4591,7 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
     };
     let addr = listener.local_addr().unwrap_or(addr);
     eprintln!(
-        "ikigai: serving HTTP on {addr}  ({posture}; {route_note}; {cors_note}; {push_note}{proxy_note}; terminate TLS at your proxy)  (Ctrl-C to stop)"
+        "ikigai: serving HTTP on {addr}  ({posture}; {route_note}; {cors_note}; {push_note}{proxy_note}; {limits_note}; terminate TLS at your proxy)  (Ctrl-C to stop)"
     );
     // ★ The public door records its posture like any other — and `urn:host:posture` is
     // REACHABLE here (`GET /host/posture`) and REFUSED, because the public capability does
