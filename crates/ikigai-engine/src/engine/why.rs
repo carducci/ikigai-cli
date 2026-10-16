@@ -121,6 +121,8 @@ impl Engine {
         for word in rest {
             match word.split_once('=') {
                 Some(("scopes", value)) => scopes.push(value.to_string()),
+                // ledger #387: a second face is refused, never kept last-wins.
+                Some(("as", _)) if face.is_some() => return Err(super::given_twice("as")),
                 Some(("as", value)) => face = Some(value.to_string()),
                 Some(("verb", value)) => set_verb(&mut verb, value)?,
                 None if VERBS.contains(&word.as_str()) => set_verb(&mut verb, word)?,
@@ -231,6 +233,9 @@ impl Engine {
             .with_arg("thread", inline(thread.as_str()));
         for word in rest {
             match word.split_once('=') {
+                Some(("as", _)) if request.args.contains_key("as") => {
+                    return Err(super::given_twice("as"))
+                }
                 Some(("as", face)) => request = request.with_arg("as", inline(face)),
                 _ => {
                     return Err(format!(
@@ -636,6 +641,22 @@ mod tests {
         assert!(err(&engine, "why urn:test:stable extra").contains("one IRI"));
         assert!(err(&engine, "why").contains("usage"));
         assert!(err(&engine, "dependents urn:test:stable x=y").contains("`x=y`"));
+    }
+
+    /// ledger #387: a face named twice is refused, never kept last-wins.
+    #[test]
+    fn a_face_named_twice_is_refused() {
+        let engine = engine();
+        for line in [
+            "explain urn:test:stable as=text/plain as=text/turtle",
+            "dependents urn:test:stable as=text/plain as=text/turtle",
+        ] {
+            assert_eq!(
+                err(&engine, line),
+                "invalid argument `as`: given twice; an argument takes one value, so name it once",
+                "{line}"
+            );
+        }
     }
 
     #[derive(Default)]

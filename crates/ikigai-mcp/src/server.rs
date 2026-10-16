@@ -112,6 +112,7 @@ pub fn handle_line(
     match parse_line(line) {
         Parsed::Blank => None,
         Parsed::Unparsable(reply) => Some(reply),
+        Parsed::Repeated(msg, path) => refuse_repeated(&msg, &path),
         Parsed::Message(msg) => handle(kernel, capability, filter, &msg),
     }
 }
@@ -124,6 +125,10 @@ enum Parsed {
     Unparsable(Value),
     /// A JSON value, to dispatch.
     Message(Value),
+    /// A JSON value that names one member twice in one object, and the path to the repeat
+    /// (ledger #387). Parsing keeps the LAST value, so dispatching it would act on a message
+    /// the client did not unambiguously send: it is answered by [`refuse_repeated`] instead.
+    Repeated(Value, Vec<String>),
 }
 
 fn parse_line(line: &[u8]) -> Parsed {
@@ -133,13 +138,148 @@ fn parse_line(line: &[u8]) -> Parsed {
         return Parsed::Blank;
     }
     match serde_json::from_slice::<Value>(line) {
-        Ok(msg) => Parsed::Message(msg),
+        Ok(msg) => match repeated_member(line) {
+            Some(path) => Parsed::Repeated(msg, path),
+            None => Parsed::Message(msg),
+        },
         Err(e) => Parsed::Unparsable(err(
             Value::Null,
             PARSE_ERROR,
             "Parse error",
             Some(&e.to_string()),
         )),
+    }
+}
+
+/// The detail of every refusal of a name given twice (ledger #387).
+const GIVEN_TWICE: &str = "given twice; an argument takes one value, so name it once";
+
+/// The answer to a message that names a member twice (ledger #387). `serde_json` keeps the
+/// LAST of a repeated member, so `"arguments": {"graph": "A", "graph": "B"}` reached the
+/// endpoint as `graph=B` and the call answered as if nothing were wrong.
+///
+/// A repeated tool ARGUMENT is the caller's mistake in a well-formed call, so it is a tool
+/// result with `isError` naming the argument, the typed `InvalidArgument` form, which a
+/// model reads and repairs from. Any other repeated member makes the message itself
+/// ambiguous, so it is `-32600 Invalid Request` naming the member; a repeated `id` answers
+/// under `null`, since which id was meant is the ambiguity. A notification or a response is
+/// still never answered.
+fn refuse_repeated(msg: &Value, path: &[String]) -> Option<Value> {
+    let (id, method) = match shape(msg) {
+        Shape::Request { id, method } => (id, method),
+        Shape::Notification | Shape::Response => return None,
+        Shape::Invalid { id, reason } => {
+            return Some(err(id, INVALID_REQUEST, "Invalid Request", Some(&reason)))
+        }
+    };
+    if let ("tools/call", [params, arguments, name]) = (method, path) {
+        if params == "params" && arguments == "arguments" {
+            let refused = ikigai_core::Error::InvalidArgument {
+                name: name.clone(),
+                detail: GIVEN_TWICE.to_string(),
+            };
+            return Some(ok(id, tool_error(refused.to_string())));
+        }
+    }
+    let id = if path.first().map(String::as_str) == Some("id") {
+        Value::Null
+    } else {
+        id
+    };
+    let detail = format!(
+        "member `{}` is given twice; a message names each member of an object once",
+        path.join(".")
+    );
+    Some(err(id, INVALID_REQUEST, "Invalid Request", Some(&detail)))
+}
+
+/// The path to the first member named twice in one JSON object, anywhere in `line`, in
+/// document order (`["params", "arguments", "graph"]`; an array element is its index).
+/// `None` when every object names each member once, or when `line` does not parse.
+fn repeated_member(line: &[u8]) -> Option<Vec<String>> {
+    use serde::de::DeserializeSeed;
+    let mut path = Vec::new();
+    let mut found = None;
+    let mut de = serde_json::Deserializer::from_slice(line);
+    Walk {
+        path: &mut path,
+        found: &mut found,
+    }
+    .deserialize(&mut de)
+    .ok()?;
+    found
+}
+
+/// A JSON walk that keeps nothing but the path to the first repeated member.
+struct Walk<'a> {
+    path: &'a mut Vec<String>,
+    found: &'a mut Option<Vec<String>>,
+}
+
+impl Walk<'_> {
+    fn child(&mut self) -> Walk<'_> {
+        Walk {
+            path: &mut *self.path,
+            found: &mut *self.found,
+        }
+    }
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for Walk<'_> {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, de: D) -> Result<(), D::Error> {
+        de.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for Walk<'_> {
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a JSON value")
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_str<E>(self, _: &str) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_unit<E>(self) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(mut self, mut seq: A) -> Result<(), A::Error> {
+        let mut index = 0usize;
+        loop {
+            self.path.push(index.to_string());
+            let more = seq.next_element_seed(self.child())?;
+            self.path.pop();
+            if more.is_none() {
+                return Ok(());
+            }
+            index += 1;
+        }
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(mut self, mut map: A) -> Result<(), A::Error> {
+        let mut seen = std::collections::HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !seen.insert(key.clone()) && self.found.is_none() {
+                let mut at = self.path.clone();
+                at.push(key.clone());
+                *self.found = Some(at);
+            }
+            self.path.push(key);
+            map.next_value_seed(self.child())?;
+            self.path.pop();
+        }
+        Ok(())
     }
 }
 
@@ -778,6 +918,12 @@ pub fn serve_concurrent<W: std::io::Write + Send>(
                     write_line(output, &reply)?;
                     continue;
                 }
+                Parsed::Repeated(msg, path) => {
+                    if let Some(reply) = refuse_repeated(&msg, &path) {
+                        write_line(output, &reply)?;
+                    }
+                    continue;
+                }
                 Parsed::Message(msg) => msg,
             };
             let id = match shape(&msg) {
@@ -922,6 +1068,97 @@ mod tests {
         );
         let space = EndpointSpace::new().bind(Exact::new("urn:demo:echo"), echo);
         Kernel::new(Arc::new(space))
+    }
+
+    /// An endpoint with an OPTIONAL by-value argument, echoing what reached it.
+    fn pick_kernel() -> Kernel {
+        let pick = FnEndpoint::new("pick", |inv| {
+            let graph = inv.inline_str("graph").unwrap_or("-");
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("graph={graph}").into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("pick")
+                .verb(Verb::Source)
+                .input(ArgSpec::new("graph").optional().summary("one graph")),
+        );
+        Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:demo:pick"), pick),
+        ))
+    }
+
+    const GIVEN_TWICE_TEXT: &str =
+        "invalid argument `graph`: given twice; an argument takes one value, so name it once";
+
+    /// ledger #387, the MCP spelling of a repeat: a JSON object naming `graph` twice. It
+    /// parsed LAST-WINS and the call answered `graph=B` as if nothing were wrong; now it is a
+    /// tool error naming the argument, through `handle_line` and the stdio loop alike.
+    #[test]
+    fn a_tool_argument_given_twice_is_refused_by_name() {
+        let line = br#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"pick__source","arguments":{"graph":"A","graph":"B"}}}"#;
+        let (cap, filter) = (Capability::root(), ToolFilter::default());
+        let reply = handle_line(&pick_kernel(), &cap, &filter, line).unwrap();
+        assert_eq!(reply["id"], 4, "{reply}");
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert_eq!(reply["result"]["content"][0]["text"], GIVEN_TWICE_TEXT);
+
+        let mut out = Vec::new();
+        let input = [&line[..], b"\n"].concat();
+        serve_io(&pick_kernel(), &cap, &input[..], &mut out).unwrap();
+        let reply: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(reply["result"]["content"][0]["text"], GIVEN_TWICE_TEXT);
+
+        // Named once, the call is untouched.
+        let once = br#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"pick__source","arguments":{"graph":"A"}}}"#;
+        let reply = handle_line(&pick_kernel(), &cap, &filter, once).unwrap();
+        assert_eq!(reply["result"]["content"][0]["text"], "graph=A", "{reply}");
+    }
+
+    /// ledger #387: a repeated member outside `arguments` makes the message itself ambiguous,
+    /// so it is `-32600` naming the member; a repeated `id` answers under `null`.
+    #[test]
+    fn a_repeated_member_elsewhere_is_an_invalid_request() {
+        let (cap, filter) = (Capability::root(), ToolFilter::default());
+        let reply = handle_line(
+            &pick_kernel(),
+            &cap,
+            &filter,
+            br#"{"jsonrpc":"2.0","id":1,"id":2,"method":"ping"}"#,
+        )
+        .unwrap();
+        assert_eq!(reply["id"], Value::Null, "{reply}");
+        assert_eq!(reply["error"]["code"], INVALID_REQUEST, "{reply}");
+        assert!(
+            reply["error"]["data"]
+                .as_str()
+                .is_some_and(|d| d.contains("member `id` is given twice")),
+            "{reply}"
+        );
+        let reply = handle_line(
+            &pick_kernel(),
+            &cap,
+            &filter,
+            br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"pick__source","name":"pick__source","arguments":{}}}"#,
+        )
+        .unwrap();
+        assert_eq!(reply["id"], 3, "{reply}");
+        assert_eq!(reply["error"]["code"], INVALID_REQUEST, "{reply}");
+        assert!(
+            reply["error"]["data"]
+                .as_str()
+                .is_some_and(|d| d.contains("member `params.name` is given twice")),
+            "{reply}"
+        );
+        // A notification is never answered, a repeat or not.
+        assert!(handle_line(
+            &pick_kernel(),
+            &cap,
+            &filter,
+            br#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{"a":1,"a":2}}"#,
+        )
+        .is_none());
     }
 
     #[test]
