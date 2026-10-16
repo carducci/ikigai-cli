@@ -3006,6 +3006,7 @@ name = "ikigai-cli"
 version = "0.1.63"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "crossterm",
  "futures",
  "ikigai-core",
@@ -3020,9 +3021,13 @@ dependencies = [
  "ikigai-web",
  "ikigai-wire",
  "libc",
+ "mime_guess",
+ "oxrdf",
+ "oxttl",
  "ratatui",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "tokio",
  "tokio-rustls",
  "toml 0.8.23",

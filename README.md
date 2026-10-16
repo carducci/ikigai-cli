@@ -444,6 +444,33 @@ ikigai --override urn:layer:,urn:layers:,urn:collab:=quic://door.example:4434 \
        --cert-dir ~/.ikigai/layers-client/me -c 'source urn:layers:feed after=talk:0'
 ```
 
+**Posting briefs, issues and files** (ledger #1629). A layer whose shapes take them holds an
+`ik:Brief` (work, written to be done), an `ik:Issue` (a problem, written to be fixed) and an
+`ik:File` (an attachment) beside its messages. `ikigai layers post` composes the entry for you
+(every Turtle literal escaped; a file's SHA-256, size, and its bytes as text or base64) and
+sends it as `sink urn:layer:{layer}:say`, through whatever routes `urn:layer:` in this process,
+so the connection flags come BEFORE `layers`:
+
+```bash
+at() { ikigai --override urn:layer:,urn:layers:,urn:collab:=quic://door.example:4434 \
+             --cert-dir ~/.ikigai/layers-client/me "$@"; }
+at layers post brief talk brief.md --repo ikigai-rs/ikigai-core   # title: its first `# ` heading
+at layers post issue talk --title "Crash on start" --severity major < issue.md
+at layers post file talk ./trace.log --in-reply-to urn:layer:talk:entry:…
+at layers save urn:layer:talk:entry:… ./incoming/                 # size and digest checked
+```
+
+Each post prints the IRI the door gave the entry; every kind takes `--in-reply-to ENTRY` and
+`--supersedes ENTRY`. A file over the layer's content bound is refused before it is sent, saying how large a file the layer takes.
+`save` writes a file entry's bytes only after checking them against its `ik:byteSize` and
+`ik:contentHash`: a door checks an entry's shape, never that its digest is true, so this is the
+check that matters, and on a mismatch nothing is written and it exits 1. It replaces an existing
+file only with `--force`. Reading one kind needs no subcommand:
+`source urn:layer:talk:entries type=https://ikigai-rs.dev/ns#Brief`. The commands, flags and
+refusals are the Python participant client's
+([ikigai-layers-client](https://github.com/ikigai-rs/ikigai-layers-client): `ikigai-layers post`,
+`ikigai-layers save`); `ikigai layers --help` lists them.
+
 The three-flag form (`--override urn:layer:=… --cert-dir D --override urn:layers:=…
 --cert-dir D …`) still works; it opens three connections. A comma cannot appear inside a
 prefix, and an empty or repeated prefix in a list is refused. ⚠ An older binary reads the

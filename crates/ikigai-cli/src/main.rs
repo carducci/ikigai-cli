@@ -17,6 +17,8 @@
 mod clipboard;
 #[cfg(all(feature = "embedded", feature = "quic", feature = "web"))]
 mod front;
+#[cfg(feature = "embedded")]
+mod layer;
 #[cfg(feature = "quic")]
 mod quic;
 mod repl;
@@ -166,6 +168,16 @@ usage:
                                home stores its hash, re-read on every request
   ikigai layers-token list     the tokens: id, the client each is bound to, label, minted
   ikigai layers-token revoke <id>  remove one; its next request is refused (401)
+  ikigai [flags] layers post brief|issue|file <layer> …
+                               post an ik:Brief, ik:Issue or ik:File to a layer, the entry composed
+                               for you (the Turtle escaped; a file's SHA-256, size, and text or
+                               base64), through whatever routes urn:layer: (--override … --cert-dir,
+                               --connect, a config-home mount): `ikigai --override
+                               urn:layer:,urn:layers:,urn:collab:=quic://door:4434 --cert-dir <d>
+                               layers post file talk ./trace.log`. Prints the entry's IRI
+  ikigai [flags] layers save <entry> [<path>] [--force]
+                               write a posted file back to disk after checking its size and
+                               SHA-256 against what the entry says; `ikigai layers --help` for all
   ikigai -c '<command>' ...    run command(s) non-interactively, then exit. Each -c is ONE
                                statement (a newline does not split it): repeat -c for more
   ikigai -e '<sexpr>' ...       evaluate a Lisp s-expression (urn:lisp:eval), then exit
@@ -445,6 +457,10 @@ struct ReplArgs {
     /// happens to have. For demonstrating the tuplespace on a machine with no daemon —
     /// never alongside one.
     react: bool,
+    /// `layers post|save …` (ledger #1629): run that against this engine instead of a REPL
+    /// or a `-c` batch. Everything after `layers` on the command line is its own.
+    #[cfg(feature = "embedded")]
+    layers: Option<layer::Command>,
 }
 
 /// One `--mount`: where it binds, what it connects to, and the certificates for
@@ -1559,6 +1575,11 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
             "--react" => {
                 repl.react = true;
             }
+            #[cfg(feature = "embedded")]
+            "layers" => {
+                // Everything after it is the subcommand's; connection flags come before it.
+                repl.layers = Some(layer::parse(argv.by_ref())?);
+            }
             "--prefer" => {
                 // `--prefer <prefix>=<target>`: an override that DEGRADES. The
                 // remote answers when it can; a transient failure (peer asleep,
@@ -1614,6 +1635,13 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
     // Both postures at once is a startup error, not a precedence rule (see `Mounts`) — for
     // the REPL, the one-shot `-c`, and `--daemon`, which share this parse.
     repl.mounts.refuse_conflict()?;
+    #[cfg(feature = "embedded")]
+    if repl.layers.is_some() && (daemon || repl.react || !repl.commands.is_empty()) {
+        return Err(
+            "`layers` runs one command and exits: drop -c/-e/--load, --daemon and --react"
+                .to_string(),
+        );
+    }
     if daemon {
         return Ok(Some(Mode::Daemon {
             mounts: repl.mounts,
@@ -1764,11 +1792,26 @@ fn main() {
             if args.demo {
                 ikigai_embedded::demo_flag().store(true, std::sync::atomic::Ordering::SeqCst);
             }
+            // `layers post|save` (ledger #1629): everything local first (a bad name, an
+            // unreadable file, the entry composed), so a usage problem is refused before
+            // anything is dialed; then the same engine a `-c` batch gets, and one command.
+            let layers = match args.layers.clone().map(layer::prepare) {
+                None => None,
+                Some(Ok(layer::Prepared::Help)) => {
+                    println!("{}", layer::USAGE);
+                    return;
+                }
+                Some(Ok(prepared)) => Some(prepared),
+                Some(Err(e)) => {
+                    eprintln!("ikigai: {e}");
+                    std::process::exit(layer::EXIT_USAGE);
+                }
+            };
             if args.connect.is_some() {
                 refuse_arrangement_flag("`--connect`, which resolves on another kernel,");
             } else {
                 arm_local_root();
-                arm_bayes(!args.quiet && args.commands.is_empty());
+                arm_bayes(!args.quiet && args.commands.is_empty() && layers.is_none());
             }
             let (engine, topology) =
                 build_engine(args.connect, args.mounts, &args.certs, args.react).unwrap_or_else(
@@ -1777,6 +1820,9 @@ fn main() {
                         std::process::exit(1);
                     },
                 );
+            if let Some(prepared) = layers {
+                std::process::exit(layer::run(&engine, prepared));
+            }
             run_repl(engine, args.plain, args.quiet, &args.commands, &topology);
         }
     }
