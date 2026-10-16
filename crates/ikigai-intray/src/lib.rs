@@ -25,6 +25,9 @@
 //! levels or past the store's algebra bounds, and parsed and evaluated on a stack sized for
 //! its text within a TIME budget, the caller answered with a `Timeout` at it (see
 //! `with_template`).
+//! A TUPLE is bounded the same way where a match parses it: one that nests RDF 1.2 triple
+//! terms deeper than 64 is refused at `out`, and one already on disk is never parsed, so it
+//! never matches (see `check_tuple_nesting`).
 //!
 //! The space is *physical and inspectable* — tuples are files under a jailed root, moving
 //! through an **inbox → outbox → error** state machine. The [`SpaceReactor`] makes a space
@@ -626,6 +629,52 @@ fn parse_match(query: &str) -> Result<spargebra::Query> {
 const MATCH_REMEDY: &str = "A match is evaluated against one tuple's graph and never leaves \
      this host: put the data it needs in the tuple.";
 
+/// Refuse a tuple that nests RDF 1.2 triple terms deeper than
+/// [`ikigai_store::depth::MAX_RDF_NESTING`] (64), as a typed `InvalidArgument` on `content`,
+/// before anything is written (ledger #992).
+///
+/// Every `match=` parses every pending tuple as Turtle ([`tuple_matches`]), and in a build
+/// with RDF 1.2 on (the host's, through rudof) oxttl builds a nested triple term, and oxrdf
+/// copies and drops it, recursively, once per level. A stack overflow aborts the whole
+/// process, so a caller holding only [`CAP_OUT`] could drop a tuple about 1 MB deep that
+/// aborted the host on the next match ANYONE made, on a stack sized for the template, which
+/// says nothing about the tuples. So `out` refuses it, and [`tuple_matches`] never parses one
+/// that is already on disk (written before this bound, or by anything else that writes the
+/// tree): it simply does not match, like a tuple that is not RDF, rather than failing the
+/// match, since one planted tuple failing every caller's match would be the same denial by
+/// another route.
+///
+/// The scan is the store's ([`ikigai_store::depth::check_rdf_nesting`]), which reads text
+/// the way oxttl's STRICT Turtle lexer does, the mode a match parses in. ⚠ It reads text, not
+/// intent: a tuple that is not RDF but has more than 64 unclosed `<<` outside quotes, `<…>`
+/// and `#` comments (a long C++ `cout << …` chain, say) is refused too. Seal or encode such a
+/// tuple; a sealed one is ciphertext and never reads that way.
+fn check_tuple_nesting(content: &[u8]) -> Result<()> {
+    ikigai_store::depth::check_rdf_nesting(content, RdfFormat::Turtle, "content").map_err(|e| {
+        match e {
+            Error::InvalidArgument { .. } => Error::InvalidArgument {
+                name: "content".to_string(),
+                detail: format!(
+                    "this tuple, read as Turtle the way every `match=` reads it, nests RDF 1.2 \
+                     triple terms deeper than {} (MAX_RDF_NESTING), counting `<<( … )>>` and \
+                     `<< … >>` outside literals, IRIs and comments: the RDF library copies a \
+                     nested triple term recursively, once per level, where a stack overflow \
+                     aborts the whole host. Nothing was dropped. A tuple that is not RDF and \
+                     only reads this way: seal or encode it",
+                    ikigai_store::depth::MAX_RDF_NESTING
+                ),
+            },
+            other => other,
+        }
+    })
+}
+
+/// Whether a tuple on disk nests too deep to parse: [`check_tuple_nesting`]'s question,
+/// asked of a tuple a match is about to read.
+fn nests_too_deep(bytes: &[u8]) -> bool {
+    check_tuple_nesting(bytes).is_err()
+}
+
 /// Does a tuple's graph satisfy the template (from [`parse_match`])? The tuple is parsed as
 /// Turtle into the default graph; a tuple that isn't valid RDF simply never matches. `token`
 /// is the evaluation's, from [`with_template`]: oxigraph stops at its next dataset access once
@@ -635,6 +684,9 @@ fn tuple_matches(
     bytes: &[u8],
     token: &CancellationToken,
 ) -> Result<bool> {
+    if nests_too_deep(bytes) {
+        return Ok(false); // never parsed: see [`check_tuple_nesting`]
+    }
     let store = Store::new().map_err(|e| Error::Endpoint(format!("match: store init: {e}")))?;
     if store
         .load_from_slice(RdfParser::from_format(RdfFormat::Turtle), bytes)
@@ -739,6 +791,7 @@ impl Endpoint for SpaceEndpoint {
                 let content = inv
                     .inline_arg("content")
                     .map_err(|_| Error::MissingArgument("content".to_string()))?;
+                check_tuple_nesting(content)?;
                 let id = tuple_id(content);
                 std::fs::create_dir_all(&inbox)
                     .map_err(|e| Error::Endpoint(format!("space `{name}`: create inbox: {e}")))?;
@@ -997,7 +1050,11 @@ impl Endpoint for SpaceEndpoint {
                         ArgSpec::new("content")
                             .optional()
                             .class(XSD_STRING)
-                            .summary("the tuple to drop (the piped value); omit only with `retry=`"),
+                            .summary(
+                                "the tuple to drop (the piped value); omit only with `retry=`. \
+                                 Refused if, read as Turtle, it nests RDF 1.2 triple terms \
+                                 deeper than 64",
+                            ),
                     )
                     .input(
                         ArgSpec::new("retry")

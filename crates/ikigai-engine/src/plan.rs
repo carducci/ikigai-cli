@@ -435,6 +435,22 @@ struct Graph {
 #[cfg(feature = "plan-reader")]
 impl Graph {
     fn parse(turtle: &str) -> Result<Graph, String> {
+        // Bounded before it is parsed (ledger #992): oxttl and oxrdf build, copy and drop a
+        // nested RDF 1.2 triple term recursively, so a stored plan a few thousand levels deep
+        // would abort whoever reads it, the REPL's `run` included. The plan doors refuse it as
+        // an argument first (`plan_space::plan_text`); this covers every other reader.
+        if let Err(refusal) = ikigai_store::depth::check_rdf_nesting(
+            turtle.as_bytes(),
+            oxigraph::io::RdfFormat::Turtle,
+            "plan",
+        ) {
+            return Err(match refusal {
+                ikigai_core::Error::InvalidArgument { detail, .. } => {
+                    format!("the plan is not read: {detail}")
+                }
+                other => other.to_string(),
+            });
+        }
         let mut subjects: BTreeMap<String, BTreeMap<String, Vec<Obj>>> = BTreeMap::new();
         for triple in TurtleParser::new().for_slice(turtle.as_bytes()) {
             let triple = triple.map_err(|e| format!("the plan is not valid Turtle: {e}"))?;
@@ -2036,5 +2052,27 @@ mod tests {
         };
         let err = Plan::from_turtle(&plan.to_turtle(None)).expect_err("should refuse");
         assert!(err.contains("two bodies"), "{err}");
+    }
+
+    #[test]
+    fn a_stored_plan_nested_past_the_bound_is_not_read() {
+        // The reader every non-door path takes (the REPL's `run`, `Plan::from_turtle`) bounds
+        // triple-term nesting before it parses, as the plan doors do (ledger #992): the
+        // depth that aborts is far past this, and `tests/plan_nesting.rs` shows the abort.
+        let nested = |n: usize| {
+            format!(
+                "<urn:s> <urn:p> {}<urn:o>{} .",
+                "<<( <urn:s> <urn:p> ".repeat(n),
+                " )>>".repeat(n)
+            )
+        };
+        let err = Plan::from_turtle(&nested(65)).expect_err("too deep");
+        assert!(
+            err.starts_with("the plan is not read:") && err.contains("MAX_RDF_NESTING"),
+            "{err}"
+        );
+        // At the bound it is parsed, and refused for what it is: a triple term is no plan.
+        let err = Plan::from_turtle(&nested(64)).expect_err("not a plan");
+        assert!(!err.contains("MAX_RDF_NESTING"), "{err}");
     }
 }
