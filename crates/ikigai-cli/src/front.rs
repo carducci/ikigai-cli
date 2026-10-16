@@ -246,6 +246,18 @@ pub fn route(req: &HttpRequest) -> Result<Routed, Response> {
         .filter(|(k, _)| k != "principal" && k != "content")
         .map(|(k, v)| (k.clone(), v.clone().into_bytes()))
         .collect();
+    // ledger #387: a request holds one value per name and `with_arg` keeps the last, so a
+    // repeated name is refused here rather than narrowed silently on its way in.
+    let mut seen: Vec<&str> = Vec::new();
+    for (name, _) in &args {
+        if seen.contains(&name.as_str()) {
+            return Err(error_response(&Error::InvalidArgument {
+                name: name.clone(),
+                detail: "given twice; an argument takes one value, so name it once".into(),
+            }));
+        }
+        seen.push(name);
+    }
     if let Some(face) = face {
         if !args.iter().any(|(k, _)| k == "as") {
             args.push(("as".to_string(), face.as_bytes().to_vec()));
@@ -691,6 +703,40 @@ mod tests {
         .unwrap();
         assert_eq!(arg(&turtle, "as"), Some("text/turtle"));
         assert_eq!(turtle.args.iter().filter(|(k, _)| k == "as").count(), 1);
+    }
+
+    /// ledger #387: `?after=3&after=9` reached the layer as `after=9`, silently. A repeated
+    /// argument is a 400 naming it, in the typed JSON every refusal carries.
+    #[test]
+    fn a_repeated_query_argument_is_refused_by_name() {
+        for (path, query) in [
+            ("/layer/talk/entries", [("after", "3"), ("after", "9")]),
+            ("/layer/talk/entries", [("as", "text/turtle"), ("as", LD)]),
+        ] {
+            let refused = route(&req("GET", path, &query, b"")).unwrap_err();
+            assert_eq!(refused.status, 400, "{query:?}");
+            let body: serde_json::Value = serde_json::from_slice(&refused.body).unwrap();
+            assert_eq!(body["kind"], "invalid-argument", "{body}");
+            assert_eq!(body["name"], query[0].0, "{body}");
+            assert_eq!(
+                body["message"],
+                format!(
+                    "invalid argument `{}`: given twice; an argument takes one value, so name \
+                     it once",
+                    query[0].0
+                ),
+                "{body}"
+            );
+        }
+        // A repeat of a name the front drops is not an argument, so it is not refused.
+        let routed = route(&req(
+            "GET",
+            "/layer/talk/entries",
+            &[("principal", "a"), ("principal", "b"), ("after", "3")],
+            b"",
+        ))
+        .unwrap();
+        assert_eq!(arg(&routed, "after"), Some("3"));
     }
 
     #[test]

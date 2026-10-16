@@ -15,8 +15,9 @@ its own crate for the browser build to reuse unchanged.
   engine asks the target endpoint for its parameter contract (a `Meta` request
   rendered as `application/json`) and routes by it — handling an endpoint that reads
   a differently-named argument, several arguments, or only a grammar binding. A
-  `key=value` word names a declared argument; positional or piped text fills the one
-  argument left unnamed. The contract is fetched through `issue`, so it works the
+  `key=value` word names a declared argument, once: `graph=A graph=B` is refused as an invalid
+  argument `graph`, "given twice", never narrowed to the last value. Positional
+  or piped text fills the one argument left unnamed. The contract is fetched through `issue`, so it works the
   same against a remote kernel. When the fetch FAILS (a kernel with no Meta renderer,
   a refusal, an answer that is not a JSON description), routing falls back to the
   conventional `in`, as it always did, and since 0.1.62 the line says so:

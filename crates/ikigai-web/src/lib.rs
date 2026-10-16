@@ -1397,6 +1397,20 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
     if !declared.is_empty() && !declared.contains(&verb) {
         return method_not_allowed(allow);
     }
+    // A REPEATED ARGUMENT is refused (ledger #387). A `Request` holds one value per name, so
+    // `?graph=A&graph=B` reached the resource as `graph=B` and a join answered 200 with an
+    // empty table; `?as=` kept the FIRST. No argument can be declared repeatable yet, so any
+    // repeat of a name the request carries is a 400 naming it, before anything is counted or
+    // built.
+    if let Some(name) = repeated_argument(req, verb) {
+        return error_resp(
+            config,
+            &ikigai_core::Error::InvalidArgument {
+                name: name.to_string(),
+                detail: "given twice; an argument takes one value, so name it once".to_string(),
+            },
+        );
+    }
     // PER-SOURCE RATE LIMIT (ledger #1717): counted once the request is one the resource would
     // run, and refused before anything is built or invoked. `OPTIONS` and `?description` have
     // answered above and are never counted.
@@ -1826,6 +1840,26 @@ fn forwarded_query(req: &HttpRequest, verb: Verb) -> impl Iterator<Item = (&str,
             !reserved
         })
         .map(|(k, v)| (k.as_str(), v.as_str()))
+}
+
+/// The first query name the request would carry into the kernel twice: `as`, or any name
+/// [`forwarded_query`] passes on (ledger #387). Reserved names the door drops are not
+/// arguments of the request, so their repeats are not counted.
+fn repeated_argument(req: &HttpRequest, verb: Verb) -> Option<&str> {
+    let names = req
+        .query
+        .iter()
+        .filter(|(k, _)| k == "as")
+        .map(|(k, _)| k.as_str())
+        .chain(forwarded_query(req, verb).map(|(k, _)| k));
+    let mut seen: Vec<&str> = Vec::new();
+    for name in names {
+        if seen.contains(&name) {
+            return Some(name);
+        }
+        seen.push(name);
+    }
+    None
 }
 
 /// What a DELETE tombstone is keyed on: the target IRI AND the query arguments the kernel was
@@ -4433,6 +4467,53 @@ mod tests {
         .await;
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
         assert!(resp.ends_with("priya"), "arg should echo, got: {resp}");
+    }
+
+    /// ledger #387: `?name=priya&name=ada` reached the resource as `name=ada` (last-wins) and
+    /// answered 200; `?as=` kept the first. A repeated argument is now a 400 naming it, typed.
+    #[tokio::test]
+    async fn a_repeated_query_argument_is_refused_by_name() {
+        let addr = start().await;
+        for (query, name) in [("name=priya&name=ada", "name"), ("as=a&name=x&as=b", "as")] {
+            let resp = roundtrip(
+                addr,
+                &format!("GET /test/echo?{query} HTTP/1.1\r\nHost: x\r\n\r\n"),
+            )
+            .await;
+            assert!(resp.starts_with("HTTP/1.1 400 "), "{query}: {resp}");
+            assert!(
+                resp.ends_with(&format!(
+                    "invalid argument `{name}`: given twice; an argument takes one value, so \
+                     name it once"
+                )),
+                "{query}: {resp}"
+            );
+        }
+        // The typed body, when the door answers errors as JSON.
+        let addr = start_with(EdgeConfig {
+            error_body: ErrorBody::Json,
+            ..EdgeConfig::default()
+        })
+        .await;
+        let resp = roundtrip(
+            addr,
+            "GET /test/echo?name=priya&name=ada HTTP/1.1\r\nHost: x\r\n\r\n",
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 400 "), "{resp}");
+        assert!(
+            resp.contains(r#""kind":"invalid-argument""#) && resp.contains(r#""name":"name""#),
+            "{resp}"
+        );
+        // Two different names, and a repeat of a name the door drops, are not refused.
+        let addr = start().await;
+        let resp = roundtrip(
+            addr,
+            "GET /test/echo?name=priya&other=1&principal=a&principal=b HTTP/1.1\r\nHost: x\r\n\r\n",
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+        assert!(resp.ends_with("priya"), "{resp}");
     }
 
     #[tokio::test]

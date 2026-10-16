@@ -73,8 +73,8 @@ use ikigai_core::{ArgRef, Description, Provenance, Request};
 #[cfg(feature = "plan-reader")]
 use crate::engine::{combine_outputs, root_provenance, Staged};
 use crate::engine::{
-    declared_arguments, parse_spec, parse_target, route_value_name, Connector, Engine, Node,
-    Pipeline,
+    declared_arguments, given_twice, parse_spec, parse_target, route_value_name, Connector, Engine,
+    Node, Pipeline,
 };
 
 /// The ikigai vocabulary namespace — the terms a plan graph is written in.
@@ -1227,14 +1227,23 @@ impl Engine {
                     let mut arguments = BTreeMap::new();
                     let mut positional: Vec<&str> = Vec::new();
                     for arg in args {
-                        match arg.split_once('=') {
-                            Some(("as", value)) => {
-                                arguments.insert("as".to_string(), value.to_string());
-                            }
+                        let named = match arg.split_once('=') {
+                            Some(("as", value)) => ("as", value),
                             Some((key, value)) if declared.iter().any(|name| name == key) => {
-                                arguments.insert(key.to_string(), value.to_string());
+                                (key, value)
                             }
-                            _ => positional.push(arg),
+                            _ => {
+                                positional.push(arg);
+                                continue;
+                            }
+                        };
+                        // ledger #387: the text face's refusal, so a plan never records the
+                        // one value a repeat would have silently kept.
+                        if arguments
+                            .insert(named.0.to_string(), named.1.to_string())
+                            .is_some()
+                        {
+                            return Err(given_twice(named.0));
                         }
                     }
                     let positional = positional.join(" ");
@@ -1275,10 +1284,20 @@ impl Engine {
                     for arg in args {
                         match arg.split_once('=') {
                             Some(("as", value)) => {
-                                arguments.insert("as".to_string(), value.to_string());
+                                if arguments
+                                    .insert("as".to_string(), value.to_string())
+                                    .is_some()
+                                {
+                                    return Err(given_twice("as"));
+                                }
                             }
                             Some((key, value)) if declared.iter().any(|name| name == key) => {
-                                arguments.insert(key.to_string(), value.to_string());
+                                if arguments
+                                    .insert(key.to_string(), value.to_string())
+                                    .is_some()
+                                {
+                                    return Err(given_twice(key));
+                                }
                             }
                             _ => {
                                 return Err(format!(

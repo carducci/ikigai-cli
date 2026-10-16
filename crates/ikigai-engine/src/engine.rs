@@ -9,7 +9,8 @@
 //! asks the target endpoint for its parameter contract (a `Meta` request rendered
 //! as `application/json`) and routes by it — so an endpoint that reads a
 //! differently-named argument, several arguments, or only a grammar binding is
-//! handled correctly. A `key=value` word names a declared argument; the
+//! handled correctly. A `key=value` word names a declared argument, once (a
+//! repeat is refused, ledger #387); the
 //! positional text or piped value fills the one argument left unnamed. The
 //! contract is fetched through `issue`, so this works the same against a remote
 //! kernel.
@@ -173,6 +174,7 @@ commands:
 arguments:
   `key=value` sets an argument by name (`key` must be a declared argument of the
   target); any other word is positional and fills the one argument left unnamed.
+  each name is given once: `graph=A graph=B` is refused, never narrowed to one value.
 
 quoting:
   wrap a word in \"…\" to keep `|`, `..`, `(`, `)`, `;`, or spaces literal inside an
@@ -1581,7 +1583,12 @@ impl Engine {
 
         let mut request = Request::new(verb, iri.clone());
         let mut content_named = false;
+        let mut seen: Vec<&str> = Vec::new();
         while let Some((key, value, after)) = take_named_arg(tail, &declared) {
+            if seen.contains(&key) {
+                return Err(given_twice(key));
+            }
+            seen.push(key);
             content_named |= key == "content";
             request = request.with_arg(key, ArgRef::Inline(value.into_bytes()));
             tail = after;
@@ -1683,6 +1690,9 @@ impl Engine {
                 }
                 _ => positional.push(arg),
             }
+        }
+        if let Some(name) = first_repeated(named.iter().map(|(name, _)| *name)) {
+            return Err(given_twice(name));
         }
         let positional = positional.join(" ");
 
@@ -1788,6 +1798,14 @@ impl Engine {
 
         let mut request = Request::new(Verb::Sink, iri.clone());
         let mut content_named = false;
+        let named = args.iter().filter_map(|arg| match arg.split_once('=') {
+            Some(("as", _)) => Some("as"),
+            Some((key, _)) if declared.iter().any(|name| name == key) => Some(key),
+            _ => None,
+        });
+        if let Some(name) = first_repeated(named) {
+            return Err(given_twice(name));
+        }
         for arg in args {
             match arg.split_once('=') {
                 // `as` is the universal conneg selector (carried as an arg, not
@@ -3177,6 +3195,37 @@ fn cache_word(status: CacheStatus) -> &'static str {
 /// a purely structural match — the old "does not grant" text bridge is gone.
 fn is_denial(error: &ikigai_core::Error) -> bool {
     matches!(error, ikigai_core::Error::Denied(_))
+}
+
+/// The refusal for a named argument given twice (ledger #387), in the typed
+/// `InvalidArgument` display form every face shares.
+///
+/// A [`Request`] holds ONE value per name and `with_arg` is last-wins, so `graph=A graph=B`
+/// used to reach the endpoint as `graph=B` with no word said: a join came back empty and
+/// looked like an answer. No `ArgSpec` can declare an argument repeatable yet, so there is no
+/// endpoint to pass several values to, and a repeat is refused outright.
+///
+/// ```text
+/// invalid argument `graph`: given twice; an argument takes one value, so name it once
+/// ```
+pub(crate) fn given_twice(name: &str) -> String {
+    ikigai_core::Error::InvalidArgument {
+        name: name.to_string(),
+        detail: "given twice; an argument takes one value, so name it once".to_string(),
+    }
+    .to_string()
+}
+
+/// The first name that appears twice in `names`, in order (ledger #387).
+pub(crate) fn first_repeated<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    let mut seen: Vec<&str> = Vec::new();
+    for name in names {
+        if seen.contains(&name) {
+            return Some(name);
+        }
+        seen.push(name);
+    }
+    None
 }
 
 /// Split off the first whitespace-delimited token; trim the remainder.
@@ -6548,6 +6597,77 @@ mod tests {
         assert_eq!(
             output(greet_engine().eval("source urn:demo:greet name=World greeting=Hi")).unwrap(),
             "Hi, World"
+        );
+    }
+
+    const GIVEN_TWICE: &str = "given twice; an argument takes one value, so name it once";
+
+    /// ledger #387: `greeting=Hi greeting=Yo` used to reach the endpoint as `greeting=Yo`,
+    /// silently. Every place the text face assembles named arguments refuses the repeat,
+    /// naming the argument, in the typed `InvalidArgument` form — a first stage, a piped
+    /// stage, a map, the reserved `as`, and the `cache` probe and `plan` that share the
+    /// stage grammar.
+    #[test]
+    fn a_named_argument_given_twice_is_refused_at_every_source_stage() {
+        let engine = greet_engine();
+        let refusal = format!("invalid argument `greeting`: {GIVEN_TWICE}");
+        for line in [
+            "source urn:demo:greet greeting=Hi greeting=Yo name=World",
+            "source urn:demo:greet greeting=Hi name=World greeting=Hi",
+            "source urn:test:upper world | urn:demo:greet greeting=Hi greeting=Yo",
+            "source urn:test:reverse \"a\nb\" .. urn:demo:greet greeting=Hi greeting=Yo",
+            "cache urn:demo:greet greeting=Hi greeting=Yo name=World",
+            "plan urn:demo:greet greeting=Hi greeting=Yo name=World",
+        ] {
+            assert_eq!(output(engine.eval(line)).unwrap_err(), refusal, "{line}");
+        }
+        assert_eq!(
+            output(
+                engine.eval(
+                    "source urn:demo:greet greeting=Hi name=World as=text/plain as=text/turtle"
+                )
+            )
+            .unwrap_err(),
+            format!("invalid argument `as`: {GIVEN_TWICE}")
+        );
+        // Two DIFFERENT names are still fine, and so is an undeclared key repeated as text.
+        assert_eq!(
+            output(engine.eval("source urn:demo:greet greeting=Hi name=World")).unwrap(),
+            "Hi, World"
+        );
+        assert_eq!(
+            output(engine.eval("source urn:test:upper a=b a=c")).unwrap(),
+            "A=B A=C"
+        );
+    }
+
+    /// ledger #387, the write verbs: the top-level `sink`/`delete` and a piped `sink` stage
+    /// (and its `plan`) refuse a repeated named argument rather than keep the last.
+    #[test]
+    fn a_named_argument_given_twice_is_refused_by_the_write_verbs() {
+        let refusal = format!("invalid argument `url`: {GIVEN_TWICE}");
+        let engine = write_engine();
+        for line in [
+            "sink urn:test:write url=https://a/ url=https://b/ the body",
+            "delete urn:test:write url=https://a/ url=https://b/",
+        ] {
+            assert_eq!(output(engine.eval(line)).unwrap_err(), refusal, "{line}");
+        }
+        assert_eq!(
+            output(engine.eval("sink urn:test:write content=one content=two")).unwrap_err(),
+            format!("invalid argument `content`: {GIVEN_TWICE}")
+        );
+        let engine = pipe_sink_engine();
+        for line in [
+            "source urn:test:upper hi | sink urn:test:write url=https://a/ url=https://b/",
+            "plan urn:test:upper hi | sink urn:test:write url=https://a/ url=https://b/",
+        ] {
+            assert_eq!(output(engine.eval(line)).unwrap_err(), refusal, "{line}");
+        }
+        assert_eq!(
+            output(engine.eval("source urn:test:upper hi | sink urn:test:write as=a as=b"))
+                .unwrap_err(),
+            format!("invalid argument `as`: {GIVEN_TWICE}")
         );
     }
 
