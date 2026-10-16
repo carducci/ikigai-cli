@@ -91,6 +91,14 @@ forbids.
   server implements) gets `-32600 Invalid Request`, under the request's `id` when it
   is readable. The reason rides in `error.data`. A notification, or a client's own
   response (a `result` or an `error` with no `method`), is never answered.
+- **Concurrent calls** (0.1.64+) — each `tools/call` runs on its own thread and
+  is answered when it finishes, so one long call (a feed's `wait=50`) holds no
+  other tool up; responses to calls come back in the order they finish, matched
+  by `id`. Everything else is answered in arrival order before the next line is
+  read. At most `MAX_CONCURRENT_CALLS` (16) run at once: past it a call is
+  refused at once with `-32000 Server busy` under its own `id`, the bound in
+  `error.data`, never queued. A call runs under the grant in force when its line
+  was read. At end of input the server still answers every running call.
 - **Live grant-swap** — the server watches the grants file; edit the active
   grant and it emits `notifications/tools/list_changed`, so a connected client's
   tool list morphs with no restart. (Broadening is safe here: it is the human
