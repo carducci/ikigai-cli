@@ -1026,3 +1026,303 @@ fn mcp_shows_only_the_layer_doors_tools_under_its_prefixes() {
     );
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Ledger #1688 (threat model S4 gap 1, enforcement row L-18): the layer door binds the whole
+// served surface BEHIND the layers, so every endpoint `served_space` binds is reachable by name
+// from a participant's connection. These tests pin that a participant is refused every one that
+// holds protected state.
+// ---------------------------------------------------------------------------------------------
+
+/// What a protected endpoint is asked, and how its refusal must read.
+struct Probe {
+    command: String,
+    stdin: Option<String>,
+    /// A piece of the refusal: the capability the floor names, or the missing key.
+    refused_with: String,
+}
+
+fn probe(command: &str, stdin: Option<&str>, refused_with: &str) -> Probe {
+    Probe {
+        command: command.to_string(),
+        stdin: stdin.map(str::to_string),
+        refused_with: refused_with.to_string(),
+    }
+}
+
+/// Every probe that does not depend on the decision-link keys: the public intake doors, the
+/// spaces (the airlock), the blocklist, the client registry, the host's posture and switches,
+/// the file module, the passkey enrollment (store and window opener) and the kernel's catalog.
+fn protected_probes() -> Vec<Probe> {
+    let enquiry = "name=Mallory&email=mallory%40example.org&message=hello";
+    vec![
+        probe(
+            "sink urn:contact:submit",
+            Some(enquiry),
+            "urn:cap:contact:submit",
+        ),
+        probe(
+            "sink urn:booking:submit",
+            Some(enquiry),
+            "urn:cap:booking:submit",
+        ),
+        probe("source urn:space:contact", None, "urn:cap:space:read"),
+        probe(
+            "sink urn:space:contact",
+            Some("((contact \"x\"))"),
+            "urn:cap:space:out",
+        ),
+        probe("delete urn:space:contact", None, "urn:cap:space:take"),
+        probe("source urn:space:decisions", None, "urn:cap:space:read"),
+        probe(
+            "sink urn:space:decisions",
+            Some("((decide \"approve\"))"),
+            "urn:cap:space:out",
+        ),
+        probe("delete urn:space:decisions", None, "urn:cap:space:take"),
+        probe("source urn:decisions", None, "urn:cap:decisions:read"),
+        probe(
+            "sink urn:decisions",
+            Some("mallory@example.org"),
+            "urn:cap:decisions:write",
+        ),
+        probe("source urn:client:anyone", None, "urn:cap:client:read"),
+        probe("source urn:host:posture", None, "urn:cap:host:posture"),
+        probe("sink urn:host:demo", Some("on"), "urn:cap:host:write:demo"),
+        probe(
+            "sink urn:host:history",
+            Some("on"),
+            "urn:cap:host:write:history",
+        ),
+        probe("source urn:file:decide.pub", None, "urn:cap:fs:read"),
+        probe(
+            "sink urn:file:passkey-enroll.open",
+            Some("{}"),
+            "urn:cap:fs:write",
+        ),
+        probe("delete urn:file:decide.pub", None, "urn:cap:fs:delete"),
+        probe("source urn:kernel:catalog", None, "urn:cap:kernel:inspect"),
+        // Not bound on any served surface: opening an enrollment window is the box's act.
+        probe(
+            "sink urn:passkey:enroll-open",
+            Some(""),
+            "no endpoint resolved",
+        ),
+    ]
+}
+
+/// Ask the door every probe as `who`; each must fail, naming its refusal.
+fn assert_refused(home: &Path, certs: &Path, target: &str, who: &str, probes: &[Probe]) {
+    for p in probes {
+        let out = ask(home, certs, who, target, &p.command, p.stdin.as_deref());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "{who} must be refused `{}`, and was answered:\n{}",
+            p.command,
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            stderr.contains(&p.refused_with),
+            "{who}'s `{}` is refused naming `{}`:\n{stderr}",
+            p.command,
+            p.refused_with
+        );
+    }
+}
+
+/// Every file under `dir`, relative to it, so a test can say nothing was written.
+fn files_under(dir: &Path) -> BTreeSet<String> {
+    fn walk(root: &Path, dir: &Path, out: &mut BTreeSet<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.map_while(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else {
+                out.insert(
+                    path.strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// The families on the served surface that hold protected state or act. None may appear in a
+/// participant's manifold (`urn:kernel:actions` lists what the caller's capability can do).
+const PROTECTED_FAMILIES: [&str; 9] = [
+    "urn:contact:submit",
+    "urn:booking:submit",
+    "urn:space:",
+    "urn:decisions",
+    "urn:client:",
+    "urn:host:posture",
+    "urn:file:",
+    "urn:passkey:enroll-open",
+    "urn:kernel:catalog",
+];
+
+/// ★ Ledger #1688, on a door built the way the edge builds it: the layer configuration, the
+/// enrollment pair the layer host's own generator writes (so each participant's grant is exactly
+/// `urn:cap:collab:read:{collab}` and `urn:cap:layer:{verb}:{layer}`, the deployed `grants.json`
+/// shape), no `--cap`, and an EMPTY file root. A participant is refused every protected endpoint
+/// the served surface binds, its manifold offers none of them, and nothing is written.
+#[test]
+fn a_layer_participant_is_refused_every_protected_endpoint_the_served_surface_binds() {
+    let home = scratch("surface");
+    let certs = certs(&home);
+    configure_layers(&home, &certs);
+    let files = home.join("files");
+    std::fs::create_dir_all(&files).unwrap();
+    let (_door, target, _banner) = serve(&home, &certs, &[]);
+
+    let mut probes = protected_probes();
+    // On this door the decision links have no public key to verify against (the edge's layer
+    // door root is empty), so they refuse before a token is even read.
+    let link = "id=abcdefgh12&exp=99999999999&t=AAAA";
+    for (command, key) in [
+        ("sink urn:calendar-request:approve", "decide.pub"),
+        ("sink urn:contact-block", "contact-block.pub"),
+        ("sink urn:contact-label", "contact-block.pub"),
+    ] {
+        probes.push(probe(command, Some(link), key));
+    }
+    // And no relying party is configured here, so nothing can be enrolled.
+    probes.push(probe(
+        "sink urn:passkey:register",
+        Some("code=x&id=YWJj&spki=YWJj"),
+        "no passkey relying party",
+    ));
+
+    for who in ["alice", "bob"] {
+        assert_refused(&home, &certs, &target, who, &probes);
+        let manifold = ok(
+            ask(
+                &home,
+                &certs,
+                who,
+                &target,
+                "source urn:kernel:actions",
+                None,
+            ),
+            &format!("{who}'s manifold"),
+        );
+        for family in PROTECTED_FAMILIES {
+            assert!(
+                !manifold.lines().any(|l| l.trim().starts_with(family)),
+                "{who}'s manifold offers nothing under {family}:\n{manifold}"
+            );
+        }
+    }
+    assert_eq!(
+        files_under(&files),
+        BTreeSet::new(),
+        "no probe wrote anything under the door's file root"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Sign `payload` with `key`, as the Mac (decide) and the edge (block, label) mint a link.
+fn signed(key: &ed25519_dalek::SigningKey, payload: &str) -> String {
+    use base64::Engine;
+    use ed25519_dalek::Signer;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.sign(payload.as_bytes()).to_bytes())
+}
+
+fn write_public_key(path: PathBuf, key: &ed25519_dalek::SigningKey) {
+    use ed25519_dalek::pkcs8::{spki::der::pem::LineEnding, EncodePublicKey};
+    let pem = key
+        .verifying_key()
+        .to_public_key_pem(LineEnding::LF)
+        .expect("an SPKI PEM");
+    write(path, &pem);
+}
+
+/// The same door WIDENED past what the edge deploys: the decision and block/label public keys
+/// in its file root, a passkey relying party configured, and links that are VALIDLY signed (a
+/// participant who has seen a leaked email link). The links verify, and the participant is
+/// still refused, because recording a decision is a drop into a space and its connection's
+/// capability holds no `urn:cap:space:out`. So the refusal is the participant's authority, not
+/// the door's missing configuration, and a later deploy that puts a key on this door does not
+/// open it.
+#[test]
+fn a_layer_participant_with_a_valid_link_is_still_refused_by_its_own_capability() {
+    let home = scratch("widened");
+    let certs = certs(&home);
+    configure_layers(&home, &certs);
+    let files = home.join("files");
+    let decide = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+    let block = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    write_public_key(files.join("decide.pub"), &decide);
+    write_public_key(files.join("contact-block.pub"), &block);
+    let before = files_under(&files);
+    let (_door, target, _banner) = serve(&home, &certs, &["--passkey-rp-id", "edge.test"]);
+
+    let exp = 99_999_999_999_i64;
+    let booking = "abcdefgh12";
+    let enquiry = "a".repeat(64);
+    let approve_token = signed(&decide, &format!("{booking}|approve|{exp}"));
+    let approve = format!("id={booking}&exp={exp}&t={approve_token}");
+    let block_link = format!(
+        "email=mallory%40example.org&id=&exp={exp}&t={}",
+        signed(&block, &format!("contact-block|mallory@example.org||{exp}"))
+    );
+    let label_link = format!(
+        "label=ham&id={enquiry}&exp={exp}&t={}",
+        signed(&block, &format!("contact-label|ham|{enquiry}|{exp}"))
+    );
+
+    // The links are valid: their SHOW face (GET, which records nothing) renders the decision
+    // page, not "That link didn't work". Without this the refusals below could be a bad token.
+    let shown = ok(
+        ask(
+            &home,
+            &certs,
+            "bob",
+            &target,
+            &format!(
+                "source urn:calendar-request:approve id={booking} exp={exp} t={approve_token}"
+            ),
+            None,
+        ),
+        "the approve link's page",
+    );
+    assert!(
+        shown.contains("Approve this request?"),
+        "the signed link verifies on this door:\n{shown}"
+    );
+
+    let mut probes = protected_probes();
+    for (command, body) in [
+        ("sink urn:calendar-request:approve", &approve),
+        ("sink urn:contact-block", &block_link),
+        ("sink urn:contact-label", &label_link),
+    ] {
+        probes.push(probe(command, Some(body), "urn:cap:space:out"));
+    }
+    // A relying party is configured, and still nothing enrolls: no window can be opened from
+    // this door, and a registration carries no code it could know (ledger #1689).
+    probes.push(probe(
+        "sink urn:passkey:register",
+        Some("code=x&id=YWJj&spki=YWJj"),
+        "no enrollment window is open",
+    ));
+
+    for who in ["alice", "bob"] {
+        assert_refused(&home, &certs, &target, who, &probes);
+    }
+    assert_eq!(
+        files_under(&files),
+        before,
+        "nothing was dropped, recorded or enrolled under the door's file root"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}

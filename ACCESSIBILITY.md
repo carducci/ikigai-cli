@@ -61,7 +61,9 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
   decision page in `a_get_shows_the_decision_but_records_nothing`) and the intake's
   `with_a_redirect_the_response_is_an_html_page_to_the_url` pin `lang` and the one `main`;
   `passkey.rs`'s `the_passkey_status_lines_are_live_regions_present_before_the_script` pins the
-  live regions, their place before the script, and that the script writes into them.
+  live regions, their place before the script, and that the script writes into them;
+  `the_register_page_has_a_labeled_code_field_the_script_sends` pins that the enrollment code
+  field has a `<label>` tied to it by `for`, and comes before the button.
 - The full-screen REPL is rendered against ratatui's test backend in `tui.rs`'s tests, mostly for
   layout and editing. `no_color_takes_every_color_escape_out_of_the_frame` writes a frame through
   the crossterm backend and finds no color escape in the bytes under `NO_COLOR`, and finds some
@@ -84,6 +86,7 @@ Found by reading the source on 2026-10-15, not by testing:
 | 2026-10-15 | The embedded host's pages and the intake's redirect page gain `<html lang="en">` and a `<main>`; the passkey status lines become live regions; the full-screen REPL honors `NO_COLOR`. Three known limitations removed ([PR 522](https://github.com/ikigai-rs/ikigai-cli/pull/522)). |
 | 2026-10-15 | Reports use the `accessibility` issue label instead of a word in the title; `AGENTS.md` (with `CLAUDE.md` a link to it) asks for this file to be read before any change to rendered output. |
 | 2026-10-15 | `ikigai layers post` and `ikigai layers save` (ledger #1629) add terminal text under the same rules: plain lines, no color, the entry's IRI or a `saved …` line on stdout, and every refusal on stderr starting with `ikigai:`. |
+| 2026-10-16 | The passkey register page gains a field for the enrollment window's one-time code (ledger #1689): a visible `<label>` tied to the input by `for`, `autocomplete=one-time-code`, placed before the button; a missing code is reported in the existing `#status` live region and moves focus to the field. |
 
 ## Contributing
 
