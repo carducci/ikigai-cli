@@ -32,13 +32,19 @@
 //! `urn:passkey:challenge` mints a random challenge and remembers it briefly; the gate consumes it
 //! on use, so an assertion can be presented exactly once and only within the window.
 //!
-//! ## Enrollment trust (v1)
+//! ## Enrollment trust
 //!
 //! Registering a passkey grants the authority to approve everything the links can, so it must be
-//! bootstrapped from a trusted context. v1 uses a **local enrollment window**: `urn:passkey:enroll-open`
-//! is cap-gated (`urn:cap:passkey:enroll`) and run from the box, opening a few minutes during which
-//! one credential may register; the first registration closes it. Anchoring the enrol link in the
-//! Mac-held decide key instead is the natural hardening, left as a follow-on.
+//! bootstrapped from a trusted context. It uses a **local enrollment window with a one-time
+//! code** (ledger #1689): `urn:passkey:enroll-open` is cap-gated (`urn:cap:passkey:enroll`), run
+//! from the box, and answers with a fresh code that only the person at the box sees (it is
+//! printed to their terminal, never served; the window file holds only its SHA-256). For a few
+//! minutes one credential may register, and only by a POST that carries that code: an anonymous
+//! POST of `{id, spki}` without it, or with a wrong one, is refused and logged. The first
+//! registration SPENDS the window, so a second one in the same window is refused and logged too.
+//! Before the code, the window was a race: anyone who reached `/passkey/register` while it was
+//! open could enroll a key of their own first (threat model S1, gap 2). Anchoring the enrol
+//! link in the Mac-held decide key remains a possible further hardening.
 
 use crate::decide::{page, param};
 use crate::file_root;
@@ -567,10 +573,13 @@ pub fn is_enrolled() -> bool {
 pub(crate) const DECISION_PASSKEY_JS: &str = "<p id=pkstatus role=status aria-live=polite \
      style=\"color:#666\"></p><script src=\"/passkey/app.js\"></script>";
 
-/// The registration page body: a button (wired by `PASSKEY_APP_JS` via `id="reg"`) that runs
-/// `navigator.credentials.create`, then POSTs the new credential id + its SPKI public key. Its
-/// `#status` line is a live region, like [`DECISION_PASSKEY_JS`]'s.
+/// The registration page body: a labeled field for the window's one-time code, and a button
+/// (wired by `PASSKEY_APP_JS` via `id="reg"`) that runs `navigator.credentials.create`, then
+/// POSTs the code, the new credential id and its SPKI public key. Its `#status` line is a live
+/// region, like [`DECISION_PASSKEY_JS`]'s.
 const REGISTER_PAGE_BODY: &str = r#"<p>Create a passkey for this site — your device will ask you to confirm with Face/Touch ID.</p>
+<p><label for=code>One-time code (shown at the box when the window was opened)</label><br>
+<input id=code name=code autocomplete=one-time-code autocapitalize=characters spellcheck=false required style="font:inherit;padding:.4rem;width:100%;max-width:20rem"></p>
 <button id=reg style="font:inherit;padding:.6rem 1.2rem">Create passkey</button>
 <p id=status role=status aria-live=polite style="color:#666"></p>
 <script src="/passkey/app.js"></script>"#;
@@ -617,6 +626,8 @@ const PASSKEY_APP_JS: &str = r#"(function(){
   function register(btn){
     var status=document.getElementById('status');
     btn.addEventListener('click', function(){
+      var code=document.getElementById('code');
+      if(!code||!code.value.trim()){ status.textContent='Enter the one-time code shown at the box first.'; if(code) code.focus(); return; }
       status.textContent='Creating…';
       fetch('/passkey/challenge').then(function(r){return r.json();}).then(function(opt){
         return navigator.credentials.create({publicKey:{
@@ -630,7 +641,7 @@ const PASSKEY_APP_JS: &str = r#"(function(){
       }).then(function(cred){
         var spki=cred.response.getPublicKey && cred.response.getPublicKey();
         if(!spki){ throw new Error('this browser did not expose the public key (needs WebAuthn L2)'); }
-        var body='id='+encodeURIComponent(b(cred.rawId))+'&spki='+encodeURIComponent(b(spki));
+        var body='code='+encodeURIComponent(code.value.trim())+'&id='+encodeURIComponent(b(cred.rawId))+'&spki='+encodeURIComponent(b(spki));
         return fetch('/passkey/register',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:body});
       }).then(function(res){ return res.text(); }).then(function(html){ document.open(); document.write(html); document.close(); })
         .catch(function(e){ status.textContent='Registration failed: '+((e&&e.message)||e); });
@@ -858,8 +869,9 @@ impl Endpoint for PasskeyChallenge {
 // urn:passkey:enroll-open — open a short enrollment window (run from the box).
 // =====================================================================================
 
-/// Opens a brief window during which one credential may register. Cap-gated so only a human at
-/// the box can open it. The first registration closes it.
+/// Opens a brief window during which one credential may register, and answers with the window's
+/// one-time code. Cap-gated so only a human at the box can open it; the code goes back to that
+/// human (their terminal) and nowhere else. The first registration spends the window.
 pub struct PasskeyEnrollOpen;
 
 #[async_trait::async_trait]
@@ -870,15 +882,30 @@ impl Endpoint for PasskeyEnrollOpen {
                 "opening enrollment requires `{CAP_PASSKEY_ENROLL}`"
             )));
         }
-        let until = now_secs() + ENROLL_WINDOW_SECONDS;
+        let code = enrollment_code()?;
+        let window = EnrollWindow {
+            until: now_secs() + ENROLL_WINDOW_SECONDS,
+            code_sha256: code_digest(&code),
+            spent: false,
+        };
         // Owner-only and whole (ledger #850): `fs::write` left it 0664 under umask 002, and a
         // window that expires unused stays on disk, where anyone who can write it reopens it.
-        write_atomic(&enroll_window_path(), until.to_string().as_bytes())
+        write_window(&window)
             .map_err(|e| Error::Endpoint(format!("cannot open the enrollment window: {e}")))?;
+        // The event goes to the log; the code does not (only the person who opened it has it).
+        eprintln!(
+            "ikigai passkey: enrollment window opened for {ENROLL_WINDOW_SECONDS}s (one \
+             registration, by one-time code)"
+        );
         Ok(Representation::new(
             ReprType::new("text/plain").with_param("charset", "utf-8"),
-            format!("enrollment open for {ENROLL_WINDOW_SECONDS}s — register your passkey now\n")
-                .into_bytes(),
+            format!(
+                "enrollment open for {ENROLL_WINDOW_SECONDS}s, for ONE passkey\n\
+                 one-time code: {code}\n\
+                 enter it on the register page (/passkey/register) before you create the \
+                 passkey; it is shown only here\n"
+            )
+            .into_bytes(),
         ))
     }
     fn name(&self) -> &str {
@@ -887,7 +914,7 @@ impl Endpoint for PasskeyEnrollOpen {
     fn describe(&self) -> Description {
         Description::new("passkey-enroll-open")
             .title("Open a passkey enrollment window")
-            .summary("Opens a short window during which one passkey may be registered. Run from the box.")
+            .summary("Opens a short window during which one passkey may be registered, and answers with the one-time code the registration must carry. Run from the box.")
             .action(
                 ActionSpec::new(Verb::Sink)
                     .summary("open the window")
@@ -898,23 +925,58 @@ impl Endpoint for PasskeyEnrollOpen {
     }
 }
 
-/// Whether an enrollment window opened at the box is live. Fails CLOSED (ledger #850): the
-/// window file is judged with the credential store's rule, and its directory with
-/// [`guard_directory`], so a file someone else could have written or a workspace others can
-/// write keeps enrollment closed (said once per check on stderr), never open.
-fn enrollment_open() -> bool {
+/// An enrollment window as the box wrote it: when it closes, the SHA-256 of its one-time code
+/// (never the code), and whether its one registration has happened.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct EnrollWindow {
+    until: i64,
+    code_sha256: String,
+    #[serde(default)]
+    spent: bool,
+}
+
+/// What a registration finds when it looks at the window.
+#[derive(Debug, PartialEq, Eq)]
+enum WindowState {
+    /// No window, an expired one, or one that is not trusted or not understood.
+    Closed,
+    /// Live, and its one registration has already happened.
+    Spent,
+    /// Live and unused.
+    Open(EnrollWindow),
+}
+
+/// The window, judged. Fails CLOSED (ledger #850): the window file is judged with the credential
+/// store's rule, and its directory with [`guard_directory`], so a file someone else could have
+/// written or a workspace others can write keeps enrollment closed (said once per check on
+/// stderr), never open. A file this version cannot read as a window (a bare timestamp, written
+/// by an ikigai older than the one-time code) is closed too: it has no code to check against.
+fn window_state() -> WindowState {
     match enroll_window() {
-        Ok(until) => until.is_some_and(|u| u > now_secs()),
+        Ok(Some(w)) if w.until > now_secs() => {
+            if w.spent {
+                WindowState::Spent
+            } else {
+                WindowState::Open(w)
+            }
+        }
+        Ok(_) => WindowState::Closed,
         Err(detail) => {
             eprintln!("ikigai passkey: enrollment stays CLOSED: {detail}");
-            false
+            WindowState::Closed
         }
     }
 }
 
-/// The window's closing time, `Ok(None)` when no window file exists (or it does not parse, which
-/// is a closed window, as before), and `Err` naming the file or directory when it is not trusted.
-fn enroll_window() -> std::result::Result<Option<i64>, String> {
+/// Whether an unused window opened at the box is live.
+#[cfg(test)]
+fn enrollment_open() -> bool {
+    matches!(window_state(), WindowState::Open(_))
+}
+
+/// The window as written, `Ok(None)` when no window file exists or it does not parse as one
+/// (a closed window), and `Err` naming the file or directory when it is not trusted.
+fn enroll_window() -> std::result::Result<Option<EnrollWindow>, String> {
     use std::io::Read;
     let path = enroll_window_path();
     let p = path.display();
@@ -930,11 +992,80 @@ fn enroll_window() -> std::result::Result<Option<i64>, String> {
     let mut text = String::new();
     file.read_to_string(&mut text)
         .map_err(|e| format!("{p} is present but unreadable: {e}"))?;
-    Ok(text.trim().parse::<i64>().ok())
+    match serde_json::from_str::<EnrollWindow>(text.trim()) {
+        Ok(w) => Ok(Some(w)),
+        Err(_) => {
+            eprintln!(
+                "ikigai passkey: {p} is not an enrollment window this version opened (it has no \
+                 one-time code), so enrollment stays closed; open a new one with \
+                 `sink urn:passkey:enroll-open`"
+            );
+            Ok(None)
+        }
+    }
 }
 
-fn close_enrollment() {
-    let _ = std::fs::remove_file(enroll_window_path());
+fn write_window(window: &EnrollWindow) -> std::io::Result<()> {
+    let json = serde_json::to_vec(window).map_err(std::io::Error::other)?;
+    write_atomic(&enroll_window_path(), &json)
+}
+
+/// The alphabet of an enrollment code: Crockford's base 32 (no I, L, O or U), so it reads aloud
+/// and types without ambiguity. 32 symbols, so one random byte masked to five bits is unbiased.
+const CODE_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+/// Symbols in a code: 16 × 5 bits = 80 bits, far past guessing inside one short window.
+const CODE_SYMBOLS: usize = 16;
+
+/// A fresh one-time enrollment code, `XXXX-XXXX-XXXX-XXXX`.
+fn enrollment_code() -> Result<String> {
+    let mut raw = [0u8; CODE_SYMBOLS];
+    getrandom::getrandom(&mut raw)
+        .map_err(|e| Error::Endpoint(format!("no OS randomness for an enrollment code: {e}")))?;
+    let mut code = String::with_capacity(CODE_SYMBOLS + CODE_SYMBOLS / 4);
+    for (i, byte) in raw.iter().enumerate() {
+        if i > 0 && i % 4 == 0 {
+            code.push('-');
+        }
+        code.push(CODE_ALPHABET[usize::from(byte & 31)] as char);
+    }
+    Ok(code)
+}
+
+/// A code as typed, in the one spelling that is hashed: separators and spaces dropped, upper
+/// case, and Crockford's look-alikes read as the digits they stand for (O → 0, I and L → 1).
+///
+/// ```text
+/// "abcd-efgh ijkm-np0q"  →  "ABCDEFGH1JKMNP0Q"
+/// ```
+fn normalize_code(typed: &str) -> String {
+    typed
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .map(|c| match c.to_ascii_uppercase() {
+            'O' => '0',
+            'I' | 'L' => '1',
+            other => other,
+        })
+        .collect()
+}
+
+/// The lowercase hex SHA-256 of a code's normalized spelling: what the window file holds.
+fn code_digest(code: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(normalize_code(code).as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// A short, non-secret handle for a credential id in a log line.
+fn id_for_log(id_b64: &str) -> String {
+    let head: String = id_b64.chars().take(12).collect();
+    if head.len() < id_b64.len() {
+        format!("{head}…")
+    } else {
+        head
+    }
 }
 
 // =====================================================================================
@@ -942,9 +1073,12 @@ fn close_enrollment() {
 // =====================================================================================
 
 /// The enrollment endpoint. GET renders the registration page (the glue-JS runs the WebAuthn
-/// create ceremony); POST accepts `{id, spki}` — base64url of the credentialId and the SPKI public
-/// key — and stores it, but only while a window opened at the box is live. The first registration
-/// closes the window.
+/// create ceremony); POST accepts `{code, id, spki}` — the window's one-time code as the box
+/// printed it, and base64url of the credentialId and the SPKI public key — and stores the key, but
+/// only while a window opened at the box is live and unused, and only with that window's code.
+/// The first registration spends the window. A wrong code does NOT spend it: at 80 bits it cannot
+/// be guessed inside the window, and spending on a wrong guess would let any passer-by close the
+/// window on the person at the box.
 pub struct PasskeyRegister;
 
 #[async_trait::async_trait]
@@ -955,14 +1089,20 @@ impl Endpoint for PasskeyRegister {
                 if relying_party().is_none() {
                     return Ok(page("Passkeys are not configured", NOT_CONFIGURED_BODY));
                 }
-                if !enrollment_open() {
-                    return Ok(page(
+                match window_state() {
+                    WindowState::Open(_) => Ok(page("Register a passkey", REGISTER_PAGE_BODY)),
+                    WindowState::Spent => Ok(page(
+                        "Enrollment window used",
+                        "<p>This window's one registration has happened. To register another \
+                         passkey, open a new window at the box: <code>ikigai -c 'sink \
+                         urn:passkey:enroll-open'</code>, then reload.</p>",
+                    )),
+                    WindowState::Closed => Ok(page(
                         "Enrollment closed",
                         "<p>Open a window at the box first: <code>ikigai -c 'sink \
                          urn:passkey:enroll-open'</code>, then reload.</p>",
-                    ));
+                    )),
                 }
-                Ok(page("Register a passkey", REGISTER_PAGE_BODY))
             }
             Verb::Sink => {
                 // Registering binds a credential to a relying party; with none configured there
@@ -972,9 +1112,42 @@ impl Endpoint for PasskeyRegister {
                         "this edge has no passkey relying party configured".to_string(),
                     ));
                 }
-                if !enrollment_open() {
+                // ONE lock from judging the window to spending it, so two registrations in one
+                // window cannot both see it unused (ledger #1689: before this, concurrent POSTs
+                // inside one window all stored).
+                let held = credential_lock();
+                let window = match window_state() {
+                    WindowState::Open(window) => window,
+                    WindowState::Spent => {
+                        eprintln!(
+                            "ikigai passkey: REFUSED a registration: this enrollment window's \
+                             one registration has already happened"
+                        );
+                        return Err(Error::Denied(
+                            "this enrollment window has already been used — open a new one at \
+                             the box"
+                                .to_string(),
+                        ));
+                    }
+                    WindowState::Closed => {
+                        return Err(Error::Denied(
+                            "no enrollment window is open — open one at the box first".to_string(),
+                        ));
+                    }
+                };
+                // The proof the enroller saw what only the person at the box has. Checked before
+                // anything else in the request is looked at, and refused with one sentence
+                // whether it is missing or wrong.
+                let code = param(inv, "code");
+                if code.is_empty() || code_digest(&code) != window.code_sha256 {
+                    eprintln!(
+                        "ikigai passkey: REFUSED a registration: {} enrollment code",
+                        if code.is_empty() { "no" } else { "a wrong" }
+                    );
                     return Err(Error::Denied(
-                        "no enrollment window is open — open one at the box first".to_string(),
+                        "a registration needs the one-time code shown at the box when the \
+                         window was opened"
+                            .to_string(),
                     ));
                 }
                 let (id_b64, spki_b64) = (param(inv, "id"), param(inv, "spki"));
@@ -998,7 +1171,6 @@ impl Endpoint for PasskeyRegister {
                         detail: format!("not a usable public key: {e}"),
                     })?;
 
-                let held = credential_lock();
                 // A store that is present but unreadable (or that someone else could have
                 // written) is not overwritten from the public face: the person at the box
                 // repairs or removes it, then enrolls again.
@@ -1010,6 +1182,15 @@ impl Endpoint for PasskeyRegister {
                             .to_string(),
                     )
                 })?;
+                // Spend the window BEFORE storing: if the store write then fails, the window is
+                // closed and the person at the box opens a new one (fail closed), rather than a
+                // stored credential leaving a window open for a second one.
+                write_window(&EnrollWindow {
+                    spent: true,
+                    ..window
+                })
+                .map_err(|e| Error::Endpoint(format!("cannot close the enrollment window: {e}")))?;
+                let logged = id_for_log(&id_b64);
                 // Replace any existing entry with this id rather than duplicate it.
                 creds.retain(|c| c.id != id_b64);
                 creds.push(StoredCredential {
@@ -1018,7 +1199,10 @@ impl Endpoint for PasskeyRegister {
                     sign_count: 0,
                 });
                 save_credentials(&creds)?;
-                close_enrollment();
+                eprintln!(
+                    "ikigai passkey: ENROLLED credential {logged} with the window's one-time \
+                     code; the window is spent"
+                );
                 Ok(page(
                     "Passkey registered",
                     "<p>Done. Decision links now ask for your passkey before they act.</p>",
@@ -1035,7 +1219,7 @@ impl Endpoint for PasskeyRegister {
     fn describe(&self) -> Description {
         Description::new("passkey-register")
             .title("Register a passkey")
-            .summary("GET shows the enrolment page; POST stores a credential while an enrollment window is open.")
+            .summary("GET shows the enrolment page; POST stores a credential while an enrollment window is open, given the window's one-time code.")
             .action(
                 ActionSpec::new(Verb::Source)
                     .summary("show the enrolment page")
@@ -1043,7 +1227,7 @@ impl Endpoint for PasskeyRegister {
             )
             .action(
                 ActionSpec::new(Verb::Sink)
-                    .summary("store a credential (window must be open)")
+                    .summary("store a credential (needs an open window and its one-time code)")
                     .output("text/html; charset=utf-8"),
             )
             .output("text/html; charset=utf-8")
@@ -1565,12 +1749,26 @@ mod tests {
         futures::executor::block_on(kernel.issue(req, &Capability::root()))
     }
 
+    /// The code every test window is opened with, as the box would print it.
+    const TEST_CODE: &str = "TEST-C0DE-AAAA-BBBB";
+
     fn open_window() {
-        write_atomic(
-            &enroll_window_path(),
-            (now_secs() + 60).to_string().as_bytes(),
-        )
+        write_window(&EnrollWindow {
+            until: now_secs() + 60,
+            code_sha256: code_digest(TEST_CODE),
+            spent: false,
+        })
         .unwrap();
+    }
+
+    /// A registration body for credential `id` from the test device, with `code` (none if None).
+    fn registration(id: &[u8], code: Option<&str>) -> String {
+        let code = code.map(|c| format!("code={c}&")).unwrap_or_default();
+        format!(
+            "{code}id={}&spki={}",
+            b64().encode(id),
+            Device::new().spki_b64()
+        )
     }
 
     #[test]
@@ -1588,11 +1786,7 @@ mod tests {
             "the page must not be told `not enrolled` and submit token-only"
         );
         open_window();
-        let body = format!(
-            "id={}&spki={}",
-            b64().encode(b"cred-2"),
-            Device::new().spki_b64()
-        );
+        let body = registration(b"cred-2", Some(TEST_CODE));
         assert!(
             call(
                 "urn:passkey:register",
@@ -1655,11 +1849,7 @@ mod tests {
     fn registration_needs_a_relying_party() {
         isolate("no-rp-register");
         open_window();
-        let body = format!(
-            "id={}&spki={}",
-            b64().encode(b"cred-1"),
-            Device::new().spki_b64()
-        );
+        let body = registration(b"cred-1", Some(TEST_CODE));
         unconfigure();
         assert!(
             call(
@@ -1738,12 +1928,10 @@ mod tests {
     }
 
     /// Whether a registration through the PUBLIC face (no enroll capability) stored anything.
+    /// It carries the window's RIGHT code, so a refusal is the file or directory check's and
+    /// not the code's.
     fn public_registration_succeeds() -> bool {
-        let reg = format!(
-            "id={}&spki={}",
-            b64().encode(b"intruder"),
-            Device::new().spki_b64()
-        );
+        let reg = registration(b"intruder", Some(TEST_CODE));
         call(
             "urn:passkey:register",
             PasskeyRegister,
@@ -1869,5 +2057,237 @@ mod tests {
         .unwrap();
         assert_eq!(mode_of(&enroll_window_path()), 0o600);
         assert!(enrollment_open());
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Ledger #1689: the one-time enrollment code.
+    // ---------------------------------------------------------------------------------
+
+    /// The ids of the credentials stored, in order.
+    fn stored_ids() -> Vec<String> {
+        match std::fs::read(credentials_path()) {
+            Ok(bytes) => serde_json::from_slice::<Vec<StoredCredential>>(&bytes)
+                .unwrap()
+                .into_iter()
+                .map(|c| c.id)
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn register_with(body: &str) -> Result<Representation> {
+        call(
+            "urn:passkey:register",
+            PasskeyRegister,
+            Verb::Sink,
+            Some(body),
+        )
+    }
+
+    fn denied_with(outcome: Result<Representation>, needle: &str) {
+        match outcome {
+            Err(Error::Denied(message)) => assert!(
+                message.contains(needle),
+                "refused, naming `{needle}`: {message}"
+            ),
+            other => panic!("expected a Denied naming `{needle}`, got {other:?}"),
+        }
+    }
+
+    /// ★ Ledger #1689, the reproduction: an anonymous POST of `{id, spki}` with no code, during
+    /// an open window, used to be stored. It is refused, nothing is stored, and the window stays
+    /// open for the person at the box.
+    #[test]
+    fn a_registration_without_the_code_is_refused() {
+        isolate("code-missing");
+        open_window();
+        denied_with(
+            register_with(&registration(b"stranger", None)),
+            "one-time code",
+        );
+        denied_with(
+            register_with(&registration(b"stranger", Some(""))),
+            "one-time code",
+        );
+        assert!(stored_ids().is_empty(), "nothing stored");
+        assert!(!is_enrolled());
+        assert!(enrollment_open(), "the window is still the operator's");
+    }
+
+    #[test]
+    fn a_registration_with_a_wrong_code_is_refused_and_does_not_spend_the_window() {
+        isolate("code-wrong");
+        open_window();
+        for wrong in [
+            "TEST-C0DE-AAAA-BBBC",
+            "AAAA-AAAA-AAAA-AAAA",
+            "TEST-C0DE-AAAA",
+        ] {
+            denied_with(
+                register_with(&registration(b"stranger", Some(wrong))),
+                "one-time code",
+            );
+        }
+        assert!(stored_ids().is_empty(), "nothing stored");
+        assert!(
+            enrollment_open(),
+            "a wrong guess cannot close the window on the person at the box"
+        );
+        // The operator, with the right code, still enrolls.
+        assert!(register_with(&registration(b"mine", Some(TEST_CODE))).is_ok());
+        assert_eq!(stored_ids(), vec![b64().encode(b"mine")]);
+    }
+
+    /// The right code enrolls ONCE: a second registration in the same window, even with the
+    /// right code, is refused with its own sentence, and the first credential stands alone.
+    #[test]
+    fn the_right_code_enrolls_once_and_a_second_registration_is_refused() {
+        isolate("code-once");
+        open_window();
+        assert!(register_with(&registration(b"first", Some(TEST_CODE))).is_ok());
+        assert_eq!(stored_ids(), vec![b64().encode(b"first")]);
+        assert_eq!(window_state(), WindowState::Spent);
+        denied_with(
+            register_with(&registration(b"second", Some(TEST_CODE))),
+            "already been used",
+        );
+        assert_eq!(
+            stored_ids(),
+            vec![b64().encode(b"first")],
+            "the second was not stored and did not replace the first"
+        );
+        let page = call("urn:passkey:register", PasskeyRegister, Verb::Source, None).unwrap();
+        assert!(
+            String::from_utf8_lossy(&page.bytes).contains("one registration has happened"),
+            "the page says the window is used, not that none is open"
+        );
+    }
+
+    /// Concurrent registrations inside one window: exactly one is stored, because the window is
+    /// judged and spent under the credential lock. (Before ledger #1689 the window was checked
+    /// outside the lock, so every POST that saw it open before the first closed it was stored.)
+    #[test]
+    fn concurrent_registrations_in_one_window_store_exactly_one() {
+        isolate("code-race");
+        open_window();
+        let root = test_root().unwrap();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8u8)
+            .map(|i| {
+                let (root, start) = (root.clone(), start.clone());
+                std::thread::spawn(move || {
+                    TEST_ROOT.with(|r| *r.borrow_mut() = Some(root));
+                    TEST_RP.with(|r| *r.borrow_mut() = Some(test_relying_party()));
+                    start.wait();
+                    register_with(&registration(&[b'c', i], Some(TEST_CODE))).is_ok()
+                })
+            })
+            .collect();
+        let stored = threads
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(stored, 1, "one window, one registration");
+        assert_eq!(stored_ids().len(), 1);
+    }
+
+    /// The window still expires: past its deadline, the right code enrolls nothing.
+    #[test]
+    fn an_expired_window_refuses_even_the_right_code() {
+        isolate("code-expired");
+        write_window(&EnrollWindow {
+            until: now_secs() - 1,
+            code_sha256: code_digest(TEST_CODE),
+            spent: false,
+        })
+        .unwrap();
+        assert_eq!(window_state(), WindowState::Closed);
+        denied_with(
+            register_with(&registration(b"late", Some(TEST_CODE))),
+            "no enrollment window is open",
+        );
+        assert!(stored_ids().is_empty());
+    }
+
+    /// A window file from before the code (a bare timestamp) has no code to check against, so it
+    /// is a closed window, never an open one.
+    #[test]
+    fn a_window_without_a_code_is_closed() {
+        isolate("code-legacy");
+        write_atomic(
+            &enroll_window_path(),
+            (now_secs() + 60).to_string().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(window_state(), WindowState::Closed);
+        denied_with(
+            register_with(&registration(b"old", None)),
+            "no enrollment window is open",
+        );
+        assert!(stored_ids().is_empty());
+    }
+
+    /// Opening a window answers with the code, to the person who opened it; the file on disk
+    /// holds only its digest; and the code as printed (or typed loosely) enrolls.
+    #[test]
+    fn opening_a_window_answers_with_a_code_the_file_holds_only_the_digest_of() {
+        isolate("code-open");
+        let kernel = Kernel::new(std::sync::Arc::new(ikigai_core::EndpointSpace::new().bind(
+            ikigai_core::Exact::new("urn:passkey:enroll-open"),
+            PasskeyEnrollOpen,
+        )));
+        let open = || {
+            futures::executor::block_on(kernel.issue(
+                Request::new(Verb::Sink, Iri::parse("urn:passkey:enroll-open").unwrap()),
+                &Capability::root(),
+            ))
+            .unwrap()
+        };
+        let text = String::from_utf8(open().bytes.to_vec()).unwrap();
+        let code = text
+            .lines()
+            .find_map(|l| l.strip_prefix("one-time code: "))
+            .unwrap_or_else(|| panic!("the answer carries the code: {text}"))
+            .to_string();
+        assert_eq!(code.len(), 19, "XXXX-XXXX-XXXX-XXXX: {code}");
+        assert!(code
+            .split('-')
+            .all(|g| g.len() == 4 && g.bytes().all(|b| CODE_ALPHABET.contains(&b))));
+        let on_disk = std::fs::read_to_string(enroll_window_path()).unwrap();
+        assert!(
+            !on_disk.contains(&code) && !on_disk.contains(&normalize_code(&code)),
+            "the code is never written down: {on_disk}"
+        );
+        assert!(on_disk.contains(&code_digest(&code)));
+        // Typed loosely: lower case, spaces instead of dashes.
+        let typed = code.to_lowercase().replace('-', " ");
+        assert!(register_with(&registration(b"mine", Some(&typed))).is_ok());
+        assert_eq!(stored_ids(), vec![b64().encode(b"mine")]);
+        // A new window, a new code.
+        let again = open();
+        assert!(!String::from_utf8_lossy(&again.bytes).contains(&code));
+        assert!(enrollment_open(), "a new window is open and unused");
+    }
+
+    #[test]
+    fn a_code_is_normalized_before_it_is_hashed() {
+        assert_eq!(normalize_code("abcd-efgh ijkm-np0q"), "ABCDEFGH1JKMNP0Q");
+        assert_eq!(normalize_code("o0Il-1"), "00111");
+        assert_eq!(code_digest("abcd-efgh"), code_digest("ABCDEFGH"));
+        assert_ne!(code_digest("ABCDEFGH"), code_digest("ABCDEFGJ"));
+    }
+
+    /// The register page asks for the code with a LABELED field the script reads, and the script
+    /// sends it with the credential.
+    #[test]
+    fn the_register_page_has_a_labeled_code_field_the_script_sends() {
+        assert!(REGISTER_PAGE_BODY.contains("<label for=code>"));
+        assert!(REGISTER_PAGE_BODY.contains("<input id=code name=code"));
+        assert!(
+            REGISTER_PAGE_BODY.find("id=code") < REGISTER_PAGE_BODY.find("id=reg"),
+            "the field comes before the button"
+        );
+        assert!(PASSKEY_APP_JS.contains("'code='+encodeURIComponent(code.value.trim())"));
     }
 }

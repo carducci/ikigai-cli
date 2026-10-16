@@ -3008,6 +3008,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "crossterm",
+ "ed25519-dalek 2.2.0",
  "futures",
  "ikigai-core",
  "ikigai-discovery",
