@@ -15,6 +15,8 @@
 use futures::executor::block_on;
 use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request};
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use crate::{action_to_tool, parse_tool_name, ToolFilter};
 
@@ -107,14 +109,32 @@ pub fn handle_line(
     filter: &ToolFilter,
     line: &[u8],
 ) -> Option<Value> {
+    match parse_line(line) {
+        Parsed::Blank => None,
+        Parsed::Unparsable(reply) => Some(reply),
+        Parsed::Message(msg) => handle(kernel, capability, filter, &msg),
+    }
+}
+
+/// One line of MCP stdio, read.
+enum Parsed {
+    /// Framing slack: owed nothing.
+    Blank,
+    /// Not JSON (invalid UTF-8 included): the `-32700` reply it is owed.
+    Unparsable(Value),
+    /// A JSON value, to dispatch.
+    Message(Value),
+}
+
+fn parse_line(line: &[u8]) -> Parsed {
     let line = line.strip_suffix(b"\n").unwrap_or(line);
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     if line.iter().all(u8::is_ascii_whitespace) {
-        return None;
+        return Parsed::Blank;
     }
     match serde_json::from_slice::<Value>(line) {
-        Ok(msg) => handle(kernel, capability, filter, &msg),
-        Err(e) => Some(err(
+        Ok(msg) => Parsed::Message(msg),
+        Err(e) => Parsed::Unparsable(err(
             Value::Null,
             PARSE_ERROR,
             "Parse error",
@@ -660,27 +680,192 @@ pub fn serve(kernel: &Kernel, capability: &Capability) -> std::io::Result<()> {
     )
 }
 
-/// [`serve`] over any line source and sink. Every line goes through [`handle_line`], so
-/// a line that is not JSON — invalid UTF-8 included — is answered with `-32700` and the
-/// loop goes on; it neither ends the session nor passes in silence.
+/// [`serve`] over any line source and sink: [`serve_concurrent`] under one fixed capability,
+/// with no tool filter and [`MAX_CONCURRENT_CALLS`]. Every line goes through the same dispatch
+/// as [`handle_line`], so a line that is not JSON — invalid UTF-8 included — is answered with
+/// `-32700` and the loop goes on; it neither ends the session nor passes in silence.
 pub fn serve_io(
     kernel: &Kernel,
     capability: &Capability,
-    mut input: impl std::io::BufRead,
-    mut output: impl std::io::Write,
+    input: impl std::io::BufRead,
+    output: impl std::io::Write + Send,
 ) -> std::io::Result<()> {
     let filter = ToolFilter::default(); // allow-all: the plain server shows the full grant
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        if input.read_until(b'\n', &mut line)? == 0 {
-            return Ok(());
+    serve_concurrent(
+        kernel,
+        || (capability.clone(), filter.clone()),
+        input,
+        &Mutex::new(output),
+        MAX_CONCURRENT_CALLS,
+    )
+}
+
+/// The most `tools/call` requests one MCP session runs at once (ledger #1695), the bound a QUIC
+/// door puts on one connection's calls. A call past it is refused at once with
+/// [`SERVER_BUSY`] under its own `id`, never queued: a queued call would wait behind long polls
+/// with nothing telling the client why, which is the stall the concurrency exists to end.
+pub const MAX_CONCURRENT_CALLS: usize = 16;
+
+/// JSON-RPC 2.0 §5.1 leaves -32000 to -32099 to the server: this one answers a `tools/call`
+/// that arrives while the session's bound of calls is already running. Transient: the same
+/// call is admitted once one of the running calls has answered.
+pub const SERVER_BUSY: i64 = -32000;
+
+/// JSON-RPC 2.0 §5.1: the server failed while handling a valid request. Here, a `tools/call`
+/// whose thread could not start or panicked: answered, so its `id` is never left hanging.
+pub const INTERNAL_ERROR: i64 = -32603;
+
+/// **The loop of an MCP stdio session, with `tools/call`s run concurrently** (ledger #1695).
+///
+/// - Each `tools/call` runs on its own thread, under the capability `session` gave when its line
+///   was READ, and its response is written when it finishes. Responses to calls therefore come
+///   back in the order the calls finish, not the order they arrived, which JSON-RPC allows:
+///   a client matches a response by `id`.
+/// - Everything else (`initialize`, `ping`, `tools/list`, an invalid line, a notification) is
+///   answered on the reading thread before the next line is read, so those keep their order
+///   relative to each other and to what came before them.
+/// - Every response is ONE line, written and flushed whole under `output`'s lock, which a host
+///   shares with anything else that writes to the client (the grants poller's
+///   `notifications/tools/list_changed`).
+/// - At most `max_calls` calls run at once. Past that a call is refused AT ONCE with
+///   [`SERVER_BUSY`] under its own `id`, `data` naming the bound; it is never queued.
+/// - At the end of input the loop still waits for every running call and writes its answer.
+///
+/// `session` is asked once per line, on the reading thread, for the capability and tool filter
+/// in force, so a host that swaps its grant while running is honored from the next line on.
+///
+/// ```
+/// # use ikigai_core::{Capability, EndpointSpace, Kernel};
+/// # use ikigai_mcp::{server::serve_concurrent, ToolFilter};
+/// # let kernel = Kernel::new(std::sync::Arc::new(EndpointSpace::new()));
+/// let session = || (Capability::root(), ToolFilter::default());
+/// let call = br#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"x__source"}}"#;
+/// let output = std::sync::Mutex::new(Vec::new());
+/// // A bound of 0 refuses every call: the busy answer, under the call's id.
+/// serve_concurrent(&kernel, session, &call[..], &output, 0).unwrap();
+/// let reply: serde_json::Value = serde_json::from_slice(&output.into_inner().unwrap()).unwrap();
+/// assert_eq!(reply["id"], 5);
+/// assert_eq!(reply["error"]["code"], -32000);
+/// assert_eq!(reply["error"]["message"], "Server busy");
+/// assert!(reply["error"]["data"].as_str().unwrap().contains("0 tools/call"));
+/// ```
+pub fn serve_concurrent<W: std::io::Write + Send>(
+    kernel: &Kernel,
+    session: impl Fn() -> (Capability, ToolFilter),
+    mut input: impl std::io::BufRead,
+    output: &Mutex<W>,
+    max_calls: usize,
+) -> std::io::Result<()> {
+    let running = AtomicUsize::new(0);
+    // A call's thread that could not write: the client has gone. The reading thread stops at
+    // the next line rather than serving nobody.
+    let gone: Mutex<Option<std::io::Error>> = Mutex::new(None);
+    std::thread::scope(|scope| {
+        let mut line = Vec::new();
+        loop {
+            if let Some(e) = lock(&gone).take() {
+                return Err(e);
+            }
+            line.clear();
+            if input.read_until(b'\n', &mut line)? == 0 {
+                // End of input: the scope joins every running call, which writes its answer.
+                return Ok(());
+            }
+            let (capability, filter) = session();
+            let msg = match parse_line(&line) {
+                Parsed::Blank => continue,
+                Parsed::Unparsable(reply) => {
+                    write_line(output, &reply)?;
+                    continue;
+                }
+                Parsed::Message(msg) => msg,
+            };
+            let id = match shape(&msg) {
+                Shape::Request {
+                    id,
+                    method: "tools/call",
+                } => id,
+                _ => {
+                    if let Some(reply) = handle(kernel, &capability, &filter, &msg) {
+                        write_line(output, &reply)?;
+                    }
+                    continue;
+                }
+            };
+            if running.fetch_add(1, Ordering::AcqRel) >= max_calls {
+                running.fetch_sub(1, Ordering::AcqRel);
+                let detail = format!(
+                    "{max_calls} tools/call requests are already running, the bound of one MCP \
+                     session; this one was refused at once, not queued: send it again when one \
+                     of them has answered"
+                );
+                write_line(output, &err(id, SERVER_BUSY, "Server busy", Some(&detail)))?;
+                continue;
+            }
+            let slot = Slot(&running);
+            let (gone, reply_id) = (&gone, id.clone());
+            let spawned = std::thread::Builder::new()
+                .name("ikigai-mcp-call".to_string())
+                .spawn_scoped(scope, move || {
+                    let _slot = slot; // freed after the answer is written, never before
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        tools_call(kernel, &capability, msg.get("params"))
+                    }));
+                    let reply = match result {
+                        Ok(result) => ok(reply_id, result),
+                        Err(panic) => {
+                            let why = panic
+                                .downcast_ref::<&str>()
+                                .map(|s| s.to_string())
+                                .or_else(|| panic.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "a panic".to_string());
+                            err(
+                                reply_id,
+                                INTERNAL_ERROR,
+                                "Internal error",
+                                Some(&format!("the call panicked: {why}")),
+                            )
+                        }
+                    };
+                    if let Err(e) = write_line(output, &reply) {
+                        lock(gone).get_or_insert(e);
+                    }
+                });
+            if let Err(e) = spawned {
+                // The closure (and its slot) was dropped unrun: answer here instead.
+                let detail = format!("the call's thread could not start: {e}");
+                write_line(
+                    output,
+                    &err(id, INTERNAL_ERROR, "Internal error", Some(&detail)),
+                )?;
+            }
         }
-        if let Some(response) = handle_line(kernel, capability, &filter, &line) {
-            writeln!(output, "{}", serde_json::to_string(&response)?)?;
-            output.flush()?;
-        }
+    })
+}
+
+/// One running call's place under the bound, given back when it drops (after the answer is
+/// written, or on unwind).
+struct Slot<'a>(&'a AtomicUsize);
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+/// A poisoned lock still guards bytes that were written whole or not at all: carry on.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// One response, one line, written and flushed whole under the output's lock.
+fn write_line<W: std::io::Write>(output: &Mutex<W>, reply: &Value) -> std::io::Result<()> {
+    let text = serde_json::to_string(reply)?;
+    let mut out = lock(output);
+    writeln!(out, "{text}")?;
+    out.flush()
 }
 
 #[cfg(test)]
@@ -1823,5 +2008,193 @@ mod jsonrpc_1309 {
             reply,
             json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}})
         );
+    }
+}
+
+/// Ledger #1695: a `tools/call` runs on its own thread, so a slow one holds nothing else up.
+#[cfg(test)]
+mod concurrent_1695 {
+    use super::*;
+    use ikigai_core::{
+        ArgSpec, Description, EndpointSpace, Exact, FnEndpoint, ReprType, Representation, Verb,
+    };
+    use std::sync::Arc;
+
+    /// A writer the test and an endpoint can both read: the session's output so far.
+    #[derive(Clone, Default)]
+    struct Shared(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Shared {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Shared {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+        fn replies(&self) -> Vec<Value> {
+            self.text()
+                .lines()
+                .map(|l| serde_json::from_str(l).expect("each reply is one JSON line"))
+                .collect()
+        }
+    }
+
+    /// The echo kernel plus `urn:demo:slow`, a call that does not answer until `release` shows
+    /// up in the session's output (or a minute passes, so a serial server fails the test
+    /// rather than hang it). No sleep decides the order: the slow call answers only AFTER the
+    /// output says the calls behind it were answered, which a server that runs one line at a
+    /// time can never do.
+    fn kernel_with_slow(output: &Shared, release: &'static str) -> Kernel {
+        let seen = output.clone();
+        let slow = FnEndpoint::new("slow", move |_inv| {
+            let mut waited = 0;
+            while !seen.text().contains(release) && waited < 6000 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                waited += 1;
+            }
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"slow".to_vec(),
+            ))
+        })
+        .with_description(Description::new("slow").verb(Verb::Source));
+        let echo = FnEndpoint::new("echo", |inv| {
+            let text = inv.inline_str("in").unwrap_or("");
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("[{text}]").into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("echo")
+                .verb(Verb::Source)
+                .input(ArgSpec::new("in").summary("the text")),
+        );
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:demo:slow"), slow)
+            .bind(Exact::new("urn:demo:echo"), echo);
+        Kernel::new(Arc::new(space))
+    }
+
+    fn call(id: u64, tool: &str, arguments: Value) -> String {
+        json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+               "params":{"name":tool,"arguments":arguments}})
+        .to_string()
+            + "\n"
+    }
+
+    /// ★ **A slow `tools/call` holds nothing else up** (ledger #1695). The slow call answers
+    /// only once the fast call behind it has, so the order of the replies IS the proof; the
+    /// `ping` and `tools/list` between them are answered in arrival order while it runs, and
+    /// the end of input still waits for the slow call's answer.
+    #[test]
+    fn a_fast_call_answers_while_a_slow_one_runs() {
+        let out = Shared::default();
+        let kernel = kernel_with_slow(&out, "\"id\":4");
+        let input = [
+            call(1, "slow__source", json!({})),
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n".to_string(),
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n".to_string(),
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\"}\n".to_string(),
+            call(4, "echo__source", json!({"in": "fast"})),
+        ]
+        .concat();
+        serve_io(&kernel, &Capability::root(), input.as_bytes(), out.clone())
+            .expect("the loop runs");
+        let replies = out.replies();
+        let ids: Vec<Value> = replies.iter().map(|r| r["id"].clone()).collect();
+        assert_eq!(
+            ids,
+            [json!(2), json!(3), json!(4), json!(1)],
+            "{}",
+            out.text()
+        );
+        assert_eq!(replies[2]["result"]["content"][0]["text"], "[fast]");
+        assert_eq!(replies[3]["result"]["content"][0]["text"], "slow");
+    }
+
+    /// Past the bound a call is refused AT ONCE under its own id with [`SERVER_BUSY`], naming
+    /// the bound, never queued behind the calls that are running; the running call still
+    /// answers, and the bound frees when it does.
+    #[test]
+    fn a_call_past_the_bound_is_refused_at_once_never_queued() {
+        let out = Shared::default();
+        let kernel = kernel_with_slow(&out, "\"id\":2");
+        let input = [
+            call(1, "slow__source", json!({})),
+            call(2, "echo__source", json!({"in": "over"})),
+        ]
+        .concat();
+        let session = || (Capability::root(), ToolFilter::default());
+        let output = std::sync::Mutex::new(out.clone());
+        serve_concurrent(&kernel, session, input.as_bytes(), &output, 1).expect("the loop runs");
+        let replies = out.replies();
+        assert_eq!(replies.len(), 2, "{}", out.text());
+        let busy = &replies[0];
+        assert_eq!(busy["id"], 2, "{busy}");
+        assert_eq!(busy["error"]["code"], SERVER_BUSY, "{busy}");
+        assert_eq!(busy["error"]["message"], "Server busy", "{busy}");
+        assert!(
+            busy["error"]["data"]
+                .as_str()
+                .is_some_and(|d| d.contains("1 tools/call") && d.contains("not queued")),
+            "{busy}"
+        );
+        assert_eq!(replies[1]["id"], 1, "{}", replies[1]);
+        assert_eq!(replies[1]["result"]["content"][0]["text"], "slow");
+
+        // Once the running call has answered, its slot is free again in the same session: the
+        // second line is not even read until the first call's answer is out.
+        let out = Shared::default();
+        let kernel = kernel_with_slow(&out, "never");
+        let input = Paced {
+            lines: vec![
+                call(1, "echo__source", json!({"in": "a"})),
+                call(2, "echo__source", json!({"in": "b"})),
+            ],
+            next: 0,
+            out: out.clone(),
+        };
+        let output = std::sync::Mutex::new(out.clone());
+        serve_concurrent(&kernel, session, std::io::BufReader::new(input), &output, 1)
+            .expect("the loop runs");
+        let texts: Vec<Value> = out
+            .replies()
+            .iter()
+            .map(|r| r["result"]["content"][0]["text"].clone())
+            .collect();
+        assert_eq!(texts, [json!("[a]"), json!("[b]")], "{}", out.text());
+    }
+
+    /// Input that hands over line `n` only once the output holds `n` replies, so a call is
+    /// read only after every call before it has answered.
+    struct Paced {
+        lines: Vec<String>,
+        next: usize,
+        out: Shared,
+    }
+
+    impl std::io::Read for Paced {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let Some(line) = self.lines.get(self.next) else {
+                return Ok(0);
+            };
+            let mut waited = 0;
+            while self.out.text().lines().count() < self.next && waited < 6000 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                waited += 1;
+            }
+            assert!(line.len() <= buf.len(), "a test line fits one read");
+            buf[..line.len()].copy_from_slice(line.as_bytes());
+            self.next += 1;
+            Ok(line.len())
+        }
     }
 }

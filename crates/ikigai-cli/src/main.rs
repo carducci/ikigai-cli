@@ -1989,8 +1989,8 @@ fn mcp_filter(grants: &[String], shows: &[String]) -> ikigai_mcp::ToolFilter {
 /// it is the HUMAN editing the grant (root re-granting), never the client.
 #[cfg(feature = "embedded")]
 fn mcp(grants: Vec<String>, scopes: Vec<String>, shows: Vec<String>, mounts: Mounts) {
-    use ikigai_mcp::server::handle_line;
-    use std::io::{BufRead, Write};
+    use ikigai_mcp::server::serve_concurrent;
+    use std::io::Write;
     use std::sync::{Arc, Mutex, RwLock};
 
     // A grant that names nothing refuses to start: running it would either be root (the
@@ -2158,35 +2158,27 @@ fn mcp(grants: Vec<String>, scopes: Vec<String>, shows: Vec<String>, mounts: Mou
         }
     }
 
-    // Raw bytes, not `lines()`: a line that is not UTF-8 is a JSON-RPC Parse error to
-    // ANSWER (`handle_line`), where `lines()` would end the whole session on it. Every
-    // line that is not a valid message gets its -32700/-32600 reply (ledger #1309).
-    let mut stdin = std::io::stdin().lock();
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        match stdin.read_until(b'\n', &mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        let response = {
-            let cap = capability.read().expect("cap lock");
-            let filt = filter.read().expect("filter lock");
-            handle_line(&kernel, &cap, &filt, &line)
-        };
-        if let Some(response) = response {
-            let mut out = stdout.lock().expect("stdout lock");
-            if writeln!(
-                out,
-                "{}",
-                serde_json::to_string(&response).unwrap_or_default()
-            )
-            .is_err()
-            {
-                break;
-            }
-            let _ = out.flush();
-        }
+    // The library's session loop (ledger #1695): each `tools/call` on its own thread, up to
+    // `MAX_CONCURRENT_CALLS`, answered as it finishes, so a long poll holds no other tool
+    // up; everything else answered in order on this thread. Raw bytes, not `lines()`: a
+    // line that is not UTF-8 is a JSON-RPC Parse error to ANSWER, where `lines()` would end
+    // the whole session on it (ledger #1309). The grant and filter are read per LINE, so
+    // the poller's swap applies from the next message, exactly as before; a call keeps the
+    // grant it was read under. Responses share the poller's stdout lock, one whole line each.
+    let session = || {
+        (
+            capability.read().expect("cap lock").clone(),
+            filter.read().expect("filter lock").clone(),
+        )
+    };
+    if let Err(e) = serve_concurrent(
+        &kernel,
+        session,
+        std::io::stdin().lock(),
+        &stdout,
+        ikigai_mcp::server::MAX_CONCURRENT_CALLS,
+    ) {
+        eprintln!("ikigai mcp: the session ended: {e}");
     }
 }
 
