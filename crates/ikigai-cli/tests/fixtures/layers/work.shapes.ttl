@@ -1,0 +1,92 @@
+# A copy of ikigai-rs/ikigai-layers-client's tests/fixtures/layers/layers/work.shapes.ttl (at
+# 2107af8): the shapes of a channel layer that takes briefs, issues and files, as an edge door
+# serves them, with only the layer's name changed to `work`. `tests/layers_post.rs` posts and saves
+# against these exact shapes, as the Python client's tests do; keep the two copies in step.
+#
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix dcterms: <http://purl.org/dc/terms/> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix ik: <https://ikigai-rs.dev/ns#> .
+
+<urn:layers:shape:work:message> a sh:NodeShape ;
+  sh:targetClass ik:Message ;
+  sh:closed true ;
+  sh:ignoredProperties ( rdf:type ) ;
+  sh:property
+    [ sh:path ik:body ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:maxLength 16384 ] ,
+    [ sh:path ik:inReplyTo ; sh:maxCount 1 ; sh:nodeKind sh:IRI ; sh:pattern "^urn:layer:work:entry:" ] ,
+    [ sh:path ik:supersedes ; sh:maxCount 1 ; sh:nodeKind sh:IRI ; sh:pattern "^urn:layer:work:entry:" ] ,
+    [ sh:path prov:wasAttributedTo ; sh:minCount 1 ; sh:maxCount 1 ; sh:nodeKind sh:IRI ] ,
+    [ sh:path dcterms:created ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:dateTime ] ,
+    [ sh:path ik:seq ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:integer ] .
+
+<urn:layers:shape:work:question> a sh:NodeShape ;
+  sh:targetClass ik:Question ;
+  sh:closed true ;
+  sh:ignoredProperties ( rdf:type ) ;
+  sh:property
+    [ sh:path ik:body ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:maxLength 16384 ] ,
+    [ sh:path ik:inReplyTo ; sh:maxCount 1 ; sh:nodeKind sh:IRI ; sh:pattern "^urn:layer:work:entry:" ] ,
+    [ sh:path ik:supersedes ; sh:maxCount 1 ; sh:nodeKind sh:IRI ; sh:pattern "^urn:layer:work:entry:" ] ,
+    [ sh:path prov:wasAttributedTo ; sh:minCount 1 ; sh:maxCount 1 ; sh:nodeKind sh:IRI ] ,
+    [ sh:path dcterms:created ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:dateTime ] ,
+    [ sh:path ik:seq ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:integer ] .
+
+# A brief: work, written to be done. A title, the brief itself as Markdown (ik:body, as every
+# entry's text is), and optionally the repository it is for, by its web IRI (ik:repository, as an
+# ik:Offer names it; a name like `ikigai-core` means nothing outside one host's configuration).
+<urn:layers:shape:work:brief> a sh:NodeShape ;
+  sh:targetClass ik:Brief ;
+  sh:closed true ;
+  sh:ignoredProperties ( rdf:type ) ;
+  sh:property
+    [ sh:path dcterms:title ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:minLength 1 ; sh:maxLength 200 ] ,
+    [ sh:path ik:body ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:maxLength 131072 ] ,
+    [ sh:path ik:repository ; sh:maxCount 1 ; sh:nodeKind sh:IRI ; sh:pattern "^https://" ; sh:maxLength 200 ] ,
+    [ sh:path ik:inReplyTo ; sh:maxCount 1 ; sh:nodeKind sh:IRI ; sh:pattern "^urn:layer:work:entry:" ] ,
+    [ sh:path ik:supersedes ; sh:maxCount 1 ; sh:nodeKind sh:IRI ; sh:pattern "^urn:layer:work:entry:" ] ,
+    [ sh:path prov:wasAttributedTo ; sh:minCount 1 ; sh:maxCount 1 ; sh:nodeKind sh:IRI ] ,
+    [ sh:path dcterms:created ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:dateTime ] ,
+    [ sh:path ik:seq ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:integer ] .
+
+# An issue: a problem, written to be fixed. A title and a body, and optionally the repository it
+# is in and how urgent its author thinks it is (triage, never permission: it gates nothing).
+<urn:layers:shape:work:issue> a sh:NodeShape ;
+  sh:targetClass ik:Issue ;
+  sh:closed true ;
+  sh:ignoredProperties ( rdf:type ) ;
+  sh:property
+    [ sh:path dcterms:title ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:minLength 1 ; sh:maxLength 200 ] ,
+    [ sh:path ik:body ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:maxLength 65536 ] ,
+    [ sh:path ik:repository ; sh:maxCount 1 ; sh:nodeKind sh:IRI ; sh:pattern "^https://" ; sh:maxLength 200 ] ,
+    [ sh:path ik:severity ; sh:maxCount 1 ; sh:in ( <urn:iki:severity:critical> <urn:iki:severity:major> <urn:iki:severity:minor> <urn:iki:severity:info> ) ] ,
+    [ sh:path ik:inReplyTo ; sh:maxCount 1 ; sh:nodeKind sh:IRI ; sh:pattern "^urn:layer:work:entry:" ] ,
+    [ sh:path ik:supersedes ; sh:maxCount 1 ; sh:nodeKind sh:IRI ; sh:pattern "^urn:layer:work:entry:" ] ,
+    [ sh:path prov:wasAttributedTo ; sh:minCount 1 ; sh:maxCount 1 ; sh:nodeKind sh:IRI ] ,
+    [ sh:path dcterms:created ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:dateTime ] ,
+    [ sh:path ik:seq ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:integer ] .
+
+# A file: its bare name (no directory, and neither `.` nor `..`, so saving it can never write
+# outside the folder a reader chose), its media type, the SHA-256 of its bytes as ik:contentHash
+# spells a file's version (`sha256:<hex>`), its size in bytes, and the bytes themselves in
+# ik:content, either as the text (ik:encoding "text": UTF-8 with no control characters but tab,
+# newline and carriage return) or as base64 (ik:encoding "base64"). The host cannot check that the
+# digest and size match the content; a reader that saves the file checks both before it writes.
+<urn:layers:shape:work:file> a sh:NodeShape ;
+  sh:targetClass ik:File ;
+  sh:closed true ;
+  sh:ignoredProperties ( rdf:type ) ;
+  sh:property
+    [ sh:path ik:fileName ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:minLength 1 ; sh:maxLength 255 ; sh:pattern "^([^/\\\\.][^/\\\\]*|\\.[^/\\\\.][^/\\\\]*|\\.\\.[^/\\\\]+)$" ] ,
+    [ sh:path ik:mediaType ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:maxLength 127 ; sh:pattern "^[a-z0-9][a-z0-9!$&^_.+-]*/[a-z0-9][a-z0-9!$&^_.+-]*$" ] ,
+    [ sh:path ik:contentHash ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:pattern "^sha256:[0-9a-f]{64}$" ] ,
+    [ sh:path ik:byteSize ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:integer ; sh:minInclusive 0 ; sh:maxInclusive 524288 ] ,
+    [ sh:path ik:encoding ; sh:minCount 1 ; sh:maxCount 1 ; sh:in ( "text" "base64" ) ] ,
+    [ sh:path ik:content ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:maxLength 520192 ] ,
+    [ sh:path ik:inReplyTo ; sh:maxCount 1 ; sh:nodeKind sh:IRI ; sh:pattern "^urn:layer:work:entry:" ] ,
+    [ sh:path ik:supersedes ; sh:maxCount 1 ; sh:nodeKind sh:IRI ; sh:pattern "^urn:layer:work:entry:" ] ,
+    [ sh:path prov:wasAttributedTo ; sh:minCount 1 ; sh:maxCount 1 ; sh:nodeKind sh:IRI ] ,
+    [ sh:path dcterms:created ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:dateTime ] ,
+    [ sh:path ik:seq ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:integer ] .
