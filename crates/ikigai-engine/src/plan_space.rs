@@ -51,8 +51,10 @@ use oxrdf::{Literal, NamedNode, NamedOrBlankNode, Term, Triple};
 use oxttl::{TurtleParser, TurtleSerializer};
 
 use crate::engine::Staged;
+pub use crate::plan::MAX_PLAN_TRIPLES;
 use crate::plan::{
-    execute, literal, verb_name, NodeRef, Plan, PlanHost, RefTo, Refusal, RunError, IK, RDF_TYPE,
+    execute, literal, too_large, verb_name, NodeRef, Plan, PlanHost, RefTo, Refusal, RunError, IK,
+    RDF_TYPE,
 };
 
 /// Run a plan: `in` = the plan, `as` = the face of its result, and each declared
@@ -104,7 +106,7 @@ fn plan_input(what: &str) -> ArgSpec {
     ArgSpec::new("in")
         .summary(format!(
             "the plan, an ik:Process graph as Turtle — inline, or the IRI of a resource \
-             holding one; {what}"
+             holding one — of at most {MAX_PLAN_TRIPLES} triples; {what}"
         ))
         .class(XSD_STRING)
 }
@@ -431,8 +433,19 @@ impl Validation {
 async fn validate(inv: &Invocation<'_>, plan: &str) -> Result<Validation> {
     // Syntax first, so a document that is not Turtle is a bad ARGUMENT here rather than
     // an opaque failure inside the validator.
+    //
+    // And size: past MAX_PLAN_TRIPLES the plan is refused HERE, before the SHACL
+    // sub-request, which is quadratic in a chain's length and has no time budget (ledger
+    // #1733). The reader refuses the same plans with the same words, so a plan this passes
+    // is never refused later for its size.
     let mut process = BTreeSet::new();
-    for triple in TurtleParser::new().for_slice(plan.as_bytes()) {
+    for (count, triple) in TurtleParser::new().for_slice(plan.as_bytes()).enumerate() {
+        if count == MAX_PLAN_TRIPLES {
+            return Err(Error::InvalidArgument {
+                name: "in".to_string(),
+                detail: too_large(),
+            });
+        }
         let triple = triple.map_err(|e| Error::InvalidArgument {
             name: "in".to_string(),
             detail: format!("the plan is not valid Turtle: {e}"),
