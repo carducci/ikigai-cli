@@ -83,6 +83,40 @@ pub(crate) const IK: &str = "https://ikigai-rs.dev/ns#";
 #[cfg(feature = "plan-reader")]
 pub(crate) const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
+/// The most triples a plan may hold. Every reader refuses a larger one before it reads it,
+/// and `urn:plan:validate` refuses it before validating it (ledger #1733).
+///
+/// The bound is for what VALIDATION costs, since the reader's own walk is iterative and
+/// linear. The published shapes are quadratic in the length of a plan's longest dependency
+/// chain (`urn:ikigai:shape:process:edge-cycle` follows every step's upstream edges back to
+/// the head), and SHACL runs synchronously under no time budget of its own, so a
+/// 20,000-step chain was still validating after eight minutes and held its worker all that
+/// time. Measured in a debug build (`tests/plan_size.rs`, `measure_validate`): a chain of
+/// 512 steps (2,561 triples) validates in about 1.2 s and one of 1,024 (5,121 triples) in
+/// about 4 s, while plans as wide as they are long (one step with 1,024 arguments, one fork
+/// with 1,024 branches) took 0.4 s and 1.1 s. 4,096 triples holds a chain of 819 steps; at
+/// the bound the slowest shape measured, a fork of 682 branches, took under 7 s on a
+/// machine under heavy load from other builds. A plan a person writes, or the REPL
+/// renders, holds a few dozen steps of a few triples each. It is a triple count rather than
+/// a step count because arguments and parameters cost validation too, and a step count does
+/// not see them.
+///
+/// ```
+/// assert_eq!(ikigai_engine::plan_space::MAX_PLAN_TRIPLES, 4096);
+/// ```
+#[cfg(feature = "plan-reader")]
+pub const MAX_PLAN_TRIPLES: usize = 4096;
+
+/// The refusal for a plan past [`MAX_PLAN_TRIPLES`], worded once for every reader.
+#[cfg(feature = "plan-reader")]
+pub(crate) fn too_large() -> String {
+    format!(
+        "the plan holds more than {MAX_PLAN_TRIPLES} triples (MAX_PLAN_TRIPLES): it is not \
+         read or validated, because validating a plan costs time that grows faster than its \
+         size, and a plan anyone writes is far smaller"
+    )
+}
+
 /// A node of a plan: a step, or a fork — which stands where a step can, as an upstream or
 /// as the plan's result.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -452,7 +486,12 @@ impl Graph {
             });
         }
         let mut subjects: BTreeMap<String, BTreeMap<String, Vec<Obj>>> = BTreeMap::new();
-        for triple in TurtleParser::new().for_slice(turtle.as_bytes()) {
+        for (count, triple) in TurtleParser::new().for_slice(turtle.as_bytes()).enumerate() {
+            // Counted as it parses, so a plan past the bound costs only the bound's worth of
+            // parsing (ledger #1733).
+            if count == MAX_PLAN_TRIPLES {
+                return Err(too_large());
+            }
             let triple = triple.map_err(|e| format!("the plan is not valid Turtle: {e}"))?;
             let subject = match triple.subject {
                 NamedOrBlankNode::NamedNode(node) => node.into_string(),
@@ -763,7 +802,7 @@ impl Plan {
             .map(NodeRef::Step)
             .chain((0..self.forks.len()).map(NodeRef::Fork));
         for node in nodes {
-            self.visit(node, &mut marks, &mut Vec::new(), &mut Vec::new())?;
+            self.visit(node, &mut marks, &mut Vec::new())?;
         }
         Ok(())
     }
@@ -772,12 +811,7 @@ impl Plan {
     /// and nothing else — the plan is a dependency graph, not a script.
     pub(crate) fn run_order(&self) -> Result<Vec<NodeRef>, Refusal> {
         let mut order = Vec::new();
-        self.visit(
-            self.result,
-            &mut BTreeMap::new(),
-            &mut Vec::new(),
-            &mut order,
-        )?;
+        self.visit(self.result, &mut BTreeMap::new(), &mut order)?;
         Ok(order)
     }
 
@@ -808,44 +842,70 @@ impl Plan {
     /// Depth-first, dependencies first. `marks` holds `false` while a node is on the
     /// current path and `true` once it is done, so meeting a `false` is a cycle — and the
     /// path says which nodes close it.
+    ///
+    /// ITERATIVE, with the path as an explicit stack (ledger #1733): it recursed once per
+    /// dependency, so a plain piped chain of 5,000 steps overflowed a 2 MiB thread (a tokio
+    /// worker's) and aborted the host serving `urn:plan:requires`. A plan's size is bounded
+    /// too ([`MAX_PLAN_TRIPLES`]), but that bound is for what SHACL costs; this walk needs
+    /// no bound at all. The order it visits in, and the cycle it names, are the recursive
+    /// walk's.
     fn visit(
         &self,
-        node: NodeRef,
+        root: NodeRef,
         marks: &mut BTreeMap<NodeRef, bool>,
-        path: &mut Vec<NodeRef>,
         order: &mut Vec<NodeRef>,
     ) -> Result<(), Refusal> {
-        match marks.get(&node) {
-            Some(true) => return Ok(()),
-            Some(false) => {
-                let start = path.iter().position(|n| *n == node).unwrap_or(0);
-                let cycle: Vec<String> = path[start..]
-                    .iter()
-                    .chain(std::iter::once(&node))
-                    .map(|n| format!("<{}>", self.node_iri(*n)))
-                    .collect();
-                return Err(Refusal {
-                    kind: RefusalKind::Cycle,
-                    message: format!(
-                        "<{}> depends on itself — a plan is a DAG, and this one is not: {} \
-                         (each node needs the next, counting the edge an ik:ref makes through \
-                         a bound name)",
-                        self.node_iri(node),
-                        cycle.join(" → ")
-                    ),
-                });
+        // Each node on the current path, with its dependencies and how many of them have
+        // been entered.
+        let mut path: Vec<(NodeRef, Vec<NodeRef>, usize)> = Vec::new();
+        let mut entering = Some(root);
+        loop {
+            if let Some(node) = entering.take() {
+                match marks.get(&node) {
+                    Some(true) => {}
+                    Some(false) => return Err(self.cycle_refusal(node, &path)),
+                    None => {
+                        marks.insert(node, false);
+                        let deps = self.deps(node)?;
+                        path.push((node, deps, 0));
+                    }
+                }
             }
-            None => {}
+            let Some((node, deps, entered)) = path.last_mut() else {
+                return Ok(());
+            };
+            if let Some(dep) = deps.get(*entered) {
+                *entered += 1;
+                entering = Some(*dep);
+            } else {
+                let node = *node;
+                path.pop();
+                marks.insert(node, true);
+                order.push(node);
+            }
         }
-        marks.insert(node, false);
-        path.push(node);
-        for dep in self.deps(node)? {
-            self.visit(dep, marks, path, order)?;
+    }
+
+    /// The refusal for meeting `node` again while it is on `path`: the nodes from its first
+    /// appearance to itself, which is the cycle.
+    fn cycle_refusal(&self, node: NodeRef, path: &[(NodeRef, Vec<NodeRef>, usize)]) -> Refusal {
+        let start = path.iter().position(|(n, _, _)| *n == node).unwrap_or(0);
+        let cycle: Vec<String> = path[start..]
+            .iter()
+            .map(|(n, _, _)| n)
+            .chain(std::iter::once(&node))
+            .map(|n| format!("<{}>", self.node_iri(*n)))
+            .collect();
+        Refusal {
+            kind: RefusalKind::Cycle,
+            message: format!(
+                "<{}> depends on itself — a plan is a DAG, and this one is not: {} \
+                 (each node needs the next, counting the edge an ik:ref makes through \
+                 a bound name)",
+                self.node_iri(node),
+                cycle.join(" → ")
+            ),
         }
-        path.pop();
-        marks.insert(node, true);
-        order.push(node);
-        Ok(())
     }
 
     /// The tail of each branch of `fork`, in join order: the branches are the steps whose
@@ -1756,6 +1816,114 @@ mod tests {
             binds: None,
             feed,
         }
+    }
+
+    const WALK_PROBE: &str = "IKIGAI_ENGINE_PLAN_WALK_PROBE";
+
+    /// `n` steps, each piping from the one before, built directly rather than read, so the
+    /// walk is tested far past the size any reader admits (ledger #1733). `ring` closes the
+    /// chain: the first step pipes from the last.
+    fn long_chain(n: usize, ring: bool) -> Plan {
+        Plan {
+            id: "long".to_string(),
+            params: Vec::new(),
+            steps: (0..n)
+                .map(|i| {
+                    let feed = match i {
+                        0 if ring => Feed::Pipe(NodeRef::Step(n - 1)),
+                        0 => Feed::None,
+                        _ => Feed::Pipe(NodeRef::Step(i - 1)),
+                    };
+                    step("urn:t:s", feed, &[])
+                })
+                .collect(),
+            forks: Vec::new(),
+            result: NodeRef::Step(n - 1),
+        }
+    }
+
+    /// The child's half of the walk test: inert unless the parent named a probe. Walks a
+    /// chain (`chain:n`) or a ring (`ring:n`) on a 2 MiB thread, a tokio worker's size, and
+    /// prints what the walk said.
+    #[test]
+    fn walk_probe_child() {
+        let Ok(spec) = std::env::var(WALK_PROBE) else {
+            return;
+        };
+        let (shape, n) = spec.split_once(':').expect("shape:n");
+        let (ring, n) = (shape == "ring", n.parse::<usize>().expect("n"));
+        let outcome = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || {
+                let plan = long_chain(n, ring);
+                match (plan.check(), plan.run_order()) {
+                    (Ok(()), Ok(order)) => {
+                        let in_order = order.iter().copied().eq((0..n).map(NodeRef::Step));
+                        format!("ok {} in order {in_order}", order.len())
+                    }
+                    // The kind, how many edges the named cycle has, and what it says first.
+                    (Err(refusal), _) | (_, Err(refusal)) => format!(
+                        "err {:?} {} edges: {}",
+                        refusal.kind,
+                        refusal.message.matches(" → ").count(),
+                        refusal.message.split(" — ").next().unwrap_or("")
+                    ),
+                }
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+        println!("\nOUTCOME {outcome}");
+        std::process::exit(0);
+    }
+
+    /// Run one walk probe in a child of this test binary; an abort fails the parent with the
+    /// signal named rather than taking the whole test run down.
+    fn walk_probe(spec: &str) -> String {
+        let out = std::process::Command::new(std::env::current_exe().expect("exe"))
+            .args([
+                "--exact",
+                "plan::tests::walk_probe_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(WALK_PROBE, spec)
+            .output()
+            .expect("child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "the walk over {spec} did not survive a 2 MiB thread: {} - {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .find(|l| l.contains("overflow"))
+                .unwrap_or("")
+        );
+        let at = stdout
+            .find("\nOUTCOME ")
+            .unwrap_or_else(|| panic!("the walk over {spec} reported nothing: {stdout}"));
+        stdout[at + "\nOUTCOME ".len()..]
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[test]
+    fn the_walk_is_iterative_so_a_chain_far_past_the_bound_aborts_nothing() {
+        // Before: the recursive walk SIGABRTed a 2 MiB thread at 5,000 steps in debug.
+        assert_eq!(walk_probe("chain:100000"), "ok 100000 in order true");
+    }
+
+    #[test]
+    fn the_iterative_walk_still_names_a_long_cycle_from_where_it_closes() {
+        // The first step pipes from the last: checking from step 1 runs the whole ring back
+        // to step 1, all 20,000 edges of it, which is the cycle the recursive walk named too.
+        assert_eq!(
+            walk_probe("ring:20000"),
+            "err Cycle 20000 edges: <urn:plan:long:step:1> depends on itself"
+        );
     }
 
     /// Every term the engine emits, in one plan: a bare first stage, a pipe, a map, a fork
