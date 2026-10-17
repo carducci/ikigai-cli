@@ -458,6 +458,7 @@ at layers post brief talk brief.md --repo ikigai-rs/ikigai-core   # title: its f
 at layers post issue talk --title "Crash on start" --severity major < issue.md
 at layers post file talk ./trace.log --in-reply-to urn:layer:talk:entry:…
 at layers save urn:layer:talk:entry:… ./incoming/                 # size and digest checked
+at layers save urn:layer:talk:entry:…                             # no PATH: ~/Downloads
 ```
 
 Each post prints the IRI the door gave the entry; every kind takes `--in-reply-to ENTRY` and
@@ -465,7 +466,14 @@ Each post prints the IRI the door gave the entry; every kind takes `--in-reply-t
 `save` writes a file entry's bytes only after checking them against its `ik:byteSize` and
 `ik:contentHash`: a door checks an entry's shape, never that its digest is true, so this is the
 check that matters, and on a mismatch nothing is written and it exits 1. It replaces an existing
-file only with `--force`. Reading one kind needs no subcommand:
+file only with `--force`. With no PATH it writes to your downloads directory (`~/Downloads`, else
+the XDG download directory or the Windows Downloads folder), never the directory you are in, and
+asks for a PATH when there is none. An entry's file name is the poster's choice, so `save`
+refuses one that would arm something on your machine (ledger #1748): a name an agent or a shell
+loads as configuration (`CLAUDE.md`, `AGENTS.md`, `.mcp.json`, `.envrc`, any `.git` name), any
+name beginning with a dot, any `:` (a Windows drive or alternate data stream), a Windows device
+name (`CON`, `nul.txt`), and an invisible character. `--as NAME` saves it under a name you chose,
+held to the same rules, and `post file` refuses to send such a file, pointing at `--file-name`. Reading one kind needs no subcommand:
 `source urn:layer:talk:entries type=https://ikigai-rs.dev/ns#Brief`. The commands, flags and
 refusals are the Python participant client's
 ([ikigai-layers-client](https://github.com/ikigai-rs/ikigai-layers-client): `ikigai-layers post`,

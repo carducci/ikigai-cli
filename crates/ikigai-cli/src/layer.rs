@@ -33,6 +33,7 @@ use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
+use icu_properties::props::GeneralCategory;
 use ikigai_engine::{Action, Engine};
 use sha2::{Digest, Sha256};
 
@@ -58,9 +59,14 @@ usage (connection flags such as --override, --connect and --cert-dir go BEFORE `
       every post also takes --in-reply-to ENTRY and --supersedes ENTRY, and prints the entry's IRI;
       a brief or issue body is FILE, or stdin with - or no FILE; its title defaults to the
       body's first `# ` heading
-  ikigai layers save ENTRY [PATH] [--force]
-      write a file entry's bytes to PATH (a directory: its own name in it; none: its own name
-      here) after checking its size and SHA-256; nothing is written when either does not match
+  ikigai layers save ENTRY [PATH] [--as NAME] [--force]
+      write a file entry's bytes to PATH (a directory: its own name in it, or NAME with --as;
+      none: your downloads directory, ~/Downloads) after checking its size and SHA-256; nothing
+      is written when either does not match. A name an agent or a shell loads as configuration
+      (CLAUDE.md, AGENTS.md, .mcp.json, .envrc, any .git name), any name beginning with a dot,
+      any ':', and a Windows device name (CON, NUL, COM1) are refused: save it under another
+      name with --as NAME. --force replaces an existing file at the target; its old content is
+      lost
 exit: 0 done, 1 the door answered an error (or a file failed its check), 2 usage or local";
 
 /// What `ikigai layers …` was asked to do, as parsed (nothing read or dialed yet).
@@ -77,6 +83,8 @@ pub(crate) enum Command {
     Save {
         entry: String,
         path: Option<PathBuf>,
+        /// `--as NAME`: save under NAME instead of the entry's own file name.
+        as_name: Option<String>,
         force: bool,
     },
 }
@@ -183,9 +191,11 @@ pub(crate) fn parse(argv: impl Iterator<Item = String>) -> Result<Command, Strin
         Some("save") => {
             let mut positional = Vec::new();
             let mut force = false;
-            for arg in argv {
+            let mut as_name = None;
+            while let Some(arg) = argv.next() {
                 match arg.as_str() {
                     "--force" => force = true,
+                    "--as" => as_name = Some(value(&mut argv, &arg)?),
                     other if other.starts_with('-') => {
                         return Err(format!(
                             "unknown argument after `layers save`: {other} (connection flags \
@@ -205,7 +215,12 @@ pub(crate) fn parse(argv: impl Iterator<Item = String>) -> Result<Command, Strin
                     "unexpected argument after `layers save`: {extra}\n{USAGE}"
                 ));
             }
-            Ok(Command::Save { entry, path, force })
+            Ok(Command::Save {
+                entry,
+                path,
+                as_name,
+                force,
+            })
         }
         Some(other) => Err(format!("unknown `layers` command: {other}\n{USAGE}")),
         None => Err(USAGE.to_string()),
@@ -224,9 +239,24 @@ pub(crate) enum Prepared {
     },
     Save {
         entry: String,
-        path: Option<PathBuf>,
+        target: SaveTarget,
         force: bool,
     },
+}
+
+/// Where `save` writes, settled before anything is dialed.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SaveTarget {
+    /// Into this directory (PATH named one, or the downloads directory when there was no
+    /// PATH), under `as_name` or else the entry's own file name, which is checked when it
+    /// arrives.
+    Dir {
+        dir: PathBuf,
+        as_name: Option<String>,
+    },
+    /// To this file: PATH named it, and its name has been checked already, so the entry's
+    /// own name does not matter.
+    File(PathBuf),
 }
 
 /// What a file post checks against the layer's shapes before it is sent.
@@ -297,6 +327,12 @@ pub(crate) fn prepare(command: Command) -> Result<Prepared, String> {
                             })?
                             .to_string(),
                     };
+                    safe_name(&name).map_err(|e| {
+                        format!(
+                            "{e}, and a reader cannot save it: post it under another name with \
+                             --file-name NAME"
+                        )
+                    })?;
                     let entry = file_entry(&name, &data, media_type.as_deref(), thread)?;
                     (
                         entry.turtle,
@@ -315,9 +351,22 @@ pub(crate) fn prepare(command: Command) -> Result<Prepared, String> {
                 file,
             })
         }
-        Command::Save { entry, path, force } => {
+        Command::Save {
+            entry,
+            path,
+            as_name,
+            force,
+        } => {
             entry_layer(&entry)?;
-            Ok(Prepared::Save { entry, path, force })
+            if let Some(name) = &as_name {
+                safe_name(name).map_err(|e| format!("not saved: {e}; choose another --as NAME"))?;
+            }
+            let target = save_target(path, as_name, downloads_dir)?;
+            Ok(Prepared::Save {
+                entry,
+                target,
+                force,
+            })
         }
     }
 }
@@ -331,7 +380,11 @@ pub(crate) fn run(engine: &Engine, prepared: Prepared) -> i32 {
             turtle,
             file,
         } => post(engine, &layer, turtle, file),
-        Prepared::Save { entry, path, force } => save(engine, &entry, path.as_deref(), force),
+        Prepared::Save {
+            entry,
+            target,
+            force,
+        } => save(engine, &entry, &target, force),
     };
     match outcome {
         Ok(line) => {
@@ -381,7 +434,7 @@ fn post(engine: &Engine, layer: &str, turtle: String, file: Option<FileCheck>) -
     Ok(answer.trim().to_string())
 }
 
-fn save(engine: &Engine, entry: &str, path: Option<&Path>, force: bool) -> Outcome {
+fn save(engine: &Engine, entry: &str, target: &SaveTarget, force: bool) -> Outcome {
     let turtle = ask(engine, &format!("source {entry} as=text/turtle"))?;
     let node = Node::of(&turtle, entry).map_err(|e| (EXIT_DOOR, format!("not saved: {e}")))?;
     if !node.types.iter().any(|t| t == &format!("{IK}File")) {
@@ -403,26 +456,36 @@ fn save(engine: &Engine, entry: &str, path: Option<&Path>, force: bool) -> Outco
             ),
         ));
     }
-    let (name, data) = node
-        .file()
-        .map_err(|e| (EXIT_DOOR, format!("not saved: {e}")))?;
-    let target = match path {
-        None => std::env::current_dir()
-            .map_err(|e| {
+    // The entry's own name matters only when it picks the file: not with --as, and not when
+    // PATH names the file (both were checked before dialing).
+    let target = match target {
+        SaveTarget::Dir {
+            dir,
+            as_name: Some(name),
+        } => dir.join(name),
+        SaveTarget::Dir { dir, as_name: None } => {
+            let name = node
+                .one("fileName")
+                .map_err(|e| (EXIT_DOOR, format!("not saved: {e}")))?;
+            let name = safe_name(name).map_err(|e| {
                 (
-                    EXIT_USAGE,
-                    format!("no working directory to save into: {e}"),
+                    EXIT_DOOR,
+                    format!("not saved: {e}; save it under another name with --as NAME"),
                 )
-            })?
-            .join(&name),
-        Some(p) if p.is_dir() => p.join(&name),
-        Some(p) => p.to_path_buf(),
+            })?;
+            dir.join(name)
+        }
+        SaveTarget::File(path) => path.clone(),
     };
+    let data = node
+        .bytes()
+        .map_err(|e| (EXIT_DOOR, format!("not saved: {e}")))?;
     if target.exists() && !force {
         return Err((
             EXIT_USAGE,
             format!(
-                "{} exists: give another PATH, or --force to replace it",
+                "{} exists: give another PATH, --as NAME, or --force to replace it (its old \
+                 content is lost)",
                 target.display()
             ),
         ));
@@ -439,6 +502,43 @@ fn save(engine: &Engine, entry: &str, path: Option<&Path>, force: bool) -> Outco
         data.len(),
         digest(&data)
     ))
+}
+
+/// Where `save` writes, decided before dialing (the Python client's `_save_dir`): no PATH is
+/// the downloads directory (`downloads`, refused when there is none, never the working
+/// directory, which is often a repository an agent works in); a directory is that directory;
+/// and a PATH naming the file has its own name held to [`safe_name`]. `--as` needs a directory.
+fn save_target(
+    path: Option<PathBuf>,
+    as_name: Option<String>,
+    downloads: impl FnOnce() -> Result<PathBuf, String>,
+) -> Result<SaveTarget, String> {
+    let Some(path) = path else {
+        return Ok(SaveTarget::Dir {
+            dir: downloads()?,
+            as_name,
+        });
+    };
+    if path.is_dir() {
+        return Ok(SaveTarget::Dir { dir: path, as_name });
+    }
+    if as_name.is_some() {
+        return Err(format!(
+            "{} is not a directory: give --as NAME with a directory, or a PATH that names the file",
+            path.display()
+        ));
+    }
+    let name = match path.file_name() {
+        None => String::new(),
+        Some(name) => name.to_str().map(str::to_string).ok_or_else(|| {
+            format!(
+                "not saved: {} has a name that is not UTF-8; give PATH another name",
+                path.display()
+            )
+        })?,
+    };
+    safe_name(&name).map_err(|e| format!("not saved: {e}; give PATH another name"))?;
+    Ok(SaveTarget::File(path))
 }
 
 /// Write `data` to `target` whole or not at all: into a new file beside it, then renamed over
@@ -728,20 +828,231 @@ fn encode(data: &[u8]) -> (&'static str, String) {
     )
 }
 
-/// `name` if a reader can save it without leaving the directory it chose: no directory part,
-/// not `.` or `..`, no control character, at most 255 bytes.
+/// Names an agent, a shell or a tool loads as configuration, or as credentials, from the
+/// directory it runs in or from home, compared case-insensitively (each written here in its
+/// folded form). Most begin with a dot, and the leading-dot rule refuses every one of those
+/// anyway; they are listed so the reason a reader sees is the specific one. Every name
+/// beginning `.git` is refused too (`.gitconfig`, `.gitattributes`, `.git`).
+///
+/// The Python participant client's `CONFIG_NAMES` (`files.py` in ikigai-layers-client), the
+/// source of truth for this rule (ledger #1748): a name added there is added here.
+const CONFIG_NAMES: [&str; 24] = [
+    // agent instructions and tool servers
+    "claude.md",
+    "claude.local.md",
+    "agents.md",
+    "agent.md",
+    "gemini.md",
+    ".mcp.json",
+    // shells and direnv
+    ".envrc",
+    ".env",
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".profile",
+    ".zshrc",
+    ".zshenv",
+    ".zprofile",
+    ".zlogin",
+    // credentials read by git, npm, pip and curl (`_netrc` is the Windows spelling)
+    ".gitconfig",
+    ".npmrc",
+    ".pypirc",
+    ".netrc",
+    "_netrc",
+    // Python code that pytest and the interpreter import on their own
+    "conftest.py",
+    "sitecustomize.py",
+    "usercustomize.py",
+];
+
+/// Windows device names, reserved with or without an extension (`CON`, `con.txt`), as
+/// Microsoft's naming rules list them, with the ports below. The Python client's
+/// `WINDOWS_DEVICES`.
+const WINDOWS_DEVICES: [&str; 6] = ["con", "prn", "aux", "nul", "conin$", "conout$"];
+/// `COM0`-`COM9` and `LPT0`-`LPT9`, and the superscript-digit ports (`COM¹`, `LPT³`).
+const WINDOWS_PORTS: [&str; 2] = ["com", "lpt"];
+const WINDOWS_PORT_DIGITS: &str = "0123456789\u{b9}\u{b2}\u{b3}";
+/// The characters Windows does not allow in a name (besides `:`, `/` and `\`, refused
+/// before), in code point order so the one a refusal names is the Python client's.
+const WINDOWS_FORBIDDEN: [char; 6] = ['"', '*', '<', '>', '?', '|'];
+
+/// Full Unicode case folding, as Python's `str.casefold` does it.
+fn fold(text: &str) -> String {
+    icu_casemap::CaseMapper::new()
+        .fold_string(text)
+        .into_owned()
+}
+
+/// Whether `stem` (a name before its first dot, trailing spaces dropped) is a Windows device.
+fn is_windows_device(stem: &str) -> bool {
+    let stem = fold(stem);
+    WINDOWS_DEVICES.contains(&stem.as_str()) || WINDOWS_PORTS.iter().any(|port| {
+        let mut digit = stem.strip_prefix(port).unwrap_or("").chars();
+        matches!((digit.next(), digit.next()), (Some(d), None) if WINDOWS_PORT_DIGITS.contains(d))
+    })
+}
+
+/// `name` if it is a bare file name a reader can save without leaving the directory it chose
+/// and without arming anything there, else why not.
+///
+/// Refused, in this order (the Python participant client's `safe_name`, ledger #1748): a name
+/// with a directory in it, or a control character; a name over 255 characters; an invisible
+/// character (general category Cf, Zl or Zp: HFS+ ignored some of these when comparing names,
+/// git's CVE-2014-9390); a name an agent or a shell loads as configuration ([`CONFIG_NAMES`],
+/// and every `.git` name), compared after NFKC, with trailing dots and spaces dropped, and
+/// case folded, as a case-insensitive file system and Windows would compare it; any name
+/// beginning with a dot; a Windows drive (`C:x`) and any other `:` (an alternate data stream,
+/// `a.txt:x`); a character Windows does not allow; a trailing dot or space (Windows drops it, so
+/// `CLAUDE.md.` would land as `CLAUDE.md`); and a Windows device name with or without an
+/// extension (`CON`, `nul.txt`).
 fn safe_name(name: &str) -> Result<&str, String> {
     let bad = name.is_empty()
         || name == "."
         || name == ".."
         || name.contains(['/', '\\'])
-        || name.chars().any(|c| (c as u32) < 0x20 || c as u32 == 0x7F)
-        || name.len() > 255;
+        || name.chars().any(|c| (c as u32) < 0x20 || c as u32 == 0x7F);
     if bad {
-        Err(format!("{name:?} is not a bare file name"))
-    } else {
-        Ok(name)
+        return Err(format!("{name:?} is not a bare file name"));
     }
+    if name.chars().count() > 255 {
+        let head: String = name.chars().take(40).collect();
+        return Err(format!("{head:?}… is over 255 characters"));
+    }
+    let categories = icu_properties::CodePointMapData::<GeneralCategory>::new();
+    if let Some(hidden) = name.chars().find(|&c| {
+        matches!(
+            categories.get(c),
+            GeneralCategory::Format
+                | GeneralCategory::LineSeparator
+                | GeneralCategory::ParagraphSeparator
+        )
+    }) {
+        return Err(format!(
+            "{name:?} holds an invisible character (U+{:04X})",
+            hidden as u32
+        ));
+    }
+    // As a case-insensitive file system, and Windows, would compare it.
+    let normalized = icu_normalizer::ComposingNormalizer::new_nfkc().normalize(name);
+    let key = fold(normalized.trim_end_matches(['.', ' ']));
+    if CONFIG_NAMES.contains(&key.as_str()) || key.starts_with(".git") {
+        return Err(format!(
+            "{name:?} is a name an agent or a shell loads as configuration"
+        ));
+    }
+    if name.starts_with('.') {
+        return Err(format!(
+            "{name:?} begins with a dot: a hidden file, the form configuration takes"
+        ));
+    }
+    let mut chars = name.chars();
+    if let (Some(drive), Some(':')) = (chars.next(), chars.next()) {
+        if drive.is_ascii_alphabetic() {
+            return Err(format!("{name:?} begins with a Windows drive ({drive}:)"));
+        }
+    }
+    if name.contains(':') {
+        return Err(format!(
+            "{name:?} holds ':', which Windows reads as an alternate data stream"
+        ));
+    }
+    if let Some(c) = WINDOWS_FORBIDDEN.iter().find(|&&c| name.contains(c)) {
+        return Err(format!(
+            "{name:?} holds {c:?}, which Windows does not allow in a name"
+        ));
+    }
+    if name.ends_with(['.', ' ']) {
+        return Err(format!(
+            "{name:?} ends in a dot or a space, which Windows drops from a name"
+        ));
+    }
+    let stem = name.split('.').next().unwrap_or(name);
+    if is_windows_device(stem.trim_end_matches(' ')) {
+        return Err(format!("{name:?} is a Windows device name ({stem})"));
+    }
+    Ok(name)
+}
+
+/// Where `save` writes when it is given no PATH: `~/Downloads` when it is a directory, else
+/// the platform's own downloads directory (on Windows the Downloads known folder; elsewhere the
+/// `XDG_DOWNLOAD_DIR` of `~/.config/user-dirs.dirs`), else a refusal asking for a PATH. Never
+/// home itself: a downloads directory set to home is the XDG spelling of "none".
+fn downloads_dir() -> Result<PathBuf, String> {
+    // $HOME, read once here (the environment is process-global); on Windows a native shell
+    // sets USERPROFILE instead.
+    let mut home = std::env::var_os("HOME").unwrap_or_default();
+    if cfg!(windows) && home.is_empty() {
+        home = std::env::var_os("USERPROFILE").unwrap_or_default();
+    }
+    let home = PathBuf::from(home);
+    #[cfg(windows)]
+    let known_folder: Option<&dyn Fn() -> Option<PathBuf>> = Some(&dirs::download_dir);
+    #[cfg(not(windows))]
+    let known_folder: Option<&dyn Fn() -> Option<PathBuf>> = None;
+    downloads_dir_in(&home, known_folder).ok_or_else(|| {
+        if home.as_os_str().is_empty() {
+            "no downloads directory found (HOME is not set): give a PATH to save into".to_string()
+        } else {
+            format!(
+                "no downloads directory found (no {}): give a PATH to save into",
+                home.join("Downloads").display()
+            )
+        }
+    })
+}
+
+/// [`downloads_dir`] for a given `home` (an empty one is no home). `known_folder` is the
+/// Windows lookup, and its presence is the Windows branch, so a test takes either branch on
+/// any platform (the Python client's `registry` parameter).
+fn downloads_dir_in(
+    home: &Path,
+    known_folder: Option<&dyn Fn() -> Option<PathBuf>>,
+) -> Option<PathBuf> {
+    let has_home = !home.as_os_str().is_empty();
+    let home_resolved = std::fs::canonicalize(home).ok();
+    let usable = |candidate: PathBuf| -> Option<PathBuf> {
+        if !candidate.is_dir() {
+            return None;
+        }
+        let resolved = std::fs::canonicalize(&candidate).ok()?;
+        (home_resolved.as_ref() != Some(&resolved)).then_some(candidate)
+    };
+    if has_home {
+        if let Some(found) = usable(home.join("Downloads")) {
+            return Some(found);
+        }
+    }
+    if let Some(lookup) = known_folder {
+        return lookup().and_then(usable);
+    }
+    if !has_home {
+        return None;
+    }
+    let dirs = std::fs::read_to_string(home.join(".config").join("user-dirs.dirs")).ok()?;
+    for line in dirs.lines() {
+        let Some(value) = xdg_download_dir(line) else {
+            continue;
+        };
+        if let Some(rest) = value.strip_prefix("$HOME/") {
+            return usable(home.join(rest));
+        }
+        if value.starts_with('/') {
+            return usable(PathBuf::from(value));
+        }
+        return None;
+    }
+    None
+}
+
+/// The value of a `XDG_DOWNLOAD_DIR="…"` line of `user-dirs.dirs`, `None` for any other line.
+fn xdg_download_dir(line: &str) -> Option<&str> {
+    let rest = line.trim_start().strip_prefix("XDG_DOWNLOAD_DIR")?;
+    let rest = rest.trim_start().strip_prefix('=')?;
+    let rest = rest.trim_start().strip_prefix('"')?;
+    let value = rest.trim_end().strip_suffix('"')?;
+    (!value.contains('"')).then_some(value)
 }
 
 /// Whether a layer's shapes take `value` as a media type: lowercase `type/subtype`, no
@@ -948,10 +1259,11 @@ impl Node {
         }
     }
 
-    /// A file entry's name and bytes, after checking its size and its digest against the
-    /// bytes: the check the door cannot make, so the one that matters.
-    fn file(&self) -> Result<(String, Vec<u8>), String> {
-        let name = safe_name(self.one("fileName")?)?.to_string();
+    /// A file entry's bytes, after checking its size and its digest against them: the check
+    /// the door cannot make, so the one that matters. Its NAME is not checked here: whether it
+    /// matters depends on where it is saved ([`SaveTarget`]), and `save` holds it to
+    /// [`safe_name`] when it does.
+    fn bytes(&self) -> Result<Vec<u8>, String> {
         let content = self.one("content")?;
         let data = match self.one("encoding")? {
             "text" => content.as_bytes().to_vec(),
@@ -981,7 +1293,7 @@ impl Node {
                 self.iri
             ));
         }
-        Ok((name, data))
+        Ok(data)
     }
 }
 
@@ -1108,13 +1420,373 @@ mod tests {
         assert_eq!(encode(b"esc\x1b[0m").0, "base64");
     }
 
+    // ---- what `save` will write, and where (ledger #1748) ------------------------------------
+    // Mirrors the Python participant client's tests/test_save_names.py, case for case.
+
+    /// `name` is refused, and the reason says `because`.
+    fn refused(name: &str, because: &str) {
+        let err = safe_name(name).expect_err(name);
+        assert!(err.contains(because), "{name:?}: {err}");
+    }
+
     #[test]
-    fn a_file_name_never_leaves_the_directory() {
-        assert!(safe_name("notes.md").is_ok());
-        assert!(safe_name(".hidden").is_ok());
-        for bad in ["", ".", "..", "a/b", "..\\x", "a\nb", &"x".repeat(256)] {
-            assert!(safe_name(bad).is_err(), "{bad:?}");
+    fn a_name_an_agent_or_shell_loads_as_configuration_is_refused() {
+        for name in [
+            "CLAUDE.md",
+            "CLAUDE.local.md",
+            "AGENTS.md",
+            ".mcp.json",
+            ".envrc",
+            ".env",
+            ".bashrc",
+            ".bash_profile",
+            ".profile",
+            ".zshrc",
+            ".zshenv",
+            ".zprofile",
+            ".gitconfig",
+            ".npmrc",
+            ".pypirc",
+            ".netrc",
+            "_netrc",
+            "conftest.py",
+        ] {
+            assert!(CONFIG_NAMES.contains(&fold(name).as_str()), "{name}");
+            refused(name, "loads as configuration");
         }
+        // The list is written folded, so a lookup by a folded key can find every entry.
+        for name in CONFIG_NAMES {
+            assert_eq!(fold(name), name);
+            refused(name, "loads as configuration");
+        }
+    }
+
+    #[test]
+    fn configuration_names_match_case_insensitively() {
+        for name in [
+            "claude.md",
+            "Claude.MD",
+            "agents.MD",
+            ".MCP.JSON",
+            ".EnvRC",
+            "CONFTEST.PY",
+        ] {
+            refused(name, "loads as configuration");
+        }
+    }
+
+    #[test]
+    fn every_git_name_is_refused() {
+        for name in [
+            ".git",
+            ".gitattributes",
+            ".gitignore",
+            ".git-credentials",
+            ".GITMODULES",
+        ] {
+            refused(name, "loads as configuration");
+        }
+    }
+
+    #[test]
+    fn a_trailing_dot_or_space_or_a_lookalike_does_not_slip_past_the_list() {
+        // Windows drops a trailing dot or space, so CLAUDE.md. lands as CLAUDE.md there; and
+        // NFKC makes the fullwidth spelling the ASCII one.
+        for name in [
+            "CLAUDE.md.",
+            "AGENTS.md ",
+            "CLAUDE.md. .",
+            "\u{FF23}\u{FF2C}\u{FF21}\u{FF35}\u{FF24}\u{FF25}.md",
+        ] {
+            refused(name, "loads as configuration");
+        }
+    }
+
+    #[test]
+    fn the_comparison_folds_case_as_python_casefold_does() {
+        // Full case folding, not lowercasing: these differ only where a fold expands.
+        assert_eq!(fold("Stra\u{DF}e"), "strasse");
+        assert_eq!(fold("\u{1E9E}"), "ss");
+        assert_eq!(fold("CLAUDE.MD"), "claude.md");
+    }
+
+    #[test]
+    fn an_invisible_character_is_refused() {
+        // HFS+ ignored some of these when comparing names (git's CVE-2014-9390).
+        for name in [
+            "CLAUDE\u{200C}.md",
+            "notes\u{200B}.md",
+            "a\u{2028}b",
+            "\u{FEFF}x.txt",
+        ] {
+            refused(name, "invisible character");
+        }
+        refused("a\u{2029}b", "(U+2029)");
+    }
+
+    #[test]
+    fn any_leading_dot_is_refused() {
+        for name in [".hidden", ".claude", "..notes", "._x", ".cursorrules"] {
+            refused(name, "begins with a dot");
+        }
+    }
+
+    #[test]
+    fn windows_device_names_are_refused_with_or_without_an_extension() {
+        for name in [
+            "CON", "con", "PRN", "AUX", "Nul.txt", "COM1", "com9.log", "LPT1", "lpt0",
+        ] {
+            refused(name, "Windows device name");
+        }
+        for name in [
+            "COM\u{B9}",
+            "LPT\u{B3}.txt",
+            "CONIN$",
+            "aux .txt",
+            "nul.tar.gz",
+        ] {
+            refused(name, "Windows device name");
+        }
+        refused("Nul.txt", "(Nul)");
+    }
+
+    #[test]
+    fn a_drive_letter_is_refused() {
+        for name in ["C:x", "c:evil", "Z:"] {
+            refused(name, "Windows drive");
+        }
+    }
+
+    #[test]
+    fn any_colon_is_refused_as_an_alternate_data_stream() {
+        for name in [
+            "a.txt:ads",
+            "notes:Zone.Identifier",
+            "10:30.txt",
+            "a.txt::$DATA",
+        ] {
+            refused(name, "alternate data stream");
+        }
+    }
+
+    #[test]
+    fn a_character_windows_does_not_allow_is_refused() {
+        for name in ["a?b", "a*b", "a\"b", "a|b", "a<b", "a>b"] {
+            refused(name, "Windows does not allow");
+        }
+        // The one named is the first in code point order, as the Python client names it.
+        refused("a|b?c", "holds '?'");
+    }
+
+    #[test]
+    fn a_trailing_dot_or_space_is_refused() {
+        for name in ["notes.", "notes ", "a.txt.."] {
+            refused(name, "ends in a dot or a space");
+        }
+    }
+
+    #[test]
+    fn a_directory_or_control_character_is_still_refused() {
+        for name in ["", ".", "..", "a/b", "a\\b", "x\ny", "\0"] {
+            refused(name, "not a bare file name");
+        }
+        refused(&"x".repeat(256), "over 255 characters");
+    }
+
+    #[test]
+    fn an_ordinary_name_is_allowed() {
+        for name in [
+            "notes.md",
+            "trace.log",
+            "README.md",
+            "report 2026-10-16.pdf",
+            "claude-notes.md",
+            "my.CLAUDE.md",
+            "agents.md.txt",
+            "console.txt",
+            "COM10",
+            "conx.txt",
+            "donn\u{E9}es.csv",
+            "a.b.c",
+            &"x".repeat(255),
+            // 255 characters, 510 bytes: the bound counts characters, as the Python client does.
+            &"\u{E9}".repeat(255),
+        ] {
+            assert_eq!(safe_name(name), Ok(name), "{name:?}");
+        }
+    }
+
+    /// A scratch directory unique to this case and process, removed when dropped.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(case: &str) -> Scratch {
+            let dir = std::env::temp_dir().join(format!("iki-names-{}-{case}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn downloads_under_home_when_it_exists() {
+        let home = Scratch::new("dl-home");
+        let downloads = home.0.join("Downloads");
+        std::fs::create_dir(&downloads).unwrap();
+        assert_eq!(downloads_dir_in(&home.0, None), Some(downloads.clone()));
+        // On Windows too: ~\Downloads before the known folder.
+        let none = || None;
+        assert_eq!(downloads_dir_in(&home.0, Some(&none)), Some(downloads));
+    }
+
+    #[test]
+    fn the_xdg_download_dir_otherwise() {
+        let home = Scratch::new("dl-xdg");
+        std::fs::create_dir_all(home.0.join(".config")).unwrap();
+        std::fs::create_dir(home.0.join("T\u{E9}l\u{E9}chargements")).unwrap();
+        std::fs::write(
+            home.0.join(".config").join("user-dirs.dirs"),
+            "# written by xdg-user-dirs-update\nXDG_DESKTOP_DIR=\"$HOME/Desktop\"\n\
+             XDG_DOWNLOAD_DIR=\"$HOME/T\u{E9}l\u{E9}chargements\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            downloads_dir_in(&home.0, None),
+            Some(home.0.join("T\u{E9}l\u{E9}chargements"))
+        );
+    }
+
+    #[test]
+    fn an_xdg_download_dir_that_is_home_means_none() {
+        let home = Scratch::new("dl-xdg-home");
+        std::fs::create_dir_all(home.0.join(".config")).unwrap();
+        std::fs::write(
+            home.0.join(".config").join("user-dirs.dirs"),
+            "XDG_DOWNLOAD_DIR=\"$HOME/\"\n",
+        )
+        .unwrap();
+        assert_eq!(downloads_dir_in(&home.0, None), None);
+    }
+
+    #[test]
+    fn the_windows_known_folder_otherwise() {
+        let home = Scratch::new("dl-win");
+        let elsewhere = home.0.join("D").join("Downloads2");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let found = || Some(elsewhere.clone());
+        assert_eq!(
+            downloads_dir_in(&home.0, Some(&found)),
+            Some(elsewhere.clone())
+        );
+        let none = || None;
+        assert_eq!(downloads_dir_in(&home.0, Some(&none)), None);
+        // And the known folder is never home itself.
+        let home_itself = || Some(home.0.clone());
+        assert_eq!(downloads_dir_in(&home.0, Some(&home_itself)), None);
+    }
+
+    #[test]
+    fn none_when_there_is_no_downloads_directory() {
+        let home = Scratch::new("dl-none");
+        assert_eq!(downloads_dir_in(&home.0, None), None);
+        // No home at all is not the working directory's `Downloads`.
+        assert_eq!(downloads_dir_in(Path::new(""), None), None);
+    }
+
+    #[test]
+    fn with_no_path_it_saves_to_downloads_and_with_none_it_asks_for_a_path() {
+        let downloads = PathBuf::from("/somewhere/Downloads");
+        assert_eq!(
+            save_target(None, None, || Ok(downloads.clone())),
+            Ok(SaveTarget::Dir {
+                dir: downloads.clone(),
+                as_name: None
+            })
+        );
+        let err = save_target(None, None, || Err("no downloads directory found".into()));
+        assert!(err.unwrap_err().contains("no downloads directory found"));
+    }
+
+    #[test]
+    fn a_path_naming_a_file_is_held_to_the_same_rules_before_dialing() {
+        let dir = Scratch::new("target");
+        let never = || -> Result<PathBuf, String> { panic!("downloads consulted") };
+        for name in ["CLAUDE.md", ".zshenv", "AUX.txt"] {
+            let err = save_target(Some(dir.0.join(name)), None, never).unwrap_err();
+            assert!(err.contains("give PATH another name"), "{name}: {err}");
+        }
+        assert_eq!(
+            save_target(Some(dir.0.join("envrc.txt")), None, never),
+            Ok(SaveTarget::File(dir.0.join("envrc.txt")))
+        );
+        assert_eq!(
+            save_target(Some(dir.0.clone()), Some("mcp.json".into()), never),
+            Ok(SaveTarget::Dir {
+                dir: dir.0.clone(),
+                as_name: Some("mcp.json".into())
+            })
+        );
+        // --as names the file, so PATH must be a directory.
+        let err = save_target(Some(dir.0.join("x.txt")), Some("y".into()), never).unwrap_err();
+        assert!(err.contains("not a directory"), "{err}");
+    }
+
+    #[test]
+    fn as_is_held_to_the_same_rules_before_dialing() {
+        let dir = Scratch::new("as");
+        for name in [".envrc", "CLAUDE.md", "nul", "x:y"] {
+            let command = Command::Save {
+                entry: "urn:layer:work:entry:1".into(),
+                path: Some(dir.0.clone()),
+                as_name: Some(name.into()),
+                force: false,
+            };
+            let err = prepare(command).err().expect(name);
+            assert!(err.contains("choose another --as NAME"), "{name}: {err}");
+        }
+        assert_eq!(
+            args(&["save", "urn:layer:talk:entry:1", "--as", "mcp.json"]).unwrap(),
+            Command::Save {
+                entry: "urn:layer:talk:entry:1".into(),
+                path: None,
+                as_name: Some("mcp.json".into()),
+                force: false
+            }
+        );
+        assert!(args(&["save", "urn:layer:talk:entry:1", "--as"]).is_err());
+    }
+
+    #[test]
+    fn a_file_a_reader_could_not_save_is_not_posted_and_says_how() {
+        let dir = Scratch::new("post");
+        let dotfile = dir.0.join(".gitignore");
+        std::fs::write(&dotfile, "target/\n").unwrap();
+        let post = |file_name: Option<&str>| {
+            prepare(Command::Post {
+                layer: "work".into(),
+                kind: PostKind::File {
+                    path: dotfile.clone(),
+                    file_name: file_name.map(str::to_string),
+                    media_type: None,
+                },
+                in_reply_to: None,
+                supersedes: None,
+            })
+        };
+        let err = post(None).err().expect("refused");
+        assert!(
+            err.contains("loads as configuration") && err.contains("--file-name NAME"),
+            "{err}"
+        );
+        assert!(post(Some("gitignore.txt")).is_ok());
+        let err = post(Some("CON")).err().expect("refused");
+        assert!(err.contains("Windows device name"), "{err}");
     }
 
     #[test]
@@ -1145,7 +1817,8 @@ mod tests {
                 .replace("<urn:layer:new>", "<urn:layer:talk:entry:01x>");
             let node = Node::of(&stored, "urn:layer:talk:entry:01x").unwrap();
             assert!(node.types.contains(&format!("{IK}File")));
-            assert_eq!(node.file().unwrap(), (name.to_string(), data));
+            assert_eq!(node.one("fileName").unwrap(), name);
+            assert_eq!(node.bytes().unwrap(), data);
         }
     }
 
@@ -1159,21 +1832,15 @@ mod tests {
         let wrong_hash = good.replace(&digest(b"hello\n"), &digest(b"other"));
         let err = Node::of(&wrong_hash, "urn:layer:t:entry:1")
             .unwrap()
-            .file()
+            .bytes()
             .unwrap_err();
         assert!(err.contains("hashes to"), "{err}");
         let wrong_size = good.replace("ik:byteSize 6", "ik:byteSize 7");
         let err = Node::of(&wrong_size, "urn:layer:t:entry:1")
             .unwrap()
-            .file()
+            .bytes()
             .unwrap_err();
         assert!(err.contains("it says 7"), "{err}");
-        let escaping = good.replace("\"a.txt\"", "\"../a.txt\"");
-        let err = Node::of(&escaping, "urn:layer:t:entry:1")
-            .unwrap()
-            .file()
-            .unwrap_err();
-        assert!(err.contains("not a bare file name"), "{err}");
     }
 
     #[test]
@@ -1300,6 +1967,7 @@ mod tests {
             Command::Save {
                 entry: "urn:layer:talk:entry:1".into(),
                 path: Some("out/".into()),
+                as_name: None,
                 force: true
             }
         );

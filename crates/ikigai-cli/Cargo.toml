@@ -88,6 +88,18 @@ base64 = "0.22"
 mime_guess = "2.0"
 oxttl = { workspace = true }
 oxrdf = { workspace = true }
+# `layers save` refuses a file name that would arm something on the reader's machine, by the
+# Python client's rule (ledger #1748): a configuration name is compared after NFKC and full case
+# folding, and an invisible character is one of general category Cf, Zl or Zp. The three ICU4X
+# crates the workspace's graph already holds (steel-core's icu_casemap, idna's icu_normalizer and
+# icu_properties), so nothing new is resolved, with only their compiled data. The pin is 2.3, the
+# version this lock resolves and the only one any build here has compiled: the calls used
+# (`ComposingNormalizer::new_nfkc`, `CaseMapper::new().fold_string`, `CodePointMapData::new`)
+# may well exist from 2.0, but nothing has built that, so the floor does not claim it. A 2.x
+# caret has no 0.x ceiling.
+icu_normalizer = { version = "2.3", default-features = false, features = ["compiled_data"] }
+icu_casemap = { version = "2.3", default-features = false, features = ["compiled_data"] }
+icu_properties = { version = "2.3", default-features = false, features = ["compiled_data"] }
 
 # The full-screen TUI is native-only (crossterm). The browser frontend (ratzilla)
 # lands in a later slice; on wasm the binary falls back to the line REPL.
@@ -100,6 +112,13 @@ crossterm = "0.29.0"
 # #1305; see `stdin_ended_empty` in main.rs).
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+
+# `layers save` with no PATH on Windows, when there is no `~\Downloads`: the Downloads known
+# folder (`dirs::download_dir`, SHGetKnownFolderPath), as the Python client reads it from the
+# registry (ledger #1748). Already in the graph (rudof_config's), so nothing new is resolved;
+# 6.0 is the version this lock holds.
+[target.'cfg(windows)'.dependencies]
+dirs = "6.0"
 
 # `build.rs` reads the lock this build resolved against and records the `ikigai-*` crates the
 # binary links, for `--version --verbose` (ledger #1338). The same parser the lockstep test uses.

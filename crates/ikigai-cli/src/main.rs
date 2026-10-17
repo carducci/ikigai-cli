@@ -177,9 +177,11 @@ usage:
                                --connect, a config-home mount): `ikigai --override
                                urn:layer:,urn:layers:,urn:collab:=quic://door:4434 --cert-dir <d>
                                layers post file talk ./trace.log`. Prints the entry's IRI
-  ikigai [flags] layers save <entry> [<path>] [--force]
-                               write a posted file back to disk after checking its size and
-                               SHA-256 against what the entry says; `ikigai layers --help` for all
+  ikigai [flags] layers save <entry> [<path>] [--as <name>] [--force]
+                               write a posted file back to disk (no <path>: ~/Downloads) after
+                               checking its size and SHA-256 against what the entry says; a name
+                               that would arm something (CLAUDE.md, .envrc, CON) is refused, so
+                               save it --as another; `ikigai layers --help` for all
   ikigai -c '<command>' ...    run command(s) non-interactively, then exit. Each -c is ONE
                                statement (a newline does not split it): repeat -c for more
   ikigai -e '<sexpr>' ...       evaluate a Lisp s-expression (urn:lisp:eval), then exit
