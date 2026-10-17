@@ -29,10 +29,10 @@
 //! |---|---|---|
 //! | the door, the surface, the authority | startup | no |
 //! | the composed mounts | startup (`mounts_or_config` is wholesale) | no |
-//! | the trusted certificate SET | startup (the PEMs are read once and handed to the transport) | no |
+//! | **the trusted certificate SET** (a QUIC door) | **per handshake** (since ledger #1825) | **yes — `client.crt` and `clients/*.crt` are re-read at every handshake; the `client` lines are the startup reading** |
 //! | **which authority each certificate gets** | **per connection** | **yes — `clients.json` is re-read on every connection** |
 //!
-//! The last row is the one a reader gets wrong, so the door NAMES it: every fact a door
+//! The last two rows are the ones a reader gets wrong, so the door NAMES them: every fact a door
 //! re-reads while it runs goes in [`Posture::reloads`], and both faces print those beside
 //! the startup facts rather than letting one "as of startup" line cover both. This module
 //! reports the posture MODE (frozen: the process chose its minter once) and explicitly not
@@ -109,7 +109,9 @@ pub struct Posture {
     /// The topology, and which of the three mount postures produced it.
     pub mounts: MountPosture,
     /// The client certificates this process LOADED at startup, in load order. Empty for
-    /// every door that does not authenticate clients by certificate.
+    /// every door that does not authenticate clients by certificate. A QUIC door re-reads its
+    /// trust list at every handshake and says so in [`reloads`](Posture::reloads), so this is
+    /// the startup reading of that list, not a promise that it still holds.
     pub clients: Vec<TrustedIdentity>,
     /// The served surface, where the door has one (`host + fs`, `calendar-only + llm`).
     /// `None` on a door whose surface is not a startup decision.
@@ -279,17 +281,18 @@ pub fn client_lines(clients: &[TrustedIdentity]) -> Vec<String> {
 }
 
 /// What the `text/plain` face says about freshness. Prose, because the thing a reader gets
-/// wrong is not a value but a relationship: the certificate SET is frozen while the
-/// AUTHORITY each certificate gets is decided per connection.
+/// wrong is not a value but a relationship: these facts are frozen, while whatever the door
+/// lists under `reloads` (on a QUIC door, the certificate SET and the AUTHORITY each
+/// certificate gets) is decided per handshake or per connection.
 /// The width of the key column in the `text/plain` face — `authority`, the longest key.
 const KEY: usize = 9;
 
 const FRESHNESS_NOTE: &str = concat!(
     "  as of      STARTUP — the door, the surface, the authority, the mounts (composed\n",
-    "             wholesale) and the set of certificates that may connect at all were\n",
-    "             decided once, when this process started, and cannot change while it\n",
-    "             runs. Nothing here is a re-read of the config home: it is what THIS\n",
-    "             PROCESS composed.\n",
+    "             wholesale) and the client lines were read once, when this process\n",
+    "             started. Nothing here is a re-read of the config home: it is what THIS\n",
+    "             PROCESS composed. What the door re-reads while it runs is listed\n",
+    "             under reloads, and only that can change without a restart.\n",
 );
 
 /// The `text/plain` face.

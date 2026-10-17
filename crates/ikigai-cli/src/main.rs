@@ -53,7 +53,10 @@ usage:
                                certificates — it maps a client's SHA-256 fingerprint to a grant
                                named in grants.json, so each gets its own scopes, an unenrolled
                                one is REFUSED, and editing the file revokes on the next
-                               connection. `cert add-client` prints the fingerprint to enroll.
+                               connection. `default` serves an enrolled entry that names no
+                               grant, never a certificate with no entry. The trust list
+                               (client.crt + clients/*.crt) is re-read at every handshake.
+                               `cert add-client` prints the fingerprint to enroll.
                                Each client is named urn:iki:host:<name>:client:<fingerprint>
                                (or its entry's `principal`), and a connection is closed once it
                                is quic.max_connection_age seconds old (default 600), so the
@@ -3211,7 +3214,8 @@ fn cert_add_client(name: &str, cert_dir: Option<String>, force: bool) -> ! {
         Ok(path) => {
             println!("wrote a new client identity to {}", path.display());
             println!(
-                "the server trusts it on next start (it reads clients/*.crt); to use it, copy \
+                "a running server trusts it at its next connection (it reads clients/*.crt at \
+                 every handshake); to use it, copy \
                  {name}.crt, {name}.key, and server.crt to the client machine."
             );
             // The id this cert will be KNOWN BY in clients.json. Printed here because
@@ -3596,11 +3600,13 @@ fn serve_quic(
             (None, true) => "per-client workspaces".to_string(),
             (None, false) => format!("fixed ceiling: {}", caps.join(", ")),
         };
+        // Not a warning since ledger #1825: `default` now serves only ENROLLED entries that
+        // name no grant, never a trusted certificate with no entry, so it widens nothing.
         if let Some(default_grant) = enrolment.as_ref().and_then(|e| e.default_grant()) {
             eprintln!(
-                "ikigai: warning: clients.json sets an explicit shared default grant \
-                 \"{default_grant}\" — every trusted certificate that is not enrolled \
-                 individually gets it"
+                "ikigai: clients.json sets a default grant \"{default_grant}\": an enrolled \
+                 entry that names no grant is served under it (a certificate with no entry is \
+                 still refused)"
             );
         }
         // A personal ceiling means this is a personal-resource server (the calendar
@@ -3731,17 +3737,22 @@ fn serve_quic(
             // ⚠ Under per-identity grants the ceiling above is a startup READING: the
             // minter re-reads clients.json (and grants.json through it) on EVERY
             // connection, which is what makes editing the file a revocation rather than a
-            // TTL wait. The certificate SET is frozen — the PEMs were read once and handed
-            // to the transport — so which certificates may connect cannot change while this
-            // process runs, but WHICH AUTHORITY each gets can, and nothing here reports it.
+            // TTL wait. And since ledger #1825 the certificate SET is re-read at every
+            // handshake too, so the client lines above are the startup reading of it.
             reloads: {
-                let mut reloads = Vec::new();
+                let mut reloads = vec![
+                    "the client trust list (the base client.crt and clients/*.crt) — re-read at \
+                     EVERY handshake, so a certificate added is trusted at its next connection \
+                     and one removed is refused at its next connection; the client lines \
+                     above are the startup reading."
+                        .to_string(),
+                ];
                 if enrolment.is_some() {
                     reloads.push(
                         "clients.json (and the grants it names) — re-read on EVERY connection, \
                          so which authority each certificate gets is decided then, not now; an \
-                         edit revokes on the next call. The set of certificates that may \
-                         connect at all is frozen at startup."
+                         edit revokes on the next call, and a certificate with no entry is \
+                         refused whatever `default` says."
                             .to_string(),
                     );
                 }
@@ -3807,8 +3818,39 @@ fn serve_quic(
         } else {
             None
         };
-        // The transport wants the PEMs; the banner wanted the identities. Same list.
-        let pems: Vec<String> = trusted.into_iter().map(|client| client.pem).collect();
+        // ★ The trust list is re-read at EVERY handshake (ledger #1825): a certificate added to
+        // `clients/` is trusted at its next connection and one removed is refused at its next
+        // connection, no restart. The startup reading above is the banner's and the posture's.
+        // A reading that fails trusts nobody until it reads again, and is logged once per new
+        // reason rather than per handshake: anyone who can reach the port can start one.
+        let trust: ikigai_quic::TrustList = {
+            let certs = certs.clone();
+            let last = std::sync::Mutex::new(None::<String>);
+            std::sync::Arc::new(move || {
+                let read = quic::trusted_clients(&certs);
+                let mut last = last
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match read {
+                    Ok(trusted) => {
+                        if last.take().is_some() {
+                            diagnose(format_args!("ikigai: the client trust list reads again"));
+                        }
+                        Ok(trusted.into_iter().map(|client| client.pem).collect())
+                    }
+                    Err(why) => {
+                        if last.as_deref() != Some(why.as_str()) {
+                            diagnose(format_args!(
+                                "ikigai: REFUSING every client certificate: the trust list \
+                                 does not read ({why})"
+                            ));
+                            *last = Some(why.clone());
+                        }
+                        Err(std::io::Error::other(why))
+                    }
+                }
+            })
+        };
         match (front, front_minter) {
             (Some(front), Some(front_minter)) => {
                 spawn_layers_front(front, std::sync::Arc::clone(&kernel), front_minter)?
@@ -3823,11 +3865,11 @@ fn serve_quic(
             }
             (None, _) => {}
         }
-        ikigai_quic::serve_shared_on(
+        ikigai_quic::serve_trusting_on(
             kernel,
             socket,
             &identity,
-            &pems,
+            trust,
             minter,
             quic_idle_timeout(),
             Some(max_age),

@@ -328,8 +328,12 @@ ikigai serve quic://0.0.0.0:4434 --name layers
   `clients.json` (each certificate fingerprint → its grant, with `principal` = the
   participant's IRI). The door mints that principal into each connection's capability, and
   a layer stamps it into every entry, tuple and receipt; a writer that sends an attribution,
-  a time or a sequence is refused. Both files are re-read per connection, so a manifest
-  edit plus a regenerate needs no restart; a new or changed layer definition does.
+  a time or a sequence is refused. Both files are re-read per connection, and the door's
+  trust list (`client.crt` and `clients/*.crt` under `--cert-dir`) at every handshake, so a
+  manifest edit plus a regenerate, or a participant's new certificate, needs no restart; a new
+  or changed layer definition does. A certificate with no `clients.json` entry is refused: a
+  `"default"` grant there serves only an enrolled entry that names no grant, so removing an
+  entry refuses that client at its next connection (and every token bound to it).
   **A door that hosts layers refuses to start without a `clients.json`**, `--cap` or not: it
   would otherwise fall to the per-client-workspace posture, where no participant has a grant
   and every trusted certificate gets a private filesystem instead.
@@ -371,8 +375,8 @@ curl --cacert server.crt --resolve ikigai:4435:<door address> https://ikigai:443
   a participant IRI that exactly one entry names), and it mints that entry's grant and
   principal. `ikigai layers-token list` and `revoke <id>` manage them; `layer-tokens.json`
   beside `clients.json` keeps their SHA-256 hashes, never the tokens, and is read on every
-  request, so a revocation (or removing the participant's `clients.json` entry) refuses its
-  next request. No token, or one the file does not hold: `401`.
+  request, so a revocation (or removing the participant's `clients.json` entry, whatever its
+  `"default"` says) refuses its next request. No token, or one the file does not hold: `401`.
 - **TLS (1.3 or 1.2) with the door's server certificate**, the one a QUIC client pins; an
   HTTPS client pins the same file. ⚠ Its subject name is `ikigai`, not the host's, so a client
   that checks names either connects by that name (`--resolve` above) or pins the certificate
