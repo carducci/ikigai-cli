@@ -224,6 +224,21 @@ impl PeerIdentity {
 /// that makes a log line actionable; this crate only closes the connection.
 pub type Minter = Arc<dyn Fn(&PeerIdentity) -> Option<Session> + Send + Sync>;
 
+/// Where a door reads the client certificates it trusts (PEMs), called at **every TLS
+/// handshake**, so a certificate added to the list is trusted at its next connection and one
+/// removed is refused at its next connection, without a restart (ledger #1825).
+///
+/// `Err` refuses the handshake: a trust list that cannot be read trusts nobody, it never
+/// falls back to the last reading. A PEM that does not parse trusts nobody either, and the
+/// rest of the list still does. The function is where a failure is LOGGED, as a [`Minter`]
+/// logs its refusals: it holds the paths that make a log line actionable, and this crate
+/// only refuses. It runs on the connection's handshake path, so it should be cheap (reading a
+/// directory of a few small files is).
+///
+/// [`serve_trusting_on`] takes one; the doors that take a slice of PEMs pin that slice for
+/// their whole life, as they always did.
+pub type TrustList = Arc<dyn Fn() -> io::Result<Vec<String>> + Send + Sync>;
+
 /// The QUIC application close code for a peer whose certificate authenticated but
 /// carries no authority. Distinct from a handshake failure: the cert IS trusted, the
 /// *authorization* is missing.
@@ -471,6 +486,39 @@ pub fn serve_shared_on(
     max_age: Option<std::time::Duration>,
 ) -> io::Result<()> {
     let config = server_config(identity, trusted_client_cert_pems, idle)?;
+    serve_config_on(kernel, socket, identity, config, minter, max_age)
+}
+
+/// [`serve_shared_on`] with a [`TrustList`] read at every handshake instead of a fixed set
+/// of PEMs, so the door's trust list can change while it serves.
+///
+/// The list is read once here too, before anything is served: a list that cannot be read, or
+/// holds a PEM that does not parse, stops the door at start, as a bad fixed set does.
+pub fn serve_trusting_on(
+    kernel: Arc<Kernel>,
+    socket: std::net::UdpSocket,
+    identity: &Identity,
+    trust: TrustList,
+    minter: Minter,
+    idle: std::time::Duration,
+    max_age: Option<std::time::Duration>,
+) -> io::Result<()> {
+    for pem in trust()? {
+        load_cert(&pem)?;
+    }
+    let config = server_config_pinning(identity, Pins::Live(trust), idle, alpn_protocols())?;
+    serve_config_on(kernel, socket, identity, config, minter, max_age)
+}
+
+/// The accept loop every server door runs, under a built `config`.
+fn serve_config_on(
+    kernel: Arc<Kernel>,
+    socket: std::net::UdpSocket,
+    identity: &Identity,
+    config: quinn::ServerConfig,
+    minter: Minter,
+    max_age: Option<std::time::Duration>,
+) -> io::Result<()> {
     let endpoint_config = endpoint_config(identity);
     let runtime = Runtime::new()?;
     runtime.block_on(async move {
@@ -1571,7 +1619,17 @@ fn server_config_accepting(
         .iter()
         .map(|pem| load_cert(pem))
         .collect::<io::Result<Vec<_>>>()?;
-    let verifier = Arc::new(PinnedPeer::set(certs));
+    server_config_pinning(identity, Pins::Fixed(certs), idle, alpns)
+}
+
+/// The server config over either kind of [`Pins`].
+fn server_config_pinning(
+    identity: &Identity,
+    pins: Pins,
+    idle: std::time::Duration,
+    alpns: Vec<Vec<u8>>,
+) -> io::Result<quinn::ServerConfig> {
+    let verifier = Arc::new(PinnedPeer::pinning(pins));
     let mut tls = rustls::ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(other)?
@@ -1774,24 +1832,49 @@ struct PinnedPeer {
     /// The accepted peer certificates. One for the client (it pins the single server
     /// cert); one *or more* for the server (it accepts any enrolled tenant's client
     /// cert — multi-tenant mTLS, each identity its own cert).
-    pinned: Vec<CertificateDer<'static>>,
+    pinned: Pins,
     algorithms: WebPkiSupportedAlgorithms,
+}
+
+/// The certificates a [`PinnedPeer`] accepts: a set fixed when the door was built, or a
+/// [`TrustList`] read at every handshake.
+enum Pins {
+    Fixed(Vec<CertificateDer<'static>>),
+    Live(TrustList),
+}
+
+impl std::fmt::Debug for Pins {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Pins::Fixed(certs) => write!(f, "Pins::Fixed({} certificate(s))", certs.len()),
+            Pins::Live(_) => f.write_str("Pins::Live(read at every handshake)"),
+        }
+    }
 }
 
 impl PinnedPeer {
     fn new(pinned: CertificateDer<'static>) -> Self {
-        Self::set(vec![pinned])
+        Self::pinning(Pins::Fixed(vec![pinned]))
     }
 
-    fn set(pinned: Vec<CertificateDer<'static>>) -> Self {
+    fn pinning(pinned: Pins) -> Self {
         PinnedPeer {
             pinned,
             algorithms: rustls::crypto::ring::default_provider().signature_verification_algorithms,
         }
     }
 
+    /// Whether `presented` is pinned. A live list is read NOW, and a read that fails pins
+    /// nothing (the [`TrustList`] contract: fail closed, never the last reading).
     fn matches(&self, presented: &CertificateDer<'_>) -> bool {
-        self.pinned.iter().any(|c| c.as_ref() == presented.as_ref())
+        match &self.pinned {
+            Pins::Fixed(pinned) => pinned.iter().any(|c| c.as_ref() == presented.as_ref()),
+            Pins::Live(trust) => trust().is_ok_and(|pems| {
+                pems.iter()
+                    .filter_map(|pem| load_cert(pem).ok())
+                    .any(|c| c.as_ref() == presented.as_ref())
+            }),
+        }
     }
 }
 

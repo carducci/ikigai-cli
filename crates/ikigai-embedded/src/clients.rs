@@ -16,11 +16,20 @@
 //! {
 //!   "clients": {
 //!     "6f1c…64 hex…": { "grant": "contacts-ro", "label": "linux-box" },
-//!     "a920…64 hex…": "calendar-ro"
+//!     "a920…64 hex…": "calendar-ro",
+//!     "07be…64 hex…": { "label": "spare laptop" }
 //!   },
 //!   "default": "freebusy"
 //! }
 //! ```
+//!
+//! **`default` is the grant for an ENROLLED client whose entry names none** (the spare laptop
+//! above), and nothing else. It never admits a certificate the `clients` map has no entry for:
+//! removing a client's entry refuses that client whatever `default` says, at the next
+//! connection, and a bearer token bound to it with it (ledger #1825). Through cli 0.1.63 it was
+//! the grant for every trusted certificate that had no entry, so a removal under a `default`
+//! moved the client to the default grant instead of refusing it. An entry that names no grant
+//! in a file with no `default` is an unusable entry, refused with the file like any other.
 //!
 //! An object entry may also carry a `principal`: the IRI the door names that client by
 //! (`"principal": "urn:collab:participant:bobby"`). Without one the door names it
@@ -39,11 +48,11 @@
 //!   `clients.json` revokes a client's authority on its next connection — revocation
 //!   by editing a file, not by waiting out a TTL. Deleting the whole file revokes
 //!   everyone.
-//! - **Fail closed.** An enrolled certificate with no usable grant is REFUSED, never
-//!   silently handed the shared ceiling or root. A shared default exists only when the
-//!   operator writes `"default"` explicitly; absence never implies one. (The MCP grant
-//!   path has the opposite footgun — an empty grant there yields root — which is
-//!   exactly what is not reproduced here.)
+//! - **Fail closed.** A certificate with no entry is REFUSED, and so is an enrolled one with
+//!   no usable grant: never silently handed the shared ceiling, the default or root. A
+//!   default exists only when the operator writes `"default"` explicitly; absence never
+//!   implies one. (The MCP grant path has the opposite footgun — an empty grant there
+//!   yields root — which is exactly what is not reproduced here.)
 //!
 //! A grant's **file** scopes are the one kind that is not simply carried through: a
 //! served client addresses files inside its own workspace, not by absolute host path,
@@ -81,20 +90,23 @@ pub fn default_principal(host: &str, fingerprint: &str) -> String {
 /// The authority one connection runs under, as [`authorize`] decides it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Authority {
-    /// The grant name the certificate is enrolled under (or the explicit default).
+    /// The grant name the certificate's entry names, or the explicit default when its entry
+    /// names none.
     pub grant: String,
     /// `operator ceiling ∩ grant`.
     pub capability: Capability,
     /// The `principal` the client's OWN entry names, if it names one. `None` means the
-    /// door names it [`default_principal`]; a client admitted only by the shared
-    /// `default` grant never has one, because a principal names one certificate.
+    /// door names it [`default_principal`]. A client served under the `default` grant has an
+    /// entry of its own too (nothing else is admitted), so it may name one.
     pub principal: Option<String>,
 }
 
 /// One enrolled certificate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Entry {
-    grant: String,
+    /// `None`: the entry names no grant, so the file's `default` applies (the parser refuses
+    /// such an entry in a file that sets none).
+    grant: Option<String>,
     principal: Option<String>,
 }
 
@@ -110,7 +122,8 @@ pub fn clients_path() -> Option<PathBuf> {
 }
 
 /// The parsed enrolment: fingerprint → grant name, plus the operator's *explicit*
-/// shared default (`None` when they wrote none — absence is never a default).
+/// default for an enrolled entry that names no grant (`None` when they wrote none —
+/// absence is never a default).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Enrolment {
     clients: BTreeMap<String, Entry>,
@@ -127,22 +140,40 @@ impl Enrolment {
         self.clients.is_empty()
     }
 
-    /// The explicitly configured shared default grant, if any.
+    /// The explicitly configured default grant, if any: the grant an enrolled entry that
+    /// names none is served under.
     pub fn default_grant(&self) -> Option<&str> {
         self.default_grant.as_deref()
     }
 
-    /// The grant name for a fingerprint: its own entry, else the explicit default.
-    pub fn grant_for(&self, fingerprint: &str) -> Option<&str> {
-        self.clients
-            .get(&normalize(fingerprint))
-            .map(|entry| entry.grant.as_str())
-            .or_else(|| self.default_grant())
+    /// Whether `fingerprint` has an entry of its own, folded the way every key is.
+    pub fn is_enrolled(&self, fingerprint: &str) -> bool {
+        self.clients.contains_key(&normalize(fingerprint))
     }
 
-    /// The `principal` a fingerprint's OWN entry names, if any. Never the default's: the
-    /// shared default grant admits certificates nobody enrolled by name, and no IRI can
-    /// name all of them.
+    /// The grant name for a fingerprint: the one its own entry names, else the explicit
+    /// default when its entry names none. `None` for a fingerprint with no entry, whatever
+    /// the default says: `default` covers enrolled clients, never strangers (ledger #1825).
+    ///
+    /// ```
+    /// # fn main() -> Result<(), String> {
+    /// let fp = "6f1c00000000000000000000000000000000000000000000000000000000abcd";
+    /// let stranger = "0".repeat(64);
+    /// let e = ikigai_embedded::clients::parse_enrolment(&format!(
+    ///     r#"{{"clients": {{"{fp}": {{"label": "spare laptop"}}}}, "default": "freebusy"}}"#
+    /// ))?;
+    /// assert_eq!(e.grant_for(fp), Some("freebusy"));
+    /// assert_eq!(e.grant_for(&stranger), None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn grant_for(&self, fingerprint: &str) -> Option<&str> {
+        let entry = self.clients.get(&normalize(fingerprint))?;
+        entry.grant.as_deref().or_else(|| self.default_grant())
+    }
+
+    /// The `principal` a fingerprint's OWN entry names, if any. Never the default's: a
+    /// default is a grant, and no single IRI can name every client it covers.
     pub fn principal_for(&self, fingerprint: &str) -> Option<&str> {
         self.clients
             .get(&normalize(fingerprint))
@@ -171,7 +202,7 @@ impl Enrolment {
         let mut names: Vec<String> = self
             .clients
             .values()
-            .map(|entry| entry.grant.clone())
+            .filter_map(|entry| entry.grant.clone())
             .chain(self.default_grant.clone())
             .collect();
         names.sort();
@@ -202,14 +233,26 @@ pub fn enrolment() -> Result<Option<Enrolment>, String> {
 /// Parse the `clients.json` shape. Both entry spellings are accepted: the object form
 /// `{"grant": "…", "label": "…", "principal": "…"}` (the label is for humans reading the
 /// file and the server's logs; the principal is optional, see the module docs) and the
-/// bare string form `"…"`.
+/// bare string form `"…"`. The object form may leave `grant` out when the file sets a
+/// `default`: that entry is served under the default.
 ///
 /// A `principal` that core could not carry as a principal (not an absolute IRI, a `*`,
 /// over 512 bytes) is an ERROR, like every other unusable entry: silently minting none
-/// would serve that client under a name its operator never wrote.
+/// would serve that client under a name its operator never wrote. So is an entry that names
+/// no grant in a file with no `default`: it would enroll a client with no authority to give.
+pub fn parse_enrolment(text: &str) -> Result<Enrolment, String> {
+    parse(text)
+}
+
+/// [`parse_enrolment`], under the name this crate has always called it by.
 pub(crate) fn parse(text: &str) -> Result<Enrolment, String> {
     let v: serde_json::Value =
         serde_json::from_str(text).map_err(|e| format!("not valid JSON: {e}"))?;
+    let default_grant = match v.get("default") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(name)) => Some(name.clone()),
+        Some(_) => return Err("`default` must be a grant name".to_string()),
+    };
     let mut clients = BTreeMap::new();
     // An absent `clients` object is legal — it is how an operator disables everyone
     // while keeping the file (and its default) around.
@@ -220,15 +263,25 @@ pub(crate) fn parse(text: &str) -> Result<Enrolment, String> {
         for (fingerprint, entry) in map {
             let parsed = match entry {
                 serde_json::Value::String(name) => Entry {
-                    grant: name.clone(),
+                    grant: Some(name.clone()),
                     principal: None,
                 },
                 serde_json::Value::Object(_) => Entry {
-                    grant: entry
-                        .get("grant")
-                        .and_then(|g| g.as_str())
-                        .ok_or_else(|| format!("client `{fingerprint}` has no `grant`"))?
-                        .to_string(),
+                    grant: match entry.get("grant") {
+                        Some(serde_json::Value::String(name)) => Some(name.clone()),
+                        None | Some(serde_json::Value::Null) if default_grant.is_some() => None,
+                        None | Some(serde_json::Value::Null) => {
+                            return Err(format!(
+                                "client `{fingerprint}` has no `grant`, and the file sets no \
+                                 `default` for it to be served under"
+                            ))
+                        }
+                        Some(_) => {
+                            return Err(format!(
+                                "client `{fingerprint}`: `grant` must be a grant name"
+                            ))
+                        }
+                    },
                     principal: match entry.get("principal") {
                         None | Some(serde_json::Value::Null) => None,
                         Some(serde_json::Value::String(iri)) => {
@@ -253,11 +306,6 @@ pub(crate) fn parse(text: &str) -> Result<Enrolment, String> {
             clients.insert(normalize(fingerprint), parsed);
         }
     }
-    let default_grant = match v.get("default") {
-        None | Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::String(name)) => Some(name.clone()),
-        Some(_) => return Err("`default` must be a grant name".to_string()),
-    };
     Ok(Enrolment {
         clients,
         default_grant,
@@ -328,6 +376,17 @@ fn authority_in(
     ceiling: &Capability,
     scopes_of: impl Fn(&str) -> Vec<String>,
 ) -> Result<(String, Capability), String> {
+    // ★ The order is the rule (ledger #1825): an entry of its own FIRST, and only then the
+    // grant it names or the default. Asking for a grant first let the default answer for a
+    // certificate whose entry had been removed, so removing a client moved it to the default
+    // grant instead of refusing it, and a bearer token bound to it kept working.
+    if !enrolment.is_enrolled(fingerprint) {
+        return Err(
+            "this certificate is not enrolled: the `clients` map has no entry for it (a \
+             `default` grant serves only enrolled entries that name no grant)"
+                .to_string(),
+        );
+    }
     let Some(grant) = enrolment.grant_for(fingerprint) else {
         return Err("no grant is configured for this certificate".to_string());
     };
@@ -421,7 +480,7 @@ mod tests {
         let stranger = "0000000000000000000000000000000000000000000000000000000000000000";
         let refused = authority_in(&enrolment, stranger, &ceiling, grants).unwrap_err();
         assert!(
-            refused.contains("no grant is configured"),
+            refused.contains("not enrolled"),
             "unexpected reason: {refused}"
         );
     }
@@ -436,24 +495,42 @@ mod tests {
         assert!(refused.contains("typo-ro"), "unexpected reason: {refused}");
     }
 
-    /// A shared default must be written, never implied. With one, the stranger gets the
-    /// default's authority; the same file without it refuses them.
+    /// A default must be written, never implied, and it serves ENROLLED entries that name no
+    /// grant, never a stranger (ledger #1825). Until then the stranger got the default.
     #[test]
-    fn a_shared_default_applies_only_when_explicitly_configured() {
+    fn a_default_serves_an_enrolled_entry_that_names_no_grant_and_never_a_stranger() {
         let stranger = "0000000000000000000000000000000000000000000000000000000000000000";
+        let spare = "a".repeat(64);
         let with = parse(&format!(
-            r#"{{"clients": {{"{FP}": "everything"}}, "default": "contacts-ro"}}"#
+            r#"{{"clients": {{"{FP}": "everything", "{spare}": {{"label": "spare"}}}}, "default": "contacts-ro"}}"#
         ))
         .unwrap();
-        let (grant, capability) =
-            authority_in(&with, stranger, &Capability::root(), grants).unwrap();
+        let (grant, capability) = authority_in(&with, &spare, &Capability::root(), grants).unwrap();
         assert_eq!(grant, "contacts-ro");
         assert!(capability.allows("urn:cap:personal:contacts:read"));
-        // Their own entry still wins over the default.
+        // An entry's own grant still wins over the default.
         assert_eq!(with.grant_for(FP), Some("everything"));
+        // A stranger is refused, default or not.
+        assert_eq!(with.grant_for(stranger), None);
+        let refused = authority_in(&with, stranger, &Capability::root(), grants).unwrap_err();
+        assert!(refused.contains("not enrolled"), "{refused}");
 
         let without = parse(&format!(r#"{{"clients": {{"{FP}": "everything"}}}}"#)).unwrap();
         assert!(authority_in(&without, stranger, &Capability::root(), grants).is_err());
+    }
+
+    /// The case ledger #1825 names: an entry removed from a file that sets a `default`. The
+    /// removed client is REFUSED, not moved to the default grant.
+    #[test]
+    fn removing_an_entry_refuses_it_even_under_a_default() {
+        let before = parse(&format!(
+            r#"{{"clients": {{"{FP}": "everything"}}, "default": "contacts-ro"}}"#
+        ))
+        .unwrap();
+        assert!(authority_in(&before, FP, &Capability::root(), grants).is_ok());
+        let after = parse(r#"{"clients": {}, "default": "contacts-ro"}"#).unwrap();
+        let refused = authority_in(&after, FP, &Capability::root(), grants).unwrap_err();
+        assert!(refused.contains("not enrolled"), "{refused}");
     }
 
     /// A grant NARROWER than `--cap` yields the narrow set — the point of the feature.
@@ -517,15 +594,23 @@ mod tests {
     fn a_malformed_enrolment_is_an_error_rather_than_an_empty_one() {
         assert!(parse("{ not json").is_err());
         assert!(parse(r#"{"clients": ["a", "b"]}"#).is_err());
-        assert!(parse(&format!(r#"{{"clients": {{"{FP}": {{"label": "x"}}}}}}"#)).is_err());
+        // An entry with no grant is unusable when there is no default to serve it under...
+        let bare = parse(&format!(r#"{{"clients": {{"{FP}": {{"label": "x"}}}}}}"#)).unwrap_err();
+        assert!(bare.contains("no `default`"), "{bare}");
+        // ...and legal beside one.
+        assert!(parse(&format!(
+            r#"{{"clients": {{"{FP}": {{"label": "x"}}}}, "default": "contacts-ro"}}"#
+        ))
+        .is_ok());
+        assert!(parse(&format!(r#"{{"clients": {{"{FP}": {{"grant": 7}}}}}}"#)).is_err());
         assert!(parse(r#"{"default": 7}"#).is_err());
         // Legal: no `clients` key at all — the file with everyone removed.
         assert!(parse("{}").unwrap().is_empty());
     }
 
-    /// An entry may name the principal its client is minted as; a bare-string entry, an
-    /// object without one, and a stranger admitted by the shared default name none, so the
-    /// door falls back to [`default_principal`] (ledger #1179).
+    /// An entry may name the principal its client is minted as; a bare-string entry and an
+    /// object without one name none, so the door falls back to [`default_principal`] (ledger
+    /// #1179). A stranger has no grant at all, default or not (ledger #1825).
     #[test]
     fn an_entry_may_name_its_principal_and_the_default_names_nobody() {
         let alice = "a".repeat(64);
@@ -544,7 +629,11 @@ mod tests {
             Some("urn:collab:participant:bobby")
         );
         assert_eq!(e.principal_for(&alice), None);
-        assert_eq!(e.grant_for(&stranger), Some("contacts-ro"));
+        assert_eq!(
+            e.grant_for(&stranger),
+            None,
+            "the default serves no stranger"
+        );
         assert_eq!(e.principal_for(&stranger), None, "the default names nobody");
     }
 
