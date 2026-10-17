@@ -288,6 +288,29 @@ CORS closed, proxy not trusted**:
   `Access-Control-Request-Method`) advertises methods from the resource's own
   `describe()` Allow.
 
+### A door that serves HTML
+
+One call adopts the page policy:
+
+```rust
+let config = EdgeConfig { routes, ..EdgeConfig::html_door(["https://door.example"])? };
+```
+
+- **The page CSP** (`SecurityHeaders::html_door`, `HTML_DOOR_CSP`): `default-src 'self';
+  script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none';
+  frame-ancestors 'none'; form-action 'self'`, so no inline script and no inline style,
+  plus `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and
+  `Cross-Origin-Opener-Policy: same-origin`. A route's own `csp` still replaces the CSP on
+  that route. The default edge is unchanged and sends no opener policy.
+- **The Origin check** (`OriginCheck`, installed as `admit_fn`): every method but `GET`,
+  `HEAD` and `OPTIONS` is refused `403` when its `Origin` is not one of the door's
+  CONFIGURED origins (never the request's `Host`), when `Origin` is `null` or malformed, or,
+  with no `Origin`, when `Sec-Fetch-Site` is anything but `same-origin` or `none`. A write
+  with neither header is not from a current browser: it is admitted when it carries no
+  ambient credential, and refused when it carries a `Cookie` or an `Authorization` in any
+  scheme but `Bearer`. A door with its own admission rule calls `OriginCheck::check` inside
+  its own `AdmitFn`.
+
 ### Request bounds
 
 What an anonymous client can make the server hold is bounded before it is read, and
