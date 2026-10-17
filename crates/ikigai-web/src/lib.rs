@@ -42,6 +42,9 @@
 //! - **per-source rate limits**: with [`EdgeConfig::source_limits`] set, one client past a
 //!   rule's budget is answered `429` with `Retry-After` before the resource runs; see
 //!   [`SourceLimits`].
+//! - **a door that serves HTML**: [`EdgeConfig::html_door`] is one call that adopts the
+//!   strict page CSP and its companion headers ([`SecurityHeaders::html_door`]) and refuses a
+//!   write another origin started ([`OriginCheck`]).
 //! - **server push**: with [`EdgeConfig::push`] set, one `GET` of the push path holds an
 //!   event stream open and tells the page when a golden thread its reads rest on is cut —
 //!   see [`push`].
@@ -54,12 +57,14 @@
 mod accept;
 mod entity;
 mod error_page;
+mod origin;
 pub mod push;
 mod source_limit;
 pub use entity::{
     with_headers, EndpointHeader, HeaderRefusal, HTTP_ENTITY, MAX_HEADER_BLOCK, MAX_HEADER_LINES,
     MAX_HEADER_VALUE,
 };
+pub use origin::{InvalidOrigin, OriginCheck};
 pub use push::{PushConfig, DEFAULT_PUSH_PATH};
 pub use source_limit::{source_key, SourceLimits, SourceRate, DEFAULT_MAX_SOURCES};
 
@@ -510,6 +515,70 @@ impl Default for EdgeConfig {
     }
 }
 
+impl EdgeConfig {
+    /// The edge policy for a door that serves HTML, in one call: [`EdgeConfig::default`] with
+    /// the page preset [`SecurityHeaders::html_door`] and, as [`admit_fn`](Self::admit_fn),
+    /// an [`OriginCheck`] over `origins`, the door's own origins as configured (never read off
+    /// the request). Fails when an origin does not parse, or when there is none.
+    ///
+    /// Set the rest of the policy over it, a route CSP included:
+    /// `EdgeConfig { routes, ..EdgeConfig::html_door(["https://door.example"])? }`. A door
+    /// that has its own [`AdmitFn`] keeps it and calls [`OriginCheck::check`] inside it, since
+    /// a second assignment of `admit_fn` replaces the first.
+    ///
+    /// ```
+    /// use ikigai_core::{Description, EndpointSpace, Exact, FnEndpoint, Kernel, ReprType, Representation, Verb};
+    /// use ikigai_web::EdgeConfig;
+    /// use std::sync::Arc;
+    /// use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let note = FnEndpoint::new("note", |_inv: &ikigai_core::Invocation<'_>| {
+    ///     Ok(Representation::new(ReprType::new("text/plain"), b"saved".to_vec()))
+    /// })
+    /// .with_description(Description::new("note").verb(Verb::Source).verb(Verb::Sink));
+    /// let kernel = Arc::new(Kernel::new(Arc::new(
+    ///     EndpointSpace::new().bind(Exact::new("urn:test:note"), note),
+    /// )));
+    /// let config = EdgeConfig::html_door(["https://door.example"]).unwrap();
+    /// let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    /// let addr = listener.local_addr().unwrap();
+    /// tokio::spawn(async move {
+    ///     let _ = ikigai_web::serve_with_listener(kernel, ikigai_web::public_cap(), listener, config).await;
+    /// });
+    /// async fn post(addr: std::net::SocketAddr, origin: &str) -> String {
+    ///     let raw = format!(
+    ///         "POST /test/note HTTP/1.1\r\nHost: door.example\r\nOrigin: {origin}\r\n\
+    ///          Cookie: s=1\r\nContent-Length: 2\r\n\r\nhi"
+    ///     );
+    ///     let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+    ///     c.write_all(raw.as_bytes()).await.unwrap();
+    ///     let mut out = String::new();
+    ///     c.read_to_string(&mut out).await.unwrap();
+    ///     out
+    /// }
+    /// let ours = post(addr, "https://door.example").await;
+    /// assert!(ours.starts_with("HTTP/1.1 200") && ours.ends_with("saved"), "{ours}");
+    /// let theirs = post(addr, "https://evil.example").await;
+    /// assert!(theirs.starts_with("HTTP/1.1 403 Forbidden"), "{theirs}");
+    /// assert!(theirs.contains("\r\nCross-Origin-Opener-Policy: same-origin\r\n"), "{theirs}");
+    /// assert!(EdgeConfig::html_door(["door.example"]).is_err());
+    /// # }
+    /// ```
+    pub fn html_door<I, S>(origins: I) -> Result<EdgeConfig, InvalidOrigin>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Ok(EdgeConfig {
+            security: Some(SecurityHeaders::html_door()),
+            admit_fn: Some(OriginCheck::new(origins)?.admit_fn()),
+            ..EdgeConfig::default()
+        })
+    }
+}
+
 /// A single route: a path pattern → an IRI template, with optional per-route overrides. The
 /// pattern and template share capture names (`/book/{host}` → `urn:schedule:{host}`).
 ///
@@ -696,6 +765,10 @@ pub struct SecurityHeaders {
     /// `Strict-Transport-Security` — emitted ONLY on an HTTPS request (per RFC 6797), which
     /// behind a trusted proxy means `X-Forwarded-Proto: https`.
     pub hsts: Option<String>,
+    /// `Cross-Origin-Opener-Policy`. Default `None` (not sent), so a door that already opens
+    /// or is opened by a window on another origin keeps working; [`SecurityHeaders::html_door`]
+    /// sends `same-origin`.
+    pub coop: Option<String>,
 }
 
 impl Default for SecurityHeaders {
@@ -708,6 +781,72 @@ impl Default for SecurityHeaders {
             nosniff: true,
             referrer_policy: Some("no-referrer".to_string()),
             hsts: Some("max-age=31536000; includeSubDomains".to_string()),
+            coop: None,
+        }
+    }
+}
+
+/// The `Content-Security-Policy` of [`SecurityHeaders::html_door`]: everything from this
+/// origin only, no inline script and no inline style (neither `script-src` nor `style-src`
+/// allows `'unsafe-inline'`, so a `<script>` block, an `onclick=` and a `style=` attribute are
+/// all blocked), no plugins, no `<base>`, no framing by anyone, and forms posting only here.
+/// A page under it loads its script and its stylesheet as files from its own door.
+pub const HTML_DOOR_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
+     object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
+
+impl SecurityHeaders {
+    /// The preset for a door that serves HTML pages: the CSP [`HTML_DOOR_CSP`],
+    /// `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`,
+    /// `Cross-Origin-Opener-Policy: same-origin`, and the default's HSTS (sent on an HTTPS
+    /// request only). It is at least as strict as [`Default`] on every header: it adds
+    /// `object-src 'none'` and the opener policy, and it loosens nothing. A route that needs
+    /// another CSP still sets [`Route::csp`], which replaces this one on that route alone.
+    ///
+    /// The exact lines it sends, pinned:
+    ///
+    /// ```
+    /// use ikigai_core::{Description, EndpointSpace, Exact, FnEndpoint, Kernel, ReprType, Representation, Verb};
+    /// use ikigai_web::{EdgeConfig, SecurityHeaders};
+    /// use std::sync::Arc;
+    /// use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let page = FnEndpoint::new("page", |_inv: &ikigai_core::Invocation<'_>| {
+    ///     Ok(Representation::new(ReprType::new("text/html"), b"<p>hi</p>".to_vec()))
+    /// })
+    /// .with_description(Description::new("page").verb(Verb::Source));
+    /// let kernel = Arc::new(Kernel::new(Arc::new(
+    ///     EndpointSpace::new().bind(Exact::new("urn:test:page"), page),
+    /// )));
+    /// let config = EdgeConfig { security: Some(SecurityHeaders::html_door()), ..EdgeConfig::default() };
+    /// let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    /// let addr = listener.local_addr().unwrap();
+    /// tokio::spawn(async move {
+    ///     let _ = ikigai_web::serve_with_listener(kernel, ikigai_web::public_cap(), listener, config).await;
+    /// });
+    /// let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+    /// c.write_all(b"GET /test/page HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+    /// let mut out = String::new();
+    /// c.read_to_string(&mut out).await.unwrap();
+    /// for line in [
+    ///     "Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; \
+    ///      object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+    ///     "X-Content-Type-Options: nosniff",
+    ///     "Referrer-Policy: no-referrer",
+    ///     "Cross-Origin-Opener-Policy: same-origin",
+    /// ] {
+    ///     assert!(out.contains(&format!("\r\n{line}\r\n")), "{line}\n{out}");
+    /// }
+    /// // HSTS rides on an HTTPS request only; this one was plain HTTP.
+    /// assert!(!out.contains("Strict-Transport-Security"), "{out}");
+    /// # }
+    /// ```
+    pub fn html_door() -> SecurityHeaders {
+        SecurityHeaders {
+            csp: Some(HTML_DOOR_CSP.to_string()),
+            coop: Some("same-origin".to_string()),
+            ..SecurityHeaders::default()
         }
     }
 }
@@ -2639,6 +2778,10 @@ fn apply_edge_policy(
                 resp.headers
                     .push(("Strict-Transport-Security".to_string(), hsts.clone()));
             }
+        }
+        if let Some(coop) = &sec.coop {
+            resp.headers
+                .push(("Cross-Origin-Opener-Policy".to_string(), coop.clone()));
         }
     }
 
