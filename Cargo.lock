@@ -3441,6 +3441,7 @@ dependencies = [
  "sha2 0.10.9",
  "socket2",
  "tokio",
+ "x509-parser",
 ]
 
 [[package]]

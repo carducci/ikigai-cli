@@ -1928,9 +1928,12 @@ impl ClientCertVerifier for PinnedPeer {
         &self,
         end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
-        _now: UnixTime,
+        now: UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
         if self.matches(end_entity) {
+            // Pinning says WHICH certificate; its window says WHEN (ledger #1826). Checked
+            // after the match, so only a certificate the operator trusts is ever parsed.
+            within_validity(end_entity, now)?;
             Ok(ClientCertVerified::assertion())
         } else {
             Err(rustls::Error::General(
@@ -1959,6 +1962,31 @@ impl ClientCertVerifier for PinnedPeer {
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.algorithms.supported_schemes()
+    }
+}
+
+/// Refuse a certificate outside its validity window at `now`: before its `notBefore` or after
+/// its `notAfter` (both inclusive bounds, RFC 5280 section 4.1.2.5).
+///
+/// ★ Through cli 0.1.63 a door's verifier compared certificates byte for byte and never looked
+/// at the window, so an expired certificate still on the trust list kept connecting (ledger
+/// #1826). `ikigai cert generate` mints certificates valid from 1975 to 4096, so this refuses
+/// only one minted with a real window. A certificate whose window does not parse is refused
+/// too: an operator cannot have meant to trust bytes that are not a certificate.
+fn within_validity(der: &CertificateDer<'_>, now: UnixTime) -> Result<(), rustls::Error> {
+    use rustls::CertificateError;
+    let (_, cert) = x509_parser::parse_x509_certificate(der.as_ref())
+        .map_err(|_| rustls::Error::InvalidCertificate(CertificateError::BadEncoding))?;
+    let now = i64::try_from(now.as_secs()).unwrap_or(i64::MAX);
+    let validity = cert.validity();
+    if now < validity.not_before.timestamp() {
+        Err(rustls::Error::InvalidCertificate(
+            CertificateError::NotValidYet,
+        ))
+    } else if now > validity.not_after.timestamp() {
+        Err(rustls::Error::InvalidCertificate(CertificateError::Expired))
+    } else {
+        Ok(())
     }
 }
 
