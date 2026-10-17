@@ -331,7 +331,9 @@ ikigai serve quic://0.0.0.0:4434 --name layers
   a time or a sequence is refused. Both files are re-read per connection, and the door's
   trust list (`client.crt` and `clients/*.crt` under `--cert-dir`) at every handshake, so a
   manifest edit plus a regenerate, or a participant's new certificate, needs no restart; a new
-  or changed layer definition does. A certificate with no `clients.json` entry is refused: a
+  or changed layer definition does. A pinned certificate outside its validity window (before its
+  `notBefore`, after its `notAfter`) is refused at the handshake. A certificate with no
+  `clients.json` entry is refused: a
   `"default"` grant there serves only an enrolled entry that names no grant, so removing an
   entry refuses that client at its next connection (and every token bound to it).
   **A door that hosts layers refuses to start without a `clients.json`**, `--cap` or not: it

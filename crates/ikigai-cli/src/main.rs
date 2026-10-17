@@ -55,12 +55,18 @@ usage:
                                one is REFUSED, and editing the file revokes on the next
                                connection. `default` serves an enrolled entry that names no
                                grant, never a certificate with no entry. The trust list
-                               (client.crt + clients/*.crt) is re-read at every handshake.
+                               (client.crt + clients/*.crt) is re-read at every handshake,
+                               and a certificate past its notAfter (or before its notBefore) is
+                               refused there.
                                `cert add-client` prints the fingerprint to enroll.
                                Each client is named urn:iki:host:<name>:client:<fingerprint>
                                (or its entry's `principal`), and a connection is closed once it
                                is quic.max_connection_age seconds old (default 600), so the
                                next call reconnects under the enrolment as it is then.
+  ikigai serve <q> --require-enrollment
+                               refuse to start without clients.json, so the door never falls
+                               back to one shared --cap ceiling for every trusted certificate
+                               (the booking airlock runs this way, its --cap the clamp)
   ikigai serve <q> --announce  also advertise this kernel on the local network (mDNS), so clients
                                can mount it by name; `source urn:peer:list` shows who is out there
   ikigai serve <q>             hosts LAYERS (ikigai-layers: urn:layer:*, urn:layers:*, urn:collab:*)
@@ -387,6 +393,10 @@ enum Mode {
         /// `--layers-https <addr>`: also serve the layers' participant verbs over HTTPS there
         /// (ledger #1371). See `front.rs`.
         layers_https: Option<String>,
+        /// `--require-enrollment`: a QUIC door that refuses to start without a `clients.json`,
+        /// so it can never fall back to a shared `--cap` ceiling or to per-client workspaces
+        /// because the file went missing (ledger #1826: the booking airlock).
+        require_enrollment: bool,
     },
     /// Serve the capability-scoped manifold as an MCP (Model Context Protocol)
     /// server over stdio. `grants`/`scopes` union into the session capability —
@@ -1197,7 +1207,12 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
         let mut passkey_origin: Option<String> = None;
         let mut layers_state: Option<std::path::PathBuf> = None;
         let mut layers_https: Option<String> = None;
+        let mut require_enrollment = false;
         while let Some(arg) = argv.next() {
+            if arg == "--require-enrollment" {
+                require_enrollment = true;
+                continue;
+            }
             if arg == "--layers-https" {
                 let addr = argv.next().ok_or_else(|| {
                     "--layers-https needs an address (host:port; port 0 takes a free one)"
@@ -1428,6 +1443,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
             mounts,
             layers_state,
             layers_https,
+            require_enrollment,
         }));
     }
 
@@ -1738,7 +1754,19 @@ fn main() {
             push,
             layers_state,
             layers_https,
+            require_enrollment,
         } => match (http, target.as_deref()) {
+            // Enrollment is the QUIC door's (it is the door that authenticates certificates), so
+            // the flag on any other door would require nothing.
+            (http, target)
+                if require_enrollment && (http.is_some() || !target.is_some_and(is_quic)) =>
+            {
+                eprintln!(
+                    "ikigai: --require-enrollment applies to `serve quic://…`, the door that \
+                     enrolls client certificates"
+                );
+                std::process::exit(2);
+            }
             // Layers are hosted by the QUIC door only: it is the door that names each
             // participant from its certificate, and a layer refuses a write that names nobody.
             // A state directory for a door that hosts nothing is a flag that does nothing.
@@ -1777,8 +1805,11 @@ fn main() {
                     &caps,
                     announce,
                     mounts,
-                    layers_state,
-                    layers_https,
+                    QuicDoorFlags {
+                        layers_state,
+                        layers_https,
+                        require_enrollment,
+                    },
                 )
             }
             (None, _) if !caps.is_empty() => {
@@ -3323,6 +3354,17 @@ fn trusted_identities(
         .collect()
 }
 
+/// The flags only a QUIC door takes, beside the ones every served door shares.
+#[cfg(feature = "embedded")]
+struct QuicDoorFlags {
+    /// `--layers-state <dir>`.
+    layers_state: Option<std::path::PathBuf>,
+    /// `--layers-https <addr>`.
+    layers_https: Option<String>,
+    /// `--require-enrollment`.
+    require_enrollment: bool,
+}
+
 #[cfg(all(feature = "embedded", feature = "quic"))]
 fn serve_quic(
     target: &str,
@@ -3330,9 +3372,13 @@ fn serve_quic(
     caps: &[String],
     announce: bool,
     mounts: Mounts,
-    layers_state: Option<std::path::PathBuf>,
-    layers_https: Option<String>,
+    flags: QuicDoorFlags,
 ) -> ! {
+    let QuicDoorFlags {
+        layers_state,
+        layers_https,
+        require_enrollment,
+    } = flags;
     let caps = caps.to_vec();
     let result = (|| -> Result<(), String> {
         let addr = quic::parse_addr(target)?;
@@ -3435,6 +3481,21 @@ fn serve_quic(
                  serve without layers.",
                 hosted.config.join("layers").display(),
                 hosted.config.display(),
+            ));
+        }
+        // ★ `--require-enrollment` (ledger #1826): the booking airlock serves per-drainer grants
+        // under its `--cap` ceiling, and without a `clients.json` it would fall to posture 2,
+        // the one shared ceiling for every trusted certificate. A missing file stops the door,
+        // never opens it. (While serving, a file that goes away refuses every client: the
+        // minter reads it per connection.)
+        if require_enrollment && enrolment.is_none() {
+            let clients = ikigai_embedded::clients::clients_path()
+                .map_or_else(|| "clients.json".into(), |p| p.display().to_string());
+            return Err(format!(
+                "--require-enrollment: there is no {clients}, so this door would serve every \
+                 trusted certificate under one shared authority. Enroll each client there \
+                 (`\"<fingerprint>\": {{\"grant\": \"<grant in grants.json>\", \"label\": \"…\"}}`; \
+                 `ikigai cert add-client` prints the fingerprint), or drop the flag."
             ));
         }
         // A served connection addresses files only inside `file_root/<segment>` — the
@@ -3600,6 +3661,11 @@ fn serve_quic(
             (None, true) => "per-client workspaces".to_string(),
             (None, false) => format!("fixed ceiling: {}", caps.join(", ")),
         };
+        let posture = if require_enrollment {
+            format!("{posture} (enrollment required)")
+        } else {
+            posture
+        };
         // Not a warning since ledger #1825: `default` now serves only ENROLLED entries that
         // name no grant, never a trusted certificate with no entry, so it widens nothing.
         if let Some(default_grant) = enrolment.as_ref().and_then(|e| e.default_grant()) {
@@ -3624,10 +3690,28 @@ fn serve_quic(
         // one startup-time decision (per-session surfaces are a much larger change),
         // so enrolling a grant that needs a new face takes a restart; the per-call
         // clamp is what makes serving one surface to differently-scoped clients safe.
+        //
+        // ★ And a grant scope the `--cap` ceiling does not allow is left out (ledger #1826):
+        // the clamp takes it away from every connection, so it can never be exercised, and it
+        // must not switch a face on either. Before, one stray personal scope in a drainer's
+        // grant turned the booking airlock into the calendar-only kernel, with no spaces.
+        let ceiling = (!caps.is_empty()).then(|| ikigai_core::Capability::scoped(caps.clone()));
         let surface_caps: Vec<String> = {
             let mut union = caps.clone();
             for grant in enrolment.iter().flat_map(|e| e.grant_names()) {
-                union.extend(ikigai_embedded::grant_scopes(&grant));
+                let scopes = ikigai_embedded::grant_scopes(&grant);
+                // Exactly what the minter clamps a connection under this grant to.
+                match &ceiling {
+                    Some(ceiling) => union.extend(
+                        ceiling
+                            .clamp(&ikigai_core::Capability::scoped(scopes))
+                            .scopes()
+                            .into_iter()
+                            .flatten()
+                            .cloned(),
+                    ),
+                    None => union.extend(scopes),
+                }
             }
             union.sort();
             union.dedup();
@@ -4098,9 +4182,14 @@ fn serve_quic(
     _caps: &[String],
     _announce: bool,
     _mounts: Mounts,
-    _layers_state: Option<std::path::PathBuf>,
-    _layers_https: Option<String>,
+    flags: QuicDoorFlags,
 ) -> ! {
+    // Read here so a build without `quic` does not call the fields dead; nothing uses them.
+    let _ = (
+        flags.layers_state,
+        flags.layers_https,
+        flags.require_enrollment,
+    );
     eprintln!("ikigai: `quic://` needs the `quic` feature");
     std::process::exit(1);
 }
