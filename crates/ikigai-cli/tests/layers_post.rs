@@ -375,10 +375,28 @@ fn briefs_issues_and_files_post_and_a_file_saves_back_byte_for_byte() {
         );
         assert_eq!(&std::fs::read(saved.join(name)).unwrap(), bytes, "{name}");
     }
-    // With no PATH it lands under its own name in the working directory.
+    // With no PATH it lands in the downloads directory, never the working directory (often a
+    // repository an agent works in), and with no downloads directory it asks for a PATH.
     std::fs::remove_file(work.join("trace.log")).unwrap();
-    ok(alice(&["layers", "save", &text_entry], None), "save here");
-    assert_eq!(std::fs::read(work.join("trace.log")).unwrap(), text);
+    let nowhere = alice(&["layers", "save", &text_entry], None);
+    assert_eq!(nowhere.status.code(), Some(2), "{}", stderr(&nowhere));
+    assert!(
+        stderr(&nowhere).contains("no downloads directory found")
+            && stderr(&nowhere).contains("give a PATH"),
+        "{}",
+        stderr(&nowhere)
+    );
+    let downloads = home.join("Downloads");
+    std::fs::create_dir_all(&downloads).unwrap();
+    ok(
+        alice(&["layers", "save", &text_entry], None),
+        "save to Downloads",
+    );
+    assert_eq!(std::fs::read(downloads.join("trace.log")).unwrap(), text);
+    assert!(
+        !work.join("trace.log").exists(),
+        "nothing in the working directory"
+    );
 
     // An existing file is not replaced without --force.
     let again = alice(&["layers", "save", &text_entry, saved_arg], None);
@@ -464,5 +482,129 @@ fn a_file_that_lies_about_its_digest_is_not_saved_and_an_oversized_one_is_not_se
         stderr(&out).contains("is not a layer name"),
         "{}",
         stderr(&out)
+    );
+}
+
+/// A file entry's name is the poster's choice, and the door's shapes admit a leading dot, so
+/// `save` refuses every name that would arm something on the reader's machine (ledger #1748):
+/// an agent's or a shell's configuration, a Windows device, drive or alternate data stream. It
+/// writes nothing, exits 1, and says how to save it anyway: `--as NAME`. And `post file`
+/// refuses to send a file a reader could not save, pointing at `--file-name`.
+#[test]
+fn a_file_named_as_configuration_is_not_saved_unless_renamed() {
+    let home = scratch("names");
+    let certs = configure(&home);
+    let (_door, target) = serve(&home, &certs);
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let alice =
+        |args: &[&str], stdin: Option<&str>| as_alice(&home, &certs, &target, &work, args, stdin);
+    let saved = home.join("saved");
+    std::fs::create_dir_all(&saved).unwrap();
+    let saved_arg = saved.to_str().unwrap();
+
+    // Posted by hand, as another client could: the shapes take each of these names.
+    let digest = "sha256:5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03";
+    let posted_as = |name: &str| {
+        let turtle = format!(
+            "@prefix ik: <{IK}> .\n<urn:layer:new> a ik:File ; ik:fileName \"{name}\" ; \
+             ik:mediaType \"text/plain\" ; ik:contentHash \"{digest}\" ; ik:byteSize 6 ; \
+             ik:encoding \"text\" ; ik:content \"hello\\n\" .\n"
+        );
+        ok(
+            alice(&["-c", "sink urn:layer:work:say"], Some(&turtle)),
+            "the door admits the entry",
+        )
+        .trim()
+        .to_string()
+    };
+    for name in [
+        ".mcp.json",
+        "CLAUDE.md",
+        ".envrc",
+        "AGENTS.md",
+        "CON",
+        "a.txt:ads",
+    ] {
+        let entry = posted_as(name);
+        let out = alice(&["layers", "save", &entry, saved_arg], None);
+        assert_eq!(out.status.code(), Some(1), "{name}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("not saved") && stderr(&out).contains("--as NAME"),
+            "{name}: {}",
+            stderr(&out)
+        );
+        assert_eq!(
+            std::fs::read_dir(&saved).unwrap().count(),
+            0,
+            "{name}: nothing was written"
+        );
+    }
+
+    // --as saves it under a name the reader chose, and a PATH naming the file does too.
+    let mcp = posted_as(".mcp.json");
+    ok(
+        alice(
+            &["layers", "save", &mcp, saved_arg, "--as", "mcp.json"],
+            None,
+        ),
+        "save --as",
+    );
+    assert_eq!(std::fs::read(saved.join("mcp.json")).unwrap(), b"hello\n");
+    assert!(!saved.join(".mcp.json").exists());
+    let envrc = posted_as(".envrc");
+    let named = saved.join("envrc.txt");
+    ok(
+        alice(&["layers", "save", &envrc, named.to_str().unwrap()], None),
+        "save to a named file",
+    );
+    assert_eq!(std::fs::read(&named).unwrap(), b"hello\n");
+
+    // --as and a PATH's own name are held to the same rules, before anything is dialed: these
+    // run with no route to any door.
+    let out = run(
+        &home,
+        &["layers", "save", &mcp, saved_arg, "--as", ".envrc"],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("choose another --as NAME"),
+        "{}",
+        stderr(&out)
+    );
+    let claude = saved.join("CLAUDE.md");
+    let out = run(&home, &["layers", "save", &mcp, claude.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("give PATH another name"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!claude.exists());
+
+    // A file a reader could not save is not posted, and the refusal names the way out.
+    std::fs::write(work.join(".gitignore"), "target/\n").unwrap();
+    let out = alice(&["layers", "post", "file", "work", ".gitignore"], None);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("loads as configuration")
+            && stderr(&out).contains("--file-name NAME"),
+        "{}",
+        stderr(&out)
+    );
+    posted(
+        alice(
+            &[
+                "layers",
+                "post",
+                "file",
+                "work",
+                ".gitignore",
+                "--file-name",
+                "gitignore.txt",
+            ],
+            None,
+        ),
+        "post under another name",
     );
 }
