@@ -79,16 +79,17 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"
 # `web`-featured loader uses it. (serde_yaml 0.9 is archived-but-stable; swap to serde_yml if
 # a maintained fork is preferred.)
 serde_yaml = { version = "0.9", optional = true }
-# `ikigai layers post|save` (`src/layer.rs`, ledger #1629): a file entry's SHA-256, its base64,
-# its media type guessed from its name, and the Turtle a door answers parsed back to check a
-# saved file's digest. All already in this workspace's graph; none needs a feature. oxttl and
-# oxrdf come from the workspace, which pins oxrdf to the version oxttl's triples are from.
+# `ikigai layers post|save` (`src/layer.rs`, ledger #1629): a file entry's SHA-256, its media
+# type guessed from its name, and the Turtle a door answers parsed back to check a saved file's
+# digest. All already in this workspace's graph; none needs a feature. oxttl and oxrdf come from
+# the workspace, which pins oxrdf to the version oxttl's triples are from. A file entry's base64
+# is `ikigai_http::base64` (below), not the `base64` crate directly (ledger #1866).
 sha2 = "0.10"
-base64 = "0.22"
 mime_guess = "2.0"
-# The ecosystem's one `Authorization` reader and base64 encoder (ledger #1857): the layers
-# front's `bearer()` reads its header through `ikigai_http::auth::scheme`, and the clipboard's
-# OSC-52 payload is `ikigai_http::base64::encode`, so neither carries a private copy. 0.2.1 is
+# The ecosystem's one `Authorization` reader and base64 (ledger #1857): the layers front's
+# `bearer()` reads its header through `ikigai_http::auth::scheme`, the clipboard's OSC-52 payload
+# is `ikigai_http::base64::encode`, and a layer file entry's content is encoded and decoded by the
+# same module (ledger #1866), so none carries a private copy. 0.2.1 is
 # the first release with the `auth` and `base64` modules, so it is this crate's floor, above
 # the workspace's 0.2.0 (which is ikigai-embedded's, and does not need them). Read the caret
 # as a RANGE: `^0.2.1` is `<0.3.0`.
@@ -151,6 +152,10 @@ ikigai-layers = { workspace = true }
 # holding a VALID link is still refused by its own capability, not only by a door with no key
 # (ledger #1688). The same requirement and features as ikigai-embedded's, so no second copy.
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "pkcs8", "pem"] }
+# `tests/layers_serve.rs` mints signed links in base64url WITHOUT padding (RFC 4648 §5), which
+# `ikigai_http::base64` does not expose yet (it is the standard alphabet only), so the test reaches
+# the vetted crate directly. Test-only: the shipped code's one base64 is `ikigai_http::base64`.
+base64 = "0.22"
 # `route_load.rs`'s tests run the route query through the real `urn:sparql:select`, as the loader
 # does in the binary, because what an aggregate does with an IRI `ik:cap` is the query's behavior,
 # not the parser's (ledger #30). Already in the graph through ikigai-embedded; no new package.
