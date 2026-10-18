@@ -32,10 +32,11 @@
 //!   asks for [`ErrorBody::Json`]. A plain-text error is a minimal HTML page for a client that
 //!   asks for `text/html` over `text/plain` (a browser), with `Vary: Accept` either way.
 //! - **response headers from an endpoint**: an endpoint that needs `Set-Cookie`,
-//!   `Cache-Control`, `Vary`, `Content-Disposition` or `Content-Language` answers an
+//!   `Cache-Control`, `Vary`, `Content-Disposition`, `Content-Language` or `Location` answers an
 //!   [`HTTP_ENTITY`] envelope ([`with_headers`]); the door checks each header against a closed
 //!   allowlist ([`EndpointHeader`]) and its own [`EdgeConfig::endpoint_headers`], and refuses
-//!   anything else with `500` naming it.
+//!   anything else with `500` naming it. A `Location` on a write's answer makes it
+//!   `303 See Other` to a same-origin page (Post/Redirect/Get).
 //! - **HEAD**: the head GET would carry and no content, on every path, refusals included.
 //! - **a write's answer**: a Sink or Delete whose endpoint answers with a representation is
 //!   `200` with it (a take returns what it took); an empty answer is `204`.
@@ -2167,6 +2168,17 @@ impl Served {
     }
 
     fn apply(self, resp: &mut Resp, with_content: bool) {
+        // A `Location` (only ever on a write's answer, see `entity::open`) makes the answer a
+        // `303 See Other` before anything else is decided, so its content rides as the 303's
+        // body even where an empty write would have been `204`.
+        if self
+            .asked
+            .iter()
+            .any(|(h, _)| *h == EndpointHeader::Location)
+        {
+            resp.status = 303;
+            resp.reason = "See Other";
+        }
         if with_content && resp.status != 204 {
             resp.content_type = self.content_type;
             resp.body = self.repr.bytes;
@@ -2185,7 +2197,9 @@ impl Served {
                         resp.add_vary(name);
                     }
                 }
-                EndpointHeader::SetCookie => resp.headers.push((header.name().to_string(), value)),
+                EndpointHeader::SetCookie | EndpointHeader::Location => {
+                    resp.headers.push((header.name().to_string(), value))
+                }
                 EndpointHeader::ContentDisposition | EndpointHeader::ContentLanguage => {
                     if with_content && resp.status != 204 {
                         resp.headers.push((header.name().to_string(), value));
@@ -2530,6 +2544,7 @@ fn reason_phrase(status: u16) -> &'static str {
         200 => "OK",
         201 => "Created",
         204 => "No Content",
+        303 => "See Other",
         304 => "Not Modified",
         400 => "Bad Request",
         401 => "Unauthorized",
@@ -3792,6 +3807,26 @@ mod tests {
                 .verb(Verb::Source)
                 .verb(Verb::Sink),
         );
+        // A form that answers with Post/Redirect/Get (ledger #1879): `Location` in an entity
+        // envelope, by default to a query on its own path. Its `to` argument names the
+        // Location, so a test can ask for one the door must refuse; it asks on a read too.
+        let redirecting = FnEndpoint::new("redirecting", |inv: &Invocation<'_>| {
+            // Built by hand rather than with `with_headers`, which refuses a bad `Location`
+            // itself: these tests are about what the DOOR accepts, whoever wrote the envelope.
+            let to = inv.inline_str("to").unwrap_or("?outcome=recorded");
+            let mut bytes =
+                format!("Content-Type: text/html\r\nLocation: {to}\r\n\r\n").into_bytes();
+            bytes.extend_from_slice(b"<p>Recorded.</p>");
+            Ok(Representation::new(
+                ReprType::new(entity::HTTP_ENTITY),
+                bytes,
+            ))
+        })
+        .with_description(
+            Description::new("redirecting")
+                .verb(Verb::Source)
+                .verb(Verb::Sink),
+        );
         // A resource that exists once: first Delete succeeds, later Deletes → NotFound.
         let present = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let vanishing = FnEndpoint::new("vanishing", move |_inv: &Invocation<'_>| {
@@ -4095,6 +4130,7 @@ mod tests {
             .bind(Exact::new("urn:test:doc"), doc)
             .bind(Exact::new("urn:test:newdoc"), newdoc)
             .bind(Exact::new("urn:test:flaky"), flaky)
+            .bind(Exact::new("urn:test:redirecting"), redirecting)
             .bind(Exact::new("urn:test:vanishing"), vanishing)
             .bind(Exact::new("urn:test:ghost"), ghost)
             .bind(Exact::new("urn:test:tuples"), tuples)
@@ -5080,6 +5116,67 @@ mod tests {
             after.ends_with("\r\n\r\nv1"),
             "nothing was written: {after}"
         );
+    }
+
+    /// ★ Ledger #1879, Post/Redirect/Get: a write whose answer carries `Location` is `303 See
+    /// Other` to it, with the endpoint's page as the body, so a browser that restores the page
+    /// later restores a GET and never offers to post again.
+    #[tokio::test]
+    async fn a_writes_location_answers_303_see_other() {
+        let addr = start().await;
+        for location in ["?outcome=recorded", "/done/page?x=1"] {
+            let resp = roundtrip(
+                addr,
+                &format!(
+                    "POST /test/redirecting?to={} HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
+                    url_query(location)
+                ),
+            )
+            .await;
+            assert!(resp.starts_with("HTTP/1.1 303 See Other\r\n"), "{resp}");
+            assert!(
+                resp.contains(&format!("\r\nLocation: {location}\r\n")),
+                "{resp}"
+            );
+            assert!(resp.ends_with("<p>Recorded.</p>"), "{resp}");
+        }
+    }
+
+    /// …and only to the same origin, and only from a write: a `Location` with a host, a
+    /// scheme, a backslash or a bare relative path is refused with `500` naming it, and so is
+    /// one on a read's answer. Nothing of the refused answer is served.
+    #[tokio::test]
+    async fn a_location_off_the_origin_or_on_a_read_is_refused() {
+        let addr = start().await;
+        for location in [
+            "//evil.example/x",
+            "https://evil.example/",
+            "/\\evil.example",
+            "done",
+        ] {
+            let resp = roundtrip(
+                addr,
+                &format!(
+                    "POST /test/redirecting?to={} HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
+                    url_query(location)
+                ),
+            )
+            .await;
+            assert!(resp.starts_with("HTTP/1.1 500 "), "{location}: {resp}");
+            assert!(!resp.contains("\r\nLocation:"), "{location}: {resp}");
+            assert!(resp.contains("`Location`"), "{location}: {resp}");
+        }
+        let resp = roundtrip(addr, "GET /test/redirecting HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(resp.starts_with("HTTP/1.1 500 "), "{resp}");
+        assert!(
+            resp.contains("only a write's answer may redirect"),
+            "{resp}"
+        );
+    }
+
+    /// Percent-encode a query value for these tests.
+    fn url_query(value: &str) -> String {
+        ikigai_fn::html::url_segment(value)
     }
 
     #[tokio::test]

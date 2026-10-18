@@ -55,6 +55,7 @@ pub const MAX_HEADER_BLOCK: usize = 16 * 1024;
 /// | `Set-Cookie` | one header per line; only on an answer no cache can hold (a write, or a read whose answer is uncacheable), and only at a door that opts in |
 /// | `Content-Disposition` | as given; left off a `304` (RFC 9110 §15.4.5) |
 /// | `Content-Language` | as given; left off a `304` |
+/// | `Location` | makes the answer `303 See Other` (RFC 9110 §15.4.4); only on a write's answer, and only to a same-origin relative reference: a path (`/…`, never `//…`) or a query alone (`?…`, the same path) |
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum EndpointHeader {
@@ -64,6 +65,16 @@ pub enum EndpointHeader {
     ContentDisposition,
     /// `Content-Language`.
     ContentLanguage,
+    /// `Location`, which answers the write `303 See Other`: Post/Redirect/Get (ledger #1879),
+    /// so a page a browser restores after a form POST is the GET it was sent to, never the POST
+    /// again. Only on a mutating request (a read that redirects would be cacheable and
+    /// followable by any prefetcher), and only to a same-origin relative reference, so an
+    /// endpoint can never send a browser to another host: an absolute path (`/done`, not
+    /// `//host`) or a query alone (`?outcome=recorded`, which a browser resolves against the
+    /// request's own path, so the endpoint need not know where a door routes it). The value
+    /// is a URL a browser shows and may log, so it must carry no personal data: that is the
+    /// endpoint's to keep.
+    Location,
     /// `Set-Cookie`. Not in [`EndpointHeader::DEFAULTS`]: a cookie is authority over the
     /// whole origin, so a door that serves stored content must not let that content set one
     /// unless it says so.
@@ -74,20 +85,23 @@ pub enum EndpointHeader {
 
 impl EndpointHeader {
     /// Every header an endpoint can ever set.
-    pub const ALL: [EndpointHeader; 5] = [
+    pub const ALL: [EndpointHeader; 6] = [
         EndpointHeader::CacheControl,
         EndpointHeader::ContentDisposition,
         EndpointHeader::ContentLanguage,
+        EndpointHeader::Location,
         EndpointHeader::SetCookie,
         EndpointHeader::Vary,
     ];
 
     /// What a door accepts unless it says otherwise: all of [`ALL`](Self::ALL) but
-    /// `Set-Cookie`.
-    pub const DEFAULTS: [EndpointHeader; 4] = [
+    /// `Set-Cookie`. `Location` is in: it can only send a browser that just wrote to another
+    /// page of the same origin.
+    pub const DEFAULTS: [EndpointHeader; 5] = [
         EndpointHeader::CacheControl,
         EndpointHeader::ContentDisposition,
         EndpointHeader::ContentLanguage,
+        EndpointHeader::Location,
         EndpointHeader::Vary,
     ];
 
@@ -97,6 +111,7 @@ impl EndpointHeader {
             EndpointHeader::CacheControl => "Cache-Control",
             EndpointHeader::ContentDisposition => "Content-Disposition",
             EndpointHeader::ContentLanguage => "Content-Language",
+            EndpointHeader::Location => "Location",
             EndpointHeader::SetCookie => "Set-Cookie",
             EndpointHeader::Vary => "Vary",
         }
@@ -187,10 +202,13 @@ pub fn with_headers(
     check_value("Content-Type", &content_type)?;
     let mut block = format!("Content-Type: {content_type}\r\n");
     for (name, value) in headers {
-        if EndpointHeader::parse(name).is_none() {
+        let Some(header) = EndpointHeader::parse(name) else {
             return Err(not_allowed(name));
-        }
+        };
         check_value(name, value)?;
+        if header == EndpointHeader::Location {
+            check_same_origin(name, value)?;
+        }
         block.push_str(&format!("{name}: {value}\r\n"));
     }
     block.push_str("\r\n");
@@ -287,6 +305,18 @@ pub(crate) fn open(
                 "this door does not accept it from an endpoint (EdgeConfig::endpoint_headers)",
             ));
         }
+        if header == EndpointHeader::Location {
+            if !mutating {
+                return Err(HeaderRefusal::new(
+                    name,
+                    "set on a read: only a write's answer may redirect (Post/Redirect/Get)",
+                ));
+            }
+            check_same_origin(name, value)?;
+            if headers.iter().any(|(h, _)| *h == EndpointHeader::Location) {
+                return Err(HeaderRefusal::new(name, "given more than once"));
+            }
+        }
         if header == EndpointHeader::SetCookie && !mutating && repr.expiry != Expiry::Always {
             return Err(HeaderRefusal::new(
                 name,
@@ -309,12 +339,27 @@ pub(crate) fn open(
     })
 }
 
+/// A `Location` an endpoint may set: a same-origin relative reference (RFC 3986 §4.2), an
+/// absolute path or a query alone. Refused: a scheme or an authority (`https://x`, `//x`), a
+/// backslash (which browsers read as `/`, so `/\x` is `//x`), and anything else (`done`, a
+/// relative path a browser would resolve against a directory the endpoint cannot see).
+pub(crate) fn check_same_origin(name: &str, value: &str) -> Result<(), HeaderRefusal> {
+    let path_absolute = value.starts_with('/') && !value.starts_with("//");
+    if !(path_absolute || value.starts_with('?')) || value.contains('\\') {
+        return Err(HeaderRefusal::new(
+            name,
+            "not a same-origin relative reference (an absolute path `/…` or a query `?…`)",
+        ));
+    }
+    Ok(())
+}
+
 /// A refusal for a name off the allowlist.
 fn not_allowed(name: &str) -> HeaderRefusal {
     HeaderRefusal::new(
         name,
         "not one an endpoint may set (Cache-Control, Content-Disposition, Content-Language, \
-         Set-Cookie, Vary)",
+         Location, Set-Cookie, Vary)",
     )
 }
 
@@ -442,7 +487,6 @@ mod tests {
             "ETag",
             "Content-Security-Policy",
             "Access-Control-Allow-Origin",
-            "Location",
         ] {
             let raw = format!("Content-Type: text/plain\r\n{name}: x\r\n\r\nhi");
             let refused =

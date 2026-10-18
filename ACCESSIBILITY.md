@@ -42,6 +42,11 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
   'self'` CSP applies it; without it the page is still a readable, working form in the
   browser's defaults. The intake's redirect page redirects at once and carries no style at all:
   its fallback link reads in the browser's defaults.
+- A decision POST (the decision, contact-block and label pages) answers `303 See Other` to an
+  outcome page on the same path (`?outcome=<word>`), so the browser's history holds a GET: going
+  back or restoring the tab shows the outcome again and never asks to post again. The outcome
+  page is a `decide::page` like the others, says what happened in one sentence, and works with no
+  script.
 - A message a script writes after the page loads goes into a status line that is a polite live
   region (`role=status aria-live=polite`), present and empty in the served markup before the
   script runs: the passkey pages' `#status` and `#pkstatus`. Its gray (`#666`) is 5.7:1 on white.
@@ -98,6 +103,7 @@ Found by reading the source on 2026-10-15, not by testing:
 | 2026-10-16 | The passkey register page gains a field for the enrollment window's one-time code (ledger #1689): a visible `<label>` tied to the input by `for`, `autocomplete=one-time-code`, placed before the button; a missing code is reported in the existing `#status` live region and moves focus to the field. |
 | 2026-10-17 | The embedded host's pages move their inline styles, unchanged in value, into one served stylesheet, `/decide/css` (ledger #1834). The door's CSP had been dropping the inline styles in a browser, so on the edge the column width, the button padding and the muted gray now apply where they did not. |
 | 2026-10-18 | The intake's redirect page drops its inline `<style>` (ledger #1866). The door's CSP had been dropping it in a browser already, so on the edge the page looks as it did: browser defaults, for the instant before the redirect. |
+| 2026-10-18 | A decision, contact-block or label POST answers `303 See Other` to an outcome page (Post/Redirect/Get, ledger #1879), so a phone that returns to the tab no longer asks to post again; the outcome page names no address or booking, and a second POST of the same link says "Already recorded". |
 
 ## Contributing
 

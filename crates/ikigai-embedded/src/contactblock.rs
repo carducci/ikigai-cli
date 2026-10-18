@@ -83,7 +83,7 @@
 use crate::decide::{
     b64, now_secs, page, param, parse_signing_key, quoted, urlencode, verifying_key_at,
 };
-use crate::file_root;
+use crate::{file_root, prg};
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use ikigai_core::{
@@ -476,6 +476,95 @@ fn bad_link() -> Representation {
     )
 }
 
+/// The outcome words a block or label POST redirects with (see [`crate::prg`]), beside
+/// [`prg::ALREADY`]. A label's word is the label itself, so its page can say which was taught.
+const BLOCKED: &str = "blocked";
+const INVALID: &str = "invalid";
+const PASSKEY: &str = "passkey";
+
+/// The page a block POST redirects to. Generic by design: its URL carries no address, so it
+/// says what happened and never to whom.
+fn block_outcome(word: &str) -> Representation {
+    match word {
+        BLOCKED => page(
+            "Blocked",
+            "<p>Enquiries from that sender will be dropped once the edge picks this up — \
+             usually at once.</p>",
+        ),
+        prg::ALREADY => already_page(),
+        PASSKEY => page(
+            "Your passkey is needed",
+            "<p>Blocking this sender needs a tap on your registered device. Reopen the link \
+             and try again.</p>",
+        ),
+        _ => bad_link(),
+    }
+}
+
+/// The page a label POST redirects to: the label taught (`ham` or `spam`), never the enquiry.
+fn label_outcome(word: &str) -> Representation {
+    match word {
+        "ham" | "spam" => page(
+            if word == "ham" {
+                "Marked as not spam"
+            } else {
+                "Marked as spam"
+            },
+            "<p>The filter learns this once the edge picks it up — usually at once.</p>",
+        ),
+        prg::ALREADY => already_page(),
+        PASSKEY => page(
+            "Your passkey is needed",
+            "<p>Labeling this enquiry needs a tap on your registered device. Reopen the link \
+             and try again.</p>",
+        ),
+        _ => bad_link(),
+    }
+}
+
+fn already_page() -> Representation {
+    page(
+        "Already recorded",
+        "<p>This link's decision was recorded before. Nothing more was done.</p>",
+    )
+}
+
+/// The `outcome` a GET of a link page may carry: the word its POST redirected with.
+fn outcome_spec(words: &[&str]) -> ArgSpec {
+    ArgSpec::new(prg::OUTCOME)
+        .optional()
+        .class(crate::XSD_STRING)
+        .one_of(words.iter().copied())
+        .summary(
+            "the outcome a POST redirected to (Post/Redirect/Get); with it, the page shows what \
+             happened and needs no link fields",
+        )
+}
+
+/// Record `tuple` once for the link `token` (valid until `exp`), and answer the POST with the
+/// redirect: `done` when it was recorded now, [`prg::ALREADY`] when this link was acted on
+/// before. A failed drop gives the claim back, so the link can be tried again.
+#[allow(clippy::too_many_arguments)] // one call per endpoint, each naming every part
+async fn record_once(
+    inv: &Invocation<'_>,
+    scope: &str,
+    key: &std::path::Path,
+    token: &str,
+    exp: i64,
+    tuple: String,
+    done: &'static str,
+    outcome: fn(&str) -> Representation,
+) -> Result<Representation> {
+    if !prg::claim(scope, key, token, exp, now_secs())? {
+        return Ok(prg::see_other(prg::ALREADY, outcome(prg::ALREADY)));
+    }
+    if let Err(e) = drop_intent(inv, tuple).await {
+        prg::release(scope, key, token);
+        return Err(e);
+    }
+    Ok(prg::see_other(done, outcome(done)))
+}
+
 /// The form both link pages post back to themselves, with the passkey glue. Values and the
 /// button are escaped (ledger #1516); the names are this module's own literals.
 fn confirm_form(fields: &[(&str, &str)], button: &str) -> String {
@@ -506,6 +595,13 @@ pub struct ContactBlock {
 #[async_trait::async_trait]
 impl Endpoint for ContactBlock {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        // The page a block POST redirected to (Post/Redirect/Get, ledger #1879).
+        if inv.request.verb == Verb::Source {
+            let word = param(inv, prg::OUTCOME);
+            if !word.is_empty() {
+                return Ok(block_outcome(&word));
+            }
+        }
         let email = param(inv, "email");
         let enquiry = param(inv, "id");
         let token = param(inv, "t");
@@ -513,7 +609,10 @@ impl Endpoint for ContactBlock {
 
         let key = verifying_key_at(&self.key_path)?;
         if !block_valid(&email, &enquiry, exp, &token, &key, now_secs()) {
-            return Ok(bad_link());
+            return Ok(match inv.request.verb {
+                Verb::Sink => prg::see_other(INVALID, bad_link()),
+                _ => bad_link(),
+            });
         }
         let teaches = if enquiry.is_empty() {
             ""
@@ -548,11 +647,7 @@ impl Endpoint for ContactBlock {
                 // Passkey second factor — inert until a credential is enrolled, then required.
                 // The assertion rides in the POST body (pk_* fields the glue-JS adds).
                 if crate::passkey::require_passkey(inv).is_err() {
-                    return Ok(page(
-                        "Your passkey is needed",
-                        "<p>Blocking this sender needs a tap on your registered device. Reopen \
-                         the link and try again.</p>",
-                    ));
+                    return Ok(prg::see_other(PASSKEY, block_outcome(PASSKEY)));
                 }
                 let named = if enquiry.is_empty() {
                     String::new()
@@ -564,15 +659,17 @@ impl Endpoint for ContactBlock {
                     quoted(&email),
                     quoted(&exp.to_string())
                 );
-                drop_intent(inv, tuple).await?;
-                Ok(page(
-                    "Blocked",
-                    &format!(
-                        "<p>Enquiries from <code>{}</code> will be dropped once the edge \
-                         picks this up — usually at once.</p>",
-                        html_text(&email)
-                    ),
-                ))
+                record_once(
+                    inv,
+                    BLOCK_ACTION,
+                    &self.key_path,
+                    &token,
+                    exp,
+                    tuple,
+                    BLOCKED,
+                    block_outcome,
+                )
+                .await
             }
             other => Err(Error::Endpoint(format!(
                 "a block link is shown with Source or acted with Sink, not {other:?}"
@@ -615,7 +712,6 @@ impl Endpoint for ContactBlock {
             // there when a name is not an argument. Undeclared, the one channel every browser
             // submission actually uses was invisible to the manifold.
             .input(form_body_spec())
-            .output("text/html; charset=utf-8")
         };
         Description::new("contact-block")
             .title("Block an enquiry sender")
@@ -623,12 +719,20 @@ impl Endpoint for ContactBlock {
                 "The emailed block link. GET verifies the token and shows what it would block; \
                  POST records the block for the edge to apply. Records intent only.",
             )
-            .action(inputs(
-                ActionSpec::new(Verb::Source).summary("show — the address this link would block"),
-            ))
-            .action(inputs(
-                ActionSpec::new(Verb::Sink).summary("block — record the block"),
-            ))
+            .action(
+                inputs(
+                    ActionSpec::new(Verb::Source)
+                        .summary("show — the address this link would block, or what a block did"),
+                )
+                .input(outcome_spec(&[BLOCKED, prg::ALREADY, INVALID, PASSKEY]))
+                .output("text/html; charset=utf-8"),
+            )
+            // Every POST answers Post/Redirect/Get: the outcome page in an ikigai-web entity
+            // envelope whose `Location` makes it a `303` (ledger #1879).
+            .action(
+                inputs(ActionSpec::new(Verb::Sink).summary("block — record the block"))
+                    .output(prg::HTTP_ENTITY),
+            )
             .output("text/html; charset=utf-8")
     }
 }
@@ -672,6 +776,13 @@ pub struct ContactLabel {
 #[async_trait::async_trait]
 impl Endpoint for ContactLabel {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        // The page a label POST redirected to (Post/Redirect/Get, ledger #1879).
+        if inv.request.verb == Verb::Source {
+            let word = param(inv, prg::OUTCOME);
+            if !word.is_empty() {
+                return Ok(label_outcome(&word));
+            }
+        }
         let label = param(inv, "label");
         let enquiry = param(inv, "id");
         let token = param(inv, "t");
@@ -679,7 +790,10 @@ impl Endpoint for ContactLabel {
 
         let key = verifying_key_at(&self.key_path)?;
         if !label_valid(&label, &enquiry, exp, &token, &key, now_secs()) {
-            return Ok(bad_link());
+            return Ok(match inv.request.verb {
+                Verb::Sink => prg::see_other(INVALID, bad_link()),
+                _ => bad_link(),
+            });
         }
         // Only a validated label and a 64-hex id reach the page, so nothing here is visitor text.
         let (title, button, effect) = if label == "ham" {
@@ -722,11 +836,7 @@ impl Endpoint for ContactLabel {
             }
             Verb::Sink => {
                 if crate::passkey::require_passkey(inv).is_err() {
-                    return Ok(page(
-                        "Your passkey is needed",
-                        "<p>Labeling this enquiry needs a tap on your registered device. Reopen \
-                         the link and try again.</p>",
-                    ));
+                    return Ok(prg::see_other(PASSKEY, label_outcome(PASSKEY)));
                 }
                 let tuple = format!(
                     "((label {}) (enquiry {}) (exp {}))",
@@ -734,19 +844,18 @@ impl Endpoint for ContactLabel {
                     quoted(&enquiry),
                     quoted(&exp.to_string())
                 );
-                drop_intent(inv, tuple).await?;
-                let done = if label == "ham" {
-                    "Marked as not spam"
-                } else {
-                    "Marked as spam"
-                };
-                Ok(page(
+                let done = if label == "ham" { "ham" } else { "spam" };
+                record_once(
+                    inv,
+                    LABEL_ACTION,
+                    &self.key_path,
+                    &token,
+                    exp,
+                    tuple,
                     done,
-                    &format!(
-                        "<p>Enquiry <code>{short}</code>: the filter learns this once the edge \
-                         picks it up — usually at once.</p>"
-                    ),
-                ))
+                    label_outcome,
+                )
+                .await
             }
             other => Err(Error::Endpoint(format!(
                 "a label link is shown with Source or acted with Sink, not {other:?}"
@@ -782,7 +891,6 @@ impl Endpoint for ContactLabel {
                     .class(crate::XSD_STRING),
             )
             .input(form_body_spec())
-            .output("text/html; charset=utf-8")
         };
         Description::new("contact-label")
             .title("Label an enquiry for the spam filter")
@@ -790,12 +898,26 @@ impl Endpoint for ContactLabel {
                 "The emailed label link. GET verifies the token and shows what it would teach; \
                  POST records the label for the edge to train on. Records intent only.",
             )
-            .action(inputs(
-                ActionSpec::new(Verb::Source).summary("show — the label this link would teach"),
-            ))
-            .action(inputs(
-                ActionSpec::new(Verb::Sink).summary("label — record the label"),
-            ))
+            .action(
+                inputs(
+                    ActionSpec::new(Verb::Source)
+                        .summary("show — the label this link would teach, or what a label did"),
+                )
+                .input(outcome_spec(&[
+                    "ham",
+                    "spam",
+                    prg::ALREADY,
+                    INVALID,
+                    PASSKEY,
+                ]))
+                .output("text/html; charset=utf-8"),
+            )
+            // Every POST answers Post/Redirect/Get: the outcome page in an ikigai-web entity
+            // envelope whose `Location` makes it a `303` (ledger #1879).
+            .action(
+                inputs(ActionSpec::new(Verb::Sink).summary("label — record the label"))
+                    .output(prg::HTTP_ENTITY),
+            )
             .output("text/html; charset=utf-8")
     }
 }
@@ -1196,10 +1318,16 @@ mod endpoint_tests {
             "the hidden field: {get}"
         );
 
+        // The POST answers Post/Redirect/Get (ledger #1879): its page names no address at all,
+        // so there is nothing in it to escape.
         let post = w.post_block(hostile, exp, &token);
+        assert!(post.contains("Location: ?outcome=blocked\r\n"), "{post}");
         assert!(post.contains("Blocked"), "{post}");
         assert!(!post.contains("<b>"), "markup rendered: {post}");
-        assert!(post.contains(&format!("<code>{escaped}</code>")), "{post}");
+        assert!(
+            !post.contains("spam.example"),
+            "the address is not on the page: {post}"
+        );
         assert_eq!(
             crate::decide::field(&w.dropped()[0], "block-email").as_deref(),
             Some(hostile),
