@@ -878,7 +878,12 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 [workspace.dependencies]
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
-ikigai-core = "0.1.98" # 0.1.98 = core main after the YANKED 0.1.97, which shipped from a draft vocabulary
+ikigai-core = "0.1.106" # 0.1.106 = the ArgSpec shape (ledger #1547): input groups with a pipe member, list
+# arguments and `ActionSpec::join_repeats`, open and envelope argument sets, `ActionSpec::check` (the one checker),
+# declared defaults prefilled by the kernel (by-value and, 0.1.106, optional bindings), and the `to-upper` /
+# `reverse-list` builtin rename. An API floor: the engine routes by `pipe_slots` / `excluded_by_groups` and joins
+# repeats with `join_repeats`. ⚠ `^0.1.106` is also a ceiling below 0.2.0.
+# Beneath it, still true: 0.1.98 = core main after the YANKED 0.1.97, which shipped from a draft vocabulary
 # branch: a lock must never hold 0.1.97, and a floor above it says so. 0.1.98 carries ledger #1352 (a `%` in the
 # other name positions is a character), #1356 (an authored scope is escaped, parsed, else a literal, in every
 # face) and #791 (the floor memo degrades past its bound). Not an API floor: no source here calls anything new
@@ -1008,7 +1013,9 @@ ikigai-core = "0.1.98" # 0.1.98 = core main after the YANKED 0.1.97, which shipp
 # holds beneath it: below that a MOUNTED template row whose local name-guess collides with a
 # shorter sibling is dropped from the manifold, so `ikigai mcp` silently stops projecting
 # browse-pr-explain and browse-pr-review.
-ikigai-vocab = "0.1.98" # 0.1.98 = core 0.1.98's lockstep release, past the YANKED 0.1.97 (a draft vocabulary).
+ikigai-vocab = "0.1.106" # 0.1.106 = core 0.1.106's lockstep release (the ArgSpec-shape vocabulary: ik:InputGroup,
+# ik:listSeparator, ik:Stage, ik:cap as an IRI). Not an API floor; raised with core.
+# Beneath it: 0.1.98 = core 0.1.98's lockstep release, past the YANKED 0.1.97 (a draft vocabulary).
 # Not an API floor; raised with core because this repo's tests validate against the vocabulary the lock resolves.
 # Beneath it: 0.1.96 = core 0.1.96's lockstep release: it defines the layer family (`ik:Layer`,
 # `ik:Message`, `ik:Offer`, `ik:seq`, …) the graphs of a hosted layer carry (ledger #1182, #1188). Not an

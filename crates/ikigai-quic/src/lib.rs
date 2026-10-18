@@ -3009,7 +3009,7 @@ mod tests {
             .entries()
             .unwrap()
             .iter()
-            .any(|e| e.endpoint == "toUpper"));
+            .any(|e| e.endpoint == "to-upper"));
 
         drop(client); // closes the connection → the handler loop ends
         server.join().unwrap();

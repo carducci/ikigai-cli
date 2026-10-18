@@ -2583,13 +2583,51 @@ mod tests {
         }
     }
 
+    /// A read through the KERNEL, not through `Resolver::issue_as`. ⚠ Since core 0.1.105
+    /// `Resolver::issue_as`'s cache-status probe (`Kernel::is_cached`) resolves a `Meta` to
+    /// read the declared defaults (ledger #19), and a mount answers a `Meta` resolution by
+    /// asking its peer NOW (ledger #1146), so every read through the resolver forwards one
+    /// `Meta` more, memo or not. These tests are about the MOUNT's memo, so they read past
+    /// the probe; what the probe costs is pinned on its own, in
+    /// `the_cache_probe_asks_a_mounts_peer_once_per_resolver_read`.
     fn read_as(
         kernel: &Kernel,
         iri: &str,
         capability: &Capability,
     ) -> Result<Representation, Error> {
         let request = Request::new(Verb::Source, Iri::parse(iri).unwrap());
-        Resolver::issue_as(kernel, request, capability).map(|(representation, _)| representation)
+        block_on(kernel.issue(request, capability))
+    }
+
+    /// ⚠ The cost core 0.1.105 added, pinned so its fix is noticed (reported to the hub with
+    /// ledger #1547). `Resolver::issue_as` probes `Kernel::is_cached` before each read, and
+    /// that probe now resolves a `Meta` for the target's declared defaults; a mount's `Meta`
+    /// resolution forwards to the peer at once, by design (ledger #1146). So a hot mounted
+    /// read through the resolver (the engine's path) costs one peer `Meta` again, which is
+    /// what ledger #1577's memo had removed. The mount's own memo still holds (the reads
+    /// themselves ask nothing): the extra forward is the probe's alone. When this count
+    /// drops to one, the probe has stopped asking, and this test should say so.
+    #[test]
+    fn the_cache_probe_asks_a_mounts_peer_once_per_resolver_read() {
+        const N: usize = 10;
+        let (_space, peer) = swappable_peer(None);
+        let wire = Counted::over(&peer);
+        let local = Kernel::new(Arc::new(MountedRemote::new(
+            wire.clone(),
+            "urn:mnt:",
+            "test://peer",
+        )));
+        for _ in 0..N {
+            let request = Request::new(Verb::Source, Iri::parse("urn:mnt:peer:doc").unwrap());
+            let (answer, _) = Resolver::issue_as(&local, request, &Capability::root()).unwrap();
+            assert_eq!(answer.bytes, b"doc");
+        }
+        assert_eq!(wire.others(), N, "every read is forwarded");
+        assert_eq!(
+            wire.metas(),
+            N,
+            "the cache-status probe asks the peer for the contract on every resolver read"
+        );
     }
 
     /// ★ Ledger #1577. Core's floor memo keys on the endpoint's allocation, and a mount
@@ -2769,7 +2807,8 @@ mod tests {
         assert_eq!(wire.metas(), 1);
 
         rebind(&space, &peer, Arc::new(EndpointSpace::new()));
-        let answer = Resolver::issue_as(&local, meta("urn:peer:doc"), &Capability::root());
+        // Through the kernel, past the resolver's cache-status probe (see `read_as`).
+        let answer = block_on(local.issue(meta("urn:peer:doc"), &Capability::root()));
         assert!(
             matches!(&answer, Err(Error::Unresolved(_))),
             "an unbound name is Unresolved at once, memo or not: {answer:?}"

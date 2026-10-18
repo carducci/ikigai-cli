@@ -1580,18 +1580,23 @@ impl Engine {
             None
         };
         let declared = declared_arguments(description.as_ref());
+        // On an OPEN argument set every leading `key=value` word is named (ledger #1547).
+        let open = takes_open_arguments(description.as_ref(), verb);
 
         let mut request = Request::new(verb, iri.clone());
         let mut content_named = false;
-        let mut seen: Vec<&str> = Vec::new();
-        while let Some((key, value, after)) = take_named_arg(tail, &declared) {
-            if seen.contains(&key) {
-                return Err(given_twice(key));
-            }
-            seen.push(key);
+        let mut words: Vec<(&str, String)> = Vec::new();
+        // (Not `is_named_argument`: an undeclared `as=` here has always been content.)
+        let is_named = |key: &str| open || declared.iter().any(|name| name == key);
+        while let Some((key, value, after)) = take_named_arg_where(tail, is_named) {
+            words.push((key, value));
+            tail = after;
+        }
+        // A list argument's repeats join; any other repeat is refused (ledger #387, #1547).
+        let pairs: Vec<(&str, &str)> = words.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        for (key, value) in join_named(description.as_ref(), verb, &pairs)? {
             content_named |= key == "content";
             request = request.with_arg(key, ArgRef::Inline(value.into_bytes()));
-            tail = after;
         }
         // `content=` names the body explicitly — and `with_arg` is LAST-WINS, so the
         // remainder fallback below must not run or it overwrites the named value with the
@@ -1680,20 +1685,24 @@ impl Engine {
         // endpoint input. So it's always named — otherwise, on an endpoint that
         // doesn't declare `as`, it falls to positional and, in a pipe, collides
         // with the piped value (`… | ep as=text/turtle` used to error).
-        let mut named: Vec<(&str, &str)> = Vec::new();
+        // On an OPEN argument set every `key=value` word is named (ledger #1547).
+        let open = takes_open_arguments(description.as_ref(), Verb::Source);
+        let mut words: Vec<(&str, &str)> = Vec::new();
         let mut positional: Vec<&str> = Vec::new();
         for arg in args {
             match arg.split_once('=') {
-                Some(("as", value)) => named.push(("as", value)),
-                Some((key, value)) if declared.iter().any(|name| name == key) => {
-                    named.push((key, value))
+                Some((key, value)) if is_named_argument(&declared, open, key) => {
+                    words.push((key, value))
                 }
                 _ => positional.push(arg),
             }
         }
-        if let Some(name) = first_repeated(named.iter().map(|(name, _)| *name)) {
-            return Err(given_twice(name));
-        }
+        // A list argument's repeats join; any other repeat is refused (ledger #387, #1547).
+        let named = join_named(description.as_ref(), Verb::Source, &words)?;
+        let named: Vec<(&str, &str)> = named
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
         let positional = positional.join(" ");
 
         // A batch's piped stdin, when this stage has no other value and a required
@@ -1757,10 +1766,9 @@ impl Engine {
     ) -> Option<Vec<u8>> {
         let description = description?;
         let name = route_value_name(iri, Some(description), named).ok()?;
-        if !source_inputs(description)
-            .iter()
-            .any(|input| input.name == name && input.required)
-        {
+        // Required, or a group's pipe member with no member named (ledger #1547): the same
+        // set the routing rule reads, so stdin fills exactly what a pipe would.
+        if !required_slots(description, named).contains(&name) {
             return None;
         }
         // Take FIRST, then read: a deferred reader may block, and holding the RefCell
@@ -1790,32 +1798,24 @@ impl Engine {
 
         // The contract is only consulted to recognise named arguments; a bare
         // `… | sink <iri>` (content-only, the common case) skips the lookup.
-        let declared = if args.iter().any(|arg| arg.contains('=')) {
-            declared_arguments(self.describe_struct(&iri).await.as_ref())
+        let description = if args.iter().any(|arg| arg.contains('=')) {
+            self.describe_struct(&iri).await
         } else {
-            Vec::new()
+            None
         };
+        let declared = declared_arguments(description.as_ref());
+        // On an OPEN argument set every `key=value` word is named (ledger #1547).
+        let open = takes_open_arguments(description.as_ref(), Verb::Sink);
 
         let mut request = Request::new(Verb::Sink, iri.clone());
         let mut content_named = false;
-        let named = args.iter().filter_map(|arg| match arg.split_once('=') {
-            Some(("as", _)) => Some("as"),
-            Some((key, _)) if declared.iter().any(|name| name == key) => Some(key),
-            _ => None,
-        });
-        if let Some(name) = first_repeated(named) {
-            return Err(given_twice(name));
-        }
+        let mut words: Vec<(&str, &str)> = Vec::new();
         for arg in args {
             match arg.split_once('=') {
                 // `as` is the universal conneg selector (carried as an arg, not
                 // endpoint input), so it is always a named argument.
-                Some(("as", value)) => {
-                    request = request.with_arg("as", ArgRef::Inline(value.as_bytes().to_vec()));
-                }
-                Some((key, value)) if declared.iter().any(|name| name == key) => {
-                    content_named |= key == "content";
-                    request = request.with_arg(key, ArgRef::Inline(value.as_bytes().to_vec()));
+                Some((key, value)) if is_named_argument(&declared, open, key) => {
+                    words.push((key, value));
                 }
                 _ => {
                     return Err(format!(
@@ -1825,6 +1825,11 @@ impl Engine {
                     ))
                 }
             }
+        }
+        // A list argument's repeats join; any other repeat is refused (ledger #387, #1547).
+        for (key, value) in join_named(description.as_ref(), Verb::Sink, &words)? {
+            content_named |= key == "content";
+            request = request.with_arg(key, ArgRef::Inline(value.into_bytes()));
         }
 
         // Same last-wins hazard as the top-level `sink`: a named `content=` must survive,
@@ -2549,10 +2554,19 @@ pub(crate) fn route_value_name(
             declared.push(input.name);
         }
     }
+    // ★ Input groups (ledger #1547). A member of an exactly-one or at-most-one group that
+    // already has a member named is not a place a value may go: routing it there would
+    // break the group, so the value is refused here as "already set" rather than routed
+    // and then refused by the checker as "got both".
+    let action = verb_action(description, Verb::Source);
+    let excluded: Vec<&str> = action
+        .as_ref()
+        .map(|action| action.excluded_by_groups(named))
+        .unwrap_or_default();
     let remaining: Vec<&str> = declared
         .iter()
         .map(String::as_str)
-        .filter(|name| !named.contains(name))
+        .filter(|name| !named.contains(name) && !excluded.contains(name))
         .collect();
     match remaining.as_slice() {
         [name] => Ok((*name).to_string()),
@@ -2572,15 +2586,16 @@ pub(crate) fn route_value_name(
             // exactly one *required* input is unnamed, the piped/positional value fills it
             // (e.g. `… | urn:jsonld:flatten` → `content`, leaving optional `base` unset).
             // Only genuinely ambiguous when 2+ required inputs are still unnamed.
-            let inputs = source_inputs(description);
+            //
+            // ★ A group's PIPE member counts as required here while no member of its group
+            // is named (`ActionSpec::pipe_slots`, ledger #1547). A group member is declared
+            // optional, so without this an endpoint that moves a piped-or-named intake into
+            // `exactly_one(["content", "in"]).pipe("content")` would leave every pipeline.
+            let slots = required_slots(description, named);
             let required: Vec<&str> = many
                 .iter()
                 .copied()
-                .filter(|name| {
-                    inputs
-                        .iter()
-                        .any(|input| input.name == *name && input.required)
-                })
+                .filter(|name| slots.iter().any(|slot| slot == name))
                 .collect();
             match required.as_slice() {
                 [name] => Ok((*name).to_string()),
@@ -2606,6 +2621,84 @@ pub(crate) fn route_value_name(
 /// that declares no Source verb at all keeps the flat list, as before.
 fn source_inputs(description: &Description) -> Vec<ikigai_core::ArgSpec> {
     verb_inputs(description, Verb::Source)
+}
+
+/// The action a target declares for `verb`, through `action_specs()` (both authoring
+/// forms); `None` when it declares no such verb.
+fn verb_action(description: &Description, verb: Verb) -> Option<ikigai_core::ActionSpec> {
+    description
+        .action_specs()
+        .into_iter()
+        .find(|action| action.verb == verb)
+}
+
+/// The names a piped, positional or stdin value may fill on a target's Source, given the
+/// arguments already `named`: its REQUIRED by-value inputs, plus the pipe member of every
+/// exactly-one or at-least-one group none of whose members is named
+/// (`ActionSpec::pipe_slots`, ledger #1547). The one "required set" both the routing rule
+/// ([`route_value_name`]) and a batch's stdin rule read, so they cannot disagree.
+fn required_slots(description: &Description, named: &[&str]) -> Vec<String> {
+    let mut slots: Vec<String> = source_inputs(description)
+        .into_iter()
+        .filter(|input| input.required && input.source == InputSource::Argument)
+        .map(|input| input.name)
+        .collect();
+    if let Some(action) = verb_action(description, Verb::Source) {
+        for slot in action.pipe_slots(named) {
+            if !slots.iter().any(|s| s == slot) {
+                slots.push(slot.to_string());
+            }
+        }
+    }
+    slots
+}
+
+/// Whether a target's `verb` takes an OPEN argument set (`Arguments::Open`, ledger #1547):
+/// any name beyond its declared inputs is an argument (`compose`'s template markers). On
+/// such an action every `key=value` word is a named argument, so a positional value that
+/// contains `=` has to be piped or quoted there.
+pub(crate) fn takes_open_arguments(description: Option<&Description>, verb: Verb) -> bool {
+    description
+        .and_then(|description| verb_action(description, verb))
+        .is_some_and(|action| matches!(action.arguments, ikigai_core::Arguments::Open(_)))
+}
+
+/// Whether the word `key=…` is a named argument of a target's `verb`: the reserved `as`,
+/// a declared by-value argument (any verb's: see [`declared_arguments`]), or any name at
+/// all on an open argument set ([`takes_open_arguments`]).
+pub(crate) fn is_named_argument(declared: &[String], open: bool, key: &str) -> bool {
+    key == "as" || open || declared.iter().any(|name| name == key)
+}
+
+/// One value per name for a stage about to become a [`Request`] (which holds one value per
+/// name): the repeats of a LIST argument JOINED with its separator's canonical character,
+/// so `graph=A graph=B` and `graph=A,B` are one request and one cache key; a repeat of any
+/// other name refused as [`given_twice`] (ledger #387, #1547). The rule is core's
+/// (`ActionSpec::join_repeats`), applied to the target's action for `verb`. With no
+/// contract, or no such action, nothing is a list and every repeat is refused.
+pub(crate) fn join_named(
+    description: Option<&Description>,
+    verb: Verb,
+    named: &[(&str, &str)],
+) -> Result<Vec<(String, String)>, String> {
+    let action = description.and_then(|description| verb_action(description, verb));
+    let Some(action) = action else {
+        if let Some(name) = first_repeated(named.iter().map(|(name, _)| *name)) {
+            return Err(given_twice(name));
+        }
+        return Ok(named
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect());
+    };
+    let proposed = ikigai_core::ProposedArgs::from_pairs(named.iter().copied());
+    let joined = action
+        .join_repeats(&proposed)
+        .map_err(|error| error.to_string())?;
+    Ok(joined
+        .pairs()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect())
 }
 
 /// Whether a target's DELETE declares a `content` argument, which is what lets a `-c`
@@ -3202,8 +3295,9 @@ fn is_denial(error: &ikigai_core::Error) -> bool {
 ///
 /// A [`Request`] holds ONE value per name and `with_arg` is last-wins, so `graph=A graph=B`
 /// used to reach the endpoint as `graph=B` with no word said: a join came back empty and
-/// looked like an answer. No `ArgSpec` can declare an argument repeatable yet, so there is no
-/// endpoint to pass several values to, and a repeat is refused outright.
+/// looked like an answer. Since core 0.1.105 a LIST argument (`ArgSpec::list`) is the one
+/// repeatable argument, and [`join_named`] joins its repeats; any other repeat is refused
+/// with this. Core's `ActionSpec::join_repeats` gives the same display form.
 ///
 /// ```text
 /// invalid argument `graph`: given twice; an argument takes one value, so name it once
@@ -3235,10 +3329,20 @@ pub(crate) fn first_repeated<'a>(names: impl IntoIterator<Item = &'a str>) -> Op
 /// grammar's word scanning. Returns `(key, value, rest)`; `None` when the next
 /// word isn't a declared `key=` (the verbatim-content boundary) or a quote is
 /// unterminated (the text then rides as content, where it's at least visible).
+#[cfg(test)]
 fn take_named_arg<'a>(tail: &'a str, declared: &[String]) -> Option<(&'a str, String, &'a str)> {
+    take_named_arg_where(tail, |key| declared.iter().any(|name| name == key))
+}
+
+/// [`take_named_arg`] with the "is this key an argument?" rule given: an OPEN argument set
+/// (ledger #1547) names any key.
+fn take_named_arg_where(
+    tail: &str,
+    is_named: impl Fn(&str) -> bool,
+) -> Option<(&str, String, &str)> {
     let (word, _) = split_first_word(tail);
     let (key, _) = word.split_once('=')?;
-    if key.is_empty() || !declared.iter().any(|name| name == key) {
+    if key.is_empty() || !is_named(key) {
         return None;
     }
     let after_eq = &tail[key.len() + 1..];
@@ -6799,6 +6903,267 @@ mod tests {
         );
     }
 
+    /// An engine over the ArgSpec shapes of core 0.1.105 (ledger #1547): an input GROUP
+    /// with a pipe member (`lift`: exactly one of `content` or `in`, a pipe filling
+    /// `content`), a LIST argument (`graphs`: `graph` comma-or-whitespace separated, beside
+    /// a plain `query`), an OPEN argument set (`compose`: `src` plus any name), and a
+    /// cacheable counter whose thread a piped `sink urn:kernel:cut` can cut.
+    fn shape_engine() -> Engine {
+        use ikigai_core::{InputGroup, ListSeparator};
+        let lift = FnEndpoint::new("lift", |inv: &Invocation<'_>| {
+            let text = match (inv.inline_str("content"), inv.inline_str("in")) {
+                (Ok(content), Err(_)) => format!("content={content}"),
+                (Err(_), Ok(by_name)) => format!("in={by_name}"),
+                (Ok(_), Ok(_)) => "both".to_string(),
+                (Err(_), Err(_)) => "neither".to_string(),
+            };
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                text.into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("lift")
+                .verb(Verb::Source)
+                .verb(Verb::Meta)
+                .input(ArgSpec::new("content").optional())
+                .input(ArgSpec::new("in").optional())
+                .group(InputGroup::exactly_one(["content", "in"]).pipe("content"))
+                .output("text/plain"),
+        );
+        let graphs = FnEndpoint::new("graphs", |inv: &Invocation<'_>| {
+            let text = format!(
+                "graph={} query={}",
+                inv.inline_str("graph").unwrap_or("-"),
+                inv.inline_str("query").unwrap_or("-")
+            );
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                text.into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("graphs")
+                .verb(Verb::Source)
+                .verb(Verb::Sink)
+                .verb(Verb::Meta)
+                .input(
+                    ArgSpec::new("graph")
+                        .optional()
+                        .list(ListSeparator::CommaOrWhitespace),
+                )
+                .input(ArgSpec::new("query").optional())
+                .input(ArgSpec::new("content").optional())
+                .output("text/plain"),
+        );
+        let compose = FnEndpoint::new("compose", |inv: &Invocation<'_>| {
+            let text = format!(
+                "src={} title={}",
+                inv.inline_str("src").unwrap_or("-"),
+                inv.inline_str("title").unwrap_or("-")
+            );
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                text.into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("compose")
+                .verb(Verb::Source)
+                .verb(Verb::Sink)
+                .verb(Verb::Meta)
+                .input(ArgSpec::new("src"))
+                .input(ArgSpec::new("content").optional())
+                .open_arguments("each fills a {name} marker in the body")
+                .output("text/plain"),
+        );
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = FnEndpoint::new("counter", move |_: &Invocation<'_>| {
+            let n = reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            Ok(
+                Representation::new(ReprType::new("text/plain"), n.to_string().into_bytes())
+                    .cacheable(),
+            )
+        });
+        let thread_name = FnEndpoint::new("thread-name", |_: &Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"urn:demo:counter".to_vec(),
+            ))
+        });
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:demo:lift"), lift)
+            .bind(Exact::new("urn:demo:graphs"), graphs)
+            .bind(Exact::new("urn:demo:compose"), compose)
+            .bind(Exact::new("urn:demo:counter"), counter)
+            .bind(Exact::new("urn:demo:thread-name"), thread_name)
+            .bind(Exact::new("urn:test:upper"), builtins::to_upper());
+        Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ))
+    }
+
+    /// ledger #1547: a group member is declared OPTIONAL, so before the engine read groups a
+    /// piped or positional value reaching `exactly_one(["content", "in"]).pipe("content")`
+    /// found no required input and was refused as ambiguous: every endpoint that moved its
+    /// intake into a group left every pipeline. The pipe member now counts as required
+    /// while no member of its group is named; naming `in=` satisfies the group and leaves
+    /// no slot, so a value after it is refused as "already set", never routed into the
+    /// other member and then refused as "got both".
+    #[test]
+    fn a_value_fills_a_groups_pipe_member() {
+        let engine = shape_engine();
+        assert_eq!(
+            output(engine.eval("source urn:test:upper hi | urn:demo:lift")).unwrap(),
+            "content=HI",
+            "a pipe fills the group's pipe member"
+        );
+        assert_eq!(
+            output(engine.eval("source urn:demo:lift hello")).unwrap(),
+            "content=hello",
+            "so does a positional value"
+        );
+        assert_eq!(
+            output(engine.eval("source urn:test:upper \"a\nb\" .. urn:demo:lift")).unwrap(),
+            "content=A\ncontent=B",
+            "and each mapped item"
+        );
+        assert_eq!(
+            output(engine.eval("source urn:demo:lift in=urn:x")).unwrap(),
+            "in=urn:x",
+            "the other member still works by name, with no value"
+        );
+        let err =
+            output(engine.eval("source urn:test:upper hi | urn:demo:lift in=urn:x")).unwrap_err();
+        assert!(err.contains("no argument left"), "got: {err}");
+        // A batch's stdin reads the same rule: the pipe member is a slot it may fill.
+        engine.set_piped_input(b"from stdin".to_vec());
+        assert_eq!(
+            output(engine.eval("source urn:demo:lift")).unwrap(),
+            "content=from stdin"
+        );
+        // ...and not once the group is satisfied by name (stdin is left unread).
+        engine.set_piped_input(b"unread".to_vec());
+        assert_eq!(
+            output(engine.eval("source urn:demo:lift in=urn:y")).unwrap(),
+            "in=urn:y"
+        );
+        // The plan records the same routing for a positional value.
+        let plan = output(engine.eval("plan urn:demo:lift hello")).unwrap();
+        assert!(plan.contains("ik:inputName \"content\""), "{plan}");
+    }
+
+    /// ledger #1547's lead case: `urn:kernel:cut` declares `exactly_one(["thread",
+    /// "content"]).pipe("content")`, so `… | sink urn:kernel:cut` takes the THREAD from the
+    /// pipe (a sink's piped value is its `content`) and cuts it; naming `thread=` beside a
+    /// pipe is the group broken, and is refused rather than cut either one.
+    #[test]
+    fn a_piped_value_is_the_thread_kernel_cut_cuts() {
+        let engine = shape_engine();
+        assert_eq!(output(engine.eval("source urn:demo:counter")).unwrap(), "1");
+        assert_eq!(
+            output(engine.eval("source urn:demo:counter")).unwrap(),
+            "1",
+            "cached"
+        );
+        assert_eq!(
+            output(engine.eval("source urn:demo:thread-name | sink urn:kernel:cut")).unwrap(),
+            "cut urn:demo:counter\n"
+        );
+        assert_eq!(
+            output(engine.eval("source urn:demo:counter")).unwrap(),
+            "2",
+            "the cut thread recomputes"
+        );
+        let err = output(
+            engine.eval("source urn:demo:thread-name | sink urn:kernel:cut thread=urn:demo:x"),
+        )
+        .unwrap_err();
+        assert!(err.contains("got both"), "got: {err}");
+    }
+
+    /// ledger #1547 (with #387, #1731): a LIST argument is the one repeatable argument. Its
+    /// repeats are joined with the separator's canonical character before the request is
+    /// built, so `graph=A graph=B` and `graph=A,B` are one request at every place the text
+    /// face assembles named arguments; a repeat of a non-list argument is still refused.
+    #[test]
+    fn a_list_argument_given_twice_joins() {
+        let engine = shape_engine();
+        for line in [
+            "source urn:demo:graphs graph=urn:a graph=urn:b",
+            "source urn:demo:graphs graph=urn:a,urn:b",
+            "source urn:test:upper hi | urn:demo:graphs graph=urn:a query=q graph=urn:b",
+        ] {
+            let got = output(engine.eval(line)).unwrap();
+            assert!(got.starts_with("graph=urn:a,urn:b "), "{line}: {got}");
+        }
+        // The write verbs: the top-level `sink` and a piped `sink` stage.
+        assert_eq!(
+            output(engine.eval("sink urn:demo:graphs graph=urn:a graph=urn:b body")).unwrap(),
+            "graph=urn:a,urn:b query=-"
+        );
+        assert_eq!(
+            output(
+                engine.eval(
+                    "source urn:test:upper hi | sink urn:demo:graphs graph=urn:a graph=urn:b"
+                )
+            )
+            .unwrap(),
+            "graph=urn:a,urn:b query=-"
+        );
+        // A plan records the joined value, once.
+        let plan = output(engine.eval("plan urn:demo:graphs graph=urn:a graph=urn:b")).unwrap();
+        assert!(plan.contains("urn:a,urn:b"), "{plan}");
+        // A non-list name given twice is still refused, in the shared display form.
+        assert_eq!(
+            output(engine.eval("source urn:demo:graphs query=a query=b")).unwrap_err(),
+            format!("invalid argument `query`: {GIVEN_TWICE}")
+        );
+        assert_eq!(
+            output(engine.eval("sink urn:demo:graphs query=a query=b body")).unwrap_err(),
+            format!("invalid argument `query`: {GIVEN_TWICE}")
+        );
+    }
+
+    /// ledger #1547 (#607): on an OPEN argument set every `key=value` word is a named
+    /// argument, so `compose src=urn:x title=y` passes `title` instead of taking `title=y`
+    /// for a positional value with nowhere to go.
+    #[test]
+    fn an_open_action_takes_unknown_names() {
+        let engine = shape_engine();
+        assert_eq!(
+            output(engine.eval("source urn:demo:compose src=urn:x title=Hello")).unwrap(),
+            "src=urn:x title=Hello"
+        );
+        assert_eq!(
+            output(engine.eval("source urn:test:upper urn:x | urn:demo:compose title=Hi")).unwrap(),
+            "src=URN:X title=Hi",
+            "the pipe still fills the one required declared input"
+        );
+        assert_eq!(
+            output(engine.eval("sink urn:demo:compose src=urn:x title=Hi the body")).unwrap(),
+            "src=urn:x title=Hi"
+        );
+        assert_eq!(
+            output(
+                engine.eval("source urn:test:upper b | sink urn:demo:compose src=urn:x title=Hi")
+            )
+            .unwrap(),
+            "src=urn:x title=Hi"
+        );
+        // An unknown name is still checked for the given-twice rule.
+        assert_eq!(
+            output(engine.eval("source urn:demo:compose src=urn:x title=a title=b")).unwrap_err(),
+            format!("invalid argument `title`: {GIVEN_TWICE}")
+        );
+        // On a CLOSED action an undeclared `k=v` is still positional text.
+        assert_eq!(
+            output(greet_engine().eval("source urn:demo:greet bogus=x name=World")).unwrap(),
+            "bogus=x, World"
+        );
+    }
+
     #[test]
     fn an_extra_value_when_all_arguments_are_named_errors() {
         let err = output(greet_engine().eval("source urn:demo:greet greeting=Hi name=W extra"))
@@ -6922,7 +7287,7 @@ mod tests {
     fn lists_the_bound_resources() {
         let listing = output(builtin_engine().eval("list")).unwrap();
         assert!(listing.contains("urn:test:upper"));
-        assert!(listing.contains("toUpper"));
+        assert!(listing.contains("to-upper"));
         assert!(listing.contains("urn:demo:echo/{message}"));
         assert!(listing.contains("echo"));
     }

@@ -73,8 +73,8 @@ use ikigai_core::{ArgRef, Description, Provenance, Request};
 #[cfg(feature = "plan-reader")]
 use crate::engine::{combine_outputs, root_provenance, Staged};
 use crate::engine::{
-    declared_arguments, given_twice, parse_spec, parse_target, route_value_name, Connector, Engine,
-    Node, Pipeline,
+    declared_arguments, is_named_argument, join_named, parse_spec, parse_target, route_value_name,
+    takes_open_arguments, Connector, Engine, Node, Pipeline,
 };
 
 /// The ikigai vocabulary namespace — the terms a plan graph is written in.
@@ -1299,29 +1299,24 @@ impl Engine {
                         None
                     };
                     let declared = declared_arguments(description.as_ref());
+                    let open = takes_open_arguments(description.as_ref(), Verb::Source);
 
-                    let mut arguments = BTreeMap::new();
+                    let mut words: Vec<(&str, &str)> = Vec::new();
                     let mut positional: Vec<&str> = Vec::new();
                     for arg in args {
-                        let named = match arg.split_once('=') {
-                            Some(("as", value)) => ("as", value),
-                            Some((key, value)) if declared.iter().any(|name| name == key) => {
-                                (key, value)
+                        match arg.split_once('=') {
+                            Some((key, value)) if is_named_argument(&declared, open, key) => {
+                                words.push((key, value));
                             }
-                            _ => {
-                                positional.push(arg);
-                                continue;
-                            }
-                        };
-                        // ledger #387: the text face's refusal, so a plan never records the
-                        // one value a repeat would have silently kept.
-                        if arguments
-                            .insert(named.0.to_string(), named.1.to_string())
-                            .is_some()
-                        {
-                            return Err(given_twice(named.0));
+                            _ => positional.push(arg),
                         }
                     }
+                    // ledger #387, #1547: the text face's rule, so a plan records the one
+                    // request the stage runs: a list's repeats joined, any other refused.
+                    let mut arguments: BTreeMap<String, String> =
+                        join_named(description.as_ref(), Verb::Source, &words)?
+                            .into_iter()
+                            .collect();
                     let positional = positional.join(" ");
                     if has_input && !positional.is_empty() {
                         return Err(format!(
@@ -1351,29 +1346,18 @@ impl Engine {
                 Node::Sink(words) => {
                     let (target, args) = words.split_first().ok_or("`sink` needs a target IRI")?;
                     let iri = parse_target(target)?;
-                    let declared = if args.iter().any(|arg| arg.contains('=')) {
-                        declared_arguments(self.describe_struct(&iri).await.as_ref())
+                    let description = if args.iter().any(|arg| arg.contains('=')) {
+                        self.describe_struct(&iri).await
                     } else {
-                        Vec::new()
+                        None
                     };
-                    let mut arguments = BTreeMap::new();
+                    let declared = declared_arguments(description.as_ref());
+                    let open = takes_open_arguments(description.as_ref(), Verb::Sink);
+                    let mut words: Vec<(&str, &str)> = Vec::new();
                     for arg in args {
                         match arg.split_once('=') {
-                            Some(("as", value)) => {
-                                if arguments
-                                    .insert("as".to_string(), value.to_string())
-                                    .is_some()
-                                {
-                                    return Err(given_twice("as"));
-                                }
-                            }
-                            Some((key, value)) if declared.iter().any(|name| name == key) => {
-                                if arguments
-                                    .insert(key.to_string(), value.to_string())
-                                    .is_some()
-                                {
-                                    return Err(given_twice(key));
-                                }
+                            Some((key, value)) if is_named_argument(&declared, open, key) => {
+                                words.push((key, value));
                             }
                             _ => {
                                 return Err(format!(
@@ -1384,6 +1368,10 @@ impl Engine {
                             }
                         }
                     }
+                    let mut arguments: BTreeMap<String, String> =
+                        join_named(description.as_ref(), Verb::Sink, &words)?
+                            .into_iter()
+                            .collect();
                     if has_input {
                         if arguments.contains_key("content") {
                             return Err(format!(

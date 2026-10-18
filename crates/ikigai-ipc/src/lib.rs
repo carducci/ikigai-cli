@@ -2140,7 +2140,7 @@ mod tests {
         assert!(client.is_cached(&upper("hey"), &Capability::root()));
 
         let entries = client.entries().expect("space enumerates");
-        assert!(entries.iter().any(|e| e.endpoint == "toUpper"));
+        assert!(entries.iter().any(|e| e.endpoint == "to-upper"));
 
         drop(client);
         server.join().unwrap();

@@ -723,7 +723,10 @@ fn greeter() -> FnEndpoint {
 fn clock_now() -> FnEndpoint {
     FnEndpoint::new("clock-now", |inv: &Invocation<'_>| {
         use chrono::Timelike;
-        let html = inv.inline_str("html").is_ok();
+        // The VALUE decides, not the presence: the kernel fills the declared default
+        // `html=false` before this runs (core 0.1.105, ledger #19), and a presence test read
+        // that as `true` and served the HTML face to every plain read.
+        let html = inv.inline_str("html").is_ok_and(|v| v == "true");
         let (instant, source) = ikigai_tz::read_now(inv)?;
         let now = instant.with_timezone(&chrono::Local);
         let (h, m) = (now.hour(), now.minute());
