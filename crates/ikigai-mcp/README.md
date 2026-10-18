@@ -11,7 +11,7 @@ MCP asks a server for three things, and ikigai already has all three:
 | MCP needs | ikigai provides |
 |-----------|-----------------|
 | a tool list | `urn:kernel:actions` — the capability-scoped action manifold |
-| a typed input schema per tool | `ArgSpec` contracts (`one_of` → enum, `class` → type, `default`, `required`) |
+| a typed input schema per tool | `ArgSpec` contracts (`one_of` → enum, `class` → type, a typed `default`, `required`, a list → array, `needs` → `dependentRequired`, a closed argument set → `additionalProperties: false`) |
 | a way to call a tool safely | validate the arguments, then invoke through the kernel |
 
 So this crate is a thin, runtime-free translator (newline-framed JSON-RPC over
@@ -77,8 +77,16 @@ forbids.
   `{id}__{verb}` the first contract keeps.
 - **`tools/call`** — reverse the name to `(endpoint, verb)`, route Binding
   inputs into the IRI and Argument inputs as request args, **validate** the JSON
-  arguments against the typed contract (a non-conforming call returns a SHACL
-  report the model repairs from — never a protocol error), then invoke. A
+  arguments against the typed contract with core's one checker,
+  `ActionSpec::check` (a non-conforming call returns a SHACL report the model
+  repairs from — never a protocol error), then invoke. A list argument takes a
+  JSON array, joined with its separator; an open argument set passes its extra
+  names through; an envelope's fields are serialized into its carrier as one
+  JSON object (0.1.65+). Input groups (exactly one of, at least one of, at most
+  one of) and a value's `needs` are stated in the tool's DESCRIPTION, not its
+  schema: Claude's API refuses `oneOf`/`anyOf`/`allOf` at the root of a tool's
+  `input_schema`, and fails the whole request when one tool has them. The
+  server-side check enforces them either way. A
   Binding value is substituted as given (a file path keeps its `/`, an IRI its
   `:`), but a call must reach the tool's OWN endpoint: a value that turns the
   target into another endpoint's IRI (`alice:private` under `urn:x:user:{name}`,
