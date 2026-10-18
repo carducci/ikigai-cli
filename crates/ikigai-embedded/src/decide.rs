@@ -137,14 +137,32 @@ pub(crate) fn now_secs() -> i64 {
 }
 
 /// Read the verifying key from `path`.
+///
+/// ⚠ The error crosses the wire to whoever followed the link, so it says the key is "not
+/// configured" and names the FILE (what an operator puts in place), never the directory it was
+/// looked for in: an absolute path would disclose the host's file layout to every caller. The
+/// same function reads the decide key and the contact-block key, so it names whichever file.
 pub(crate) fn verifying_key_at(path: &std::path::Path) -> Result<VerifyingKey> {
+    let file = path.file_name().map_or_else(
+        || "its key file".to_string(),
+        |f| f.to_string_lossy().into_owned(),
+    );
     let bytes = std::fs::read(path).map_err(|e| {
+        let why = match e.kind() {
+            std::io::ErrorKind::NotFound => "it is absent".to_string(),
+            kind => format!("it cannot be read ({kind})"),
+        };
         Error::Endpoint(format!(
-            "cannot read the decide public key at {}: {e}",
-            path.display()
+            "this link is not configured on this host: its public key ({file}) is not \
+             configured, {why}"
         ))
     })?;
-    parse_verifying_key(&bytes).map_err(|e| Error::Endpoint(format!("{}: {e}", path.display())))
+    parse_verifying_key(&bytes).map_err(|e| {
+        Error::Endpoint(format!(
+            "this link is not configured on this host: its public key ({file}) is not a \
+             usable key ({e})"
+        ))
+    })
 }
 
 fn parse_verifying_key(bytes: &[u8]) -> std::result::Result<VerifyingKey, String> {
@@ -1131,5 +1149,50 @@ mod endpoint_tests {
             out.contains("(approve") && out.contains(ID),
             "the program ran on the command: {out}"
         );
+    }
+
+    /// A missing or unreadable verifying key reads "not configured" and never names WHERE the
+    /// host looked: the error crosses the wire to whoever asked, and an absolute path in it
+    /// discloses the host's file layout. The file's own name stays, so an operator knows what
+    /// to put in place.
+    #[test]
+    fn a_missing_or_unreadable_key_says_not_configured_without_its_path() {
+        let dir = std::env::temp_dir().join(format!("ikigai-decide-{}-nokey", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ask = |key_path: std::path::PathBuf| {
+            let kernel = Kernel::new(Arc::new(EndpointSpace::new().bind(
+                UriTemplate::parse("urn:calendar-request:{action}").unwrap(),
+                CalendarRequest { key_path },
+            )));
+            block_on(
+                kernel.issue(
+                    Request::new(
+                        Verb::Sink,
+                        Iri::parse("urn:calendar-request:approve").unwrap(),
+                    )
+                    .with_arg(
+                        "content",
+                        ArgRef::Inline(b"id=abcdefgh12&exp=99999999999&t=AAAA".to_vec()),
+                    ),
+                    &Capability::root(),
+                ),
+            )
+            .expect_err("no usable key, no page")
+            .to_string()
+        };
+        let missing = ask(dir.join("decide.pub"));
+        std::fs::write(dir.join("garbled.pub"), "not a key").unwrap();
+        let garbled = ask(dir.join("garbled.pub"));
+        for (what, err) in [("missing", &missing), ("garbled", &garbled)] {
+            assert!(err.contains("not configured"), "{what}: {err}");
+            assert!(
+                !err.contains(dir.to_str().unwrap())
+                    && !err.contains(&*std::env::temp_dir().to_string_lossy()),
+                "{what}: the error names no path: {err}"
+            );
+        }
+        assert!(missing.contains("decide.pub"), "{missing}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -76,7 +76,10 @@ usage:
                                `ikigai-layers grants <config home>` writes them. State lives in
                                --layers-state <dir>, else `layers.state` (instance-scoped as
                                <name>.layers.state; relative to the config home) in config.toml,
-                               else ~/.ikigai/layers/<name>. No environment variable names it
+                               else ~/.ikigai/layers/<name>. No environment variable names it.
+                               A layer door serves ONLY its layers: none of the general served
+                               surface (host, files, intake, links, passkey), and it refuses to
+                               start with a mount or a ceiling that opens another face
   ikigai serve <s> --prefer …  a served host may take --mount/--override/--prefer too, so IT owns
                                the topology: a local client reaches a peer through this socket
                                without holding its certs or finding it itself
@@ -3428,6 +3431,24 @@ fn serve_quic(
                 !own
             })
             .collect();
+        // ★ A LAYER DOOR SERVES ONLY ITS LAYERS (`served_kernel_hosting`): no general served
+        // surface, and no mount either, since a mount would re-serve a peer's surface to every
+        // participant. Refused before anything dials, naming the mounts, rather than composed.
+        if let (Some(hosted), false) = (&layers, mounts.is_empty()) {
+            return Err(format!(
+                "this door hosts layers (defined in {}), and a layer door serves only its \
+                 layers: it composes no mount, and this start names {} ({}). Serve the mounted \
+                 namespaces on a door of their own, or pass --no-config-mounts if the config \
+                 home's `mount` lines are for the other processes on this machine.",
+                hosted.config.join(ikigai_embedded::layers::DIR).display(),
+                if mounts.len() == 1 { "one" } else { "several" },
+                mounts
+                    .iter()
+                    .map(|m| format!("{}={}", m.prefix, m.target))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+        }
         // Connect the mounts BEFORE announcing readiness, exactly as serve_ipc does: a
         // host that says it is serving and then cannot reach the peer it was told to
         // compose is worse than one that refuses to start. (`--prefer` is exempt — its
@@ -3728,6 +3749,30 @@ fn serve_quic(
             // servable, still bounded by require_net to the granted provider hosts.
             llm: surface_caps.iter().any(|c| c.starts_with("urn:cap:net:")),
         };
+        // ★ The same rule for a FACE: a ceiling (or an enrolled grant) that would open the
+        // calendar, inference or the governed eval beside the layers is refused, not ignored.
+        if let Some(hosted) = &layers {
+            let opened: Vec<&str> = [
+                (surface.personal, "the calendar (a urn:cap:personal: scope)"),
+                (surface.llm, "inference (a urn:cap:net: scope)"),
+                (
+                    surface.wire_eval,
+                    "the governed eval (urn:cap:lisp or urn:cap:lisp:run)",
+                ),
+            ]
+            .into_iter()
+            .filter_map(|(on, face)| on.then_some(face))
+            .collect();
+            if !opened.is_empty() {
+                return Err(format!(
+                    "this door hosts layers (defined in {}), and a layer door serves only its \
+                     layers, but its ceiling or an enrolled grant would open {} beside them. \
+                     Serve that face on a door of its own.",
+                    hosted.config.join(ikigai_embedded::layers::DIR).display(),
+                    opened.join(" and "),
+                ));
+            }
+        }
         // ONE kernel for both faces (QUIC and the layers HTTPS front): a write through one
         // must cut the threads the other's readers hang from (`ikigai_quic::serve_shared_on`).
         let kernel = std::sync::Arc::new(ikigai_embedded::served_kernel_hosting(
@@ -3741,14 +3786,14 @@ fn serve_quic(
         // of this closure, which is for as long as the door serves.
         let _workspace = watch_served_workspace(&kernel);
         let signed_door = ikigai_embedded::code_signers_configured();
-        let mut faces = vec![if surface.personal {
+        // A layer door's surface is its layers alone (refused above if anything else was asked).
+        let mut faces = vec![if layers.is_some() {
+            "layers"
+        } else if surface.personal {
             "calendar-only"
         } else {
             "host + fs"
         }];
-        if layers.is_some() {
-            faces.push("layers");
-        }
         if surface.llm {
             faces.push("llm");
         }

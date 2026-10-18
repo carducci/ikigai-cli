@@ -48,7 +48,9 @@ fn scratch(case: &str, config: &str) -> PathBuf {
 /// printed `serving HTTP on`, `Err((code, stderr))` when it exited first.
 fn start(home: &Path) -> Result<(Door, String), (i32, String)> {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ikigai"))
-        .args(["serve", "--http", "0"])
+        // The ceiling grants the passkey challenge, as the edge's does: the endpoint declares
+        // `urn:cap:passkey:challenge`, and a door without it refuses before any limit is counted.
+        .args(["serve", "--http", "0", "--cap", "urn:cap:passkey:challenge"])
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("IKIGAI_FILES", home.join("files"))

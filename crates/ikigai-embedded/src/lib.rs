@@ -1692,6 +1692,8 @@ fn served_space(nature: &'static str) -> EndpointSpace {
         // own credential + challenge stores; neither holds a signing key or `decisions:write`.
         // The gate itself (`passkey::require_passkey`) is called inside the contact-block and
         // calendar-request POSTs, and is inert until a credential is enrolled.
+        // Each DECLARES its capability (`urn:cap:passkey:challenge`, `urn:cap:passkey:register`),
+        // so only a ceiling that grants it reaches them: the edge's HTTP face lists both.
         .bind(
             Exact::new("urn:passkey:challenge"),
             passkey::PasskeyChallenge,
@@ -2148,31 +2150,38 @@ pub fn served_kernel_with_mounts(
     served_kernel_hosting(nature, surface, mounts, None)
 }
 
-/// [`served_kernel_with_mounts`], hosting a layer host when one is given (ledger #1188):
-/// [`layers::spaces`] (the layer space, alone: admission validates inside the host, ledger
-/// #1295) goes IN FRONT of the served surface, and the kernel gets a clock, which a layer
-/// needs to stamp a write. With `None` this is exactly the kernel `served_kernel_with_mounts`
-/// always built: no layer, no clock.
+/// [`served_kernel_with_mounts`], hosting a layer host when one is given (ledger #1188).
+///
+/// ★ **A door that hosts layers serves ONLY the layers.** With `Some(host)` the kernel binds
+/// [`layers::spaces`] (the layers under `urn:layer:`, the host-wide reads under `urn:layers:`,
+/// `urn:layers:me` among them, and the collaborations under `urn:collab:`) and nothing of the
+/// general served surface: no `served_space` (the intake doors, the airlock spaces, the
+/// decision and block/label links, the passkey endpoints, the client registry, the blocklist,
+/// the file module), no host or demo resources from `base_space`, and no optional face (the
+/// calendar, inference, the governed eval), whatever `surface` asks for. A layer door's
+/// principals are collaborators whose grants name layer verbs, and a binding they were never
+/// granted is still a binding: an endpoint that declares no capability answers every one of
+/// them. So the surface is decided by STRUCTURE, as `served_root`'s limiters decide the personal
+/// and inference families: a name this door does not bind resolves nowhere, under every grant.
+/// Both limiters stay on, so nothing composed in later reaches those families either.
+///
+/// `mounts` are still composed after the layers (the caller's own topology); `ikigai serve`
+/// refuses to start a layer door with a mount or a face-opening ceiling, so from the cli a
+/// layer door is exactly its layers. The kernel gets a clock, which a layer needs to stamp a
+/// write.
+///
+/// With `None` this is exactly the kernel `served_kernel_with_mounts` always built: the general
+/// served surface, no layer, no clock.
 pub fn served_kernel_hosting(
     nature: &'static str,
     surface: ServedSurface,
     mounts: Vec<MountSpec>,
     layers: Option<&Arc<ikigai_layers::Host>>,
 ) -> Kernel {
-    let mut spaces: Vec<Arc<dyn Space>> = Vec::new();
-    if let Some(host) = layers {
-        spaces.extend(layers::spaces(host));
-    }
-    // The LLM face sits in front of the base surface (it binds its own namespace;
-    // order only matters for a prefix collision, and there is none).
-    if surface.llm {
-        spaces.push(Arc::new(llm_space()) as Arc<dyn Space>);
-    }
-    spaces.push(if surface.personal {
-        Arc::new(calendar_server_space(nature)) as Arc<dyn Space>
-    } else {
-        Arc::new(served_space(nature)) as Arc<dyn Space>
-    });
+    let (spaces, surface) = match layers {
+        Some(host) => (layers::spaces(host), ServedSurface::default()),
+        None => (served_spaces(nature, surface), surface),
+    };
     let composed = compose_mounts(spaces, mounts);
     let root = if surface.wire_eval {
         with_wire_eval(composed)
@@ -2189,6 +2198,23 @@ pub fn served_kernel_hosting(
         Some(_) => kernel.with_clock(layers::clock()),
         None => kernel,
     }
+}
+
+/// The general served surface for `surface`: the inference face when the grant opens it, then
+/// the calendar-only space or the general `served_space`. Never composed on a layer door.
+fn served_spaces(nature: &'static str, surface: ServedSurface) -> Vec<Arc<dyn Space>> {
+    let mut spaces: Vec<Arc<dyn Space>> = Vec::new();
+    // The LLM face sits in front of the base surface (it binds its own namespace;
+    // order only matters for a prefix collision, and there is none).
+    if surface.llm {
+        spaces.push(Arc::new(llm_space()) as Arc<dyn Space>);
+    }
+    spaces.push(if surface.personal {
+        Arc::new(calendar_server_space(nature)) as Arc<dyn Space>
+    } else {
+        Arc::new(served_space(nature)) as Arc<dyn Space>
+    });
+    spaces
 }
 
 /// The native HTTP transport backing the `urn:http*` endpoints: a blocking `ureq`

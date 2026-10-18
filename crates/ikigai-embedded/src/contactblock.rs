@@ -1502,4 +1502,42 @@ mod endpoint_tests {
             "{too_big:?}"
         );
     }
+
+    /// The block and label links read "not configured" for a missing key, without its path
+    /// (the error crosses the wire to whoever followed the link).
+    #[test]
+    fn a_missing_key_says_not_configured_without_its_path() {
+        let dir = std::env::temp_dir().join(format!("ikigai-cblock-{}-nokey", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_path = dir.join("contact-block.pub");
+        let kernel = Kernel::new(Arc::new(
+            EndpointSpace::new()
+                .bind(
+                    Exact::new("urn:contact-block"),
+                    ContactBlock {
+                        key_path: key_path.clone(),
+                    },
+                )
+                .bind(Exact::new("urn:contact-label"), ContactLabel { key_path }),
+        ));
+        for iri in ["urn:contact-block", "urn:contact-label"] {
+            let err = block_on(kernel.issue(
+                Request::new(Verb::Sink, Iri::parse(iri).unwrap()).with_arg(
+                    "content",
+                    ArgRef::Inline(b"email=a%40b.example&id=&exp=99999999999&t=AAAA".to_vec()),
+                ),
+                &Capability::root(),
+            ))
+            .expect_err("no key, no page")
+            .to_string();
+            assert!(err.contains("not configured"), "{iri}: {err}");
+            assert!(err.contains("contact-block.pub"), "{iri}: {err}");
+            assert!(
+                !err.contains(dir.to_str().unwrap()),
+                "{iri}: the error names no path: {err}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

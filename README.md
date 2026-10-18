@@ -450,6 +450,13 @@ ikigai --override urn:layer:,urn:layers:,urn:collab:=quic://door.example:4434 \
        --cert-dir ~/.ikigai/layers-client/me -c 'source urn:layers:feed after=talk:0'
 ```
 
+**A layer door serves only its layers** (the release after 0.1.63). A `serve quic://` whose
+config home has `layers/` binds the layers, `urn:layers:*` and `urn:collab:*`, and none of the
+general served surface: no host or demo resources, no files, no intake doors, decision links or
+passkey endpoints. Every other name resolves nowhere, under every grant. It refuses to start
+with a mount or with a ceiling (or an enrolled grant) that would open the calendar, inference or
+the governed eval beside the layers; serve those on a door of their own.
+
 **Posting briefs, issues and files** (ledger #1629). A layer whose shapes take them holds an
 `ik:Brief` (work, written to be done), an `ik:Issue` (a problem, written to be fixed) and an
 `ik:File` (an attachment) beside its messages. `ikigai layers post` composes the entry for you
@@ -626,7 +633,9 @@ so one segment cannot reach a deeper resource; `{+var}` opts into carrying them 
 `Accept` becomes the `as=` face, query parameters become named
 arguments, and every request resolves under the `--cap` ceiling. Besides the public
 intakes (`urn:contact:submit`, `urn:booking:submit` — validated forms that drop a
-tuple into a space), the emailed decision links and the passkey ceremony, it carries
+tuple into a space), the emailed decision links and the passkey ceremony (whose two
+endpoints declare `urn:cap:passkey:challenge` and `urn:cap:passkey:register` since the
+release after 0.1.63, so a ceiling that serves the ceremony lists both), it carries
 **`urn:iki:foaf`**: one FOAF document (`src=`), every face by negotiation — the RDF/XML as
 fetched by default, `text/html` through a workspace stylesheet (`urn:file:foaf.xsl`;
 `fragment=1` for just `<main>`), `application/ld+json` compacted against a workspace
@@ -647,7 +656,7 @@ change them (a bad line stops the door at start-up, naming it):
 |---|---|---|
 | `http.rate_limit` | `urn:contact:submit 10/3600`, `urn:booking:submit 10/3600`, `urn:passkey:challenge 30/120` | one line per rule, `"<IRI prefix> <requests>/<seconds>"`; a line replaces the default for its prefix, and `"<IRI prefix> off"` drops it |
 | `http.rate_limit_sources` | 4096 | how many client windows the door tracks at once. Emptied windows are reclaimed first; past it a NEW client is refused (`429`), never let through untracked |
-| `passkey.max_challenges` | 4096 | passkey challenges outstanding at once (each lives 120 s). Past it a new challenge is refused with a transient error (`503`); none is evicted, so a sign-in already under way still completes. It bounds the challenge store on every door that serves `urn:passkey:challenge`, a layer door included |
+| `passkey.max_challenges` | 4096 | passkey challenges outstanding at once (each lives 120 s). Past it a new challenge is refused with a transient error (`503`); none is evicted, so a sign-in already under way still completes. It bounds the challenge store on every door that serves `urn:passkey:challenge` |
 
 The banner names the limits in force (`rate limits per client: …`).
 

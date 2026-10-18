@@ -12,6 +12,10 @@
 //! | `urn:passkey:enroll-open` | Sink | opens a short enrollment window (run from the box) |
 //! | `urn:passkey:register` | Source/Sink | GET shows the enrol page, POST stores the credential |
 //!
+//! The challenge and the register page declare `urn:cap:passkey:challenge` and
+//! `urn:cap:passkey:register`, so a door reaches them only under a ceiling that grants them (the
+//! edge's HTTP face does); enroll-open declares `urn:cap:passkey:enroll`.
+//!
 //! ## Per-action, not a session — and inert until enrolled
 //!
 //! There is no cookie and no session store: the browser runs the ceremony on the button tap and
@@ -59,6 +63,18 @@ use std::time::{Duration, Instant};
 
 /// Cap to open an enrollment window — held only where a human at the box runs it.
 pub const CAP_PASSKEY_ENROLL: &str = "urn:cap:passkey:enroll";
+
+/// Cap to mint a login challenge (`urn:passkey:challenge`). DECLARED, so the kernel's floor
+/// refuses a caller without it and the manifold offers the endpoint only to one that holds it:
+/// a door whose principals were never granted the passkey ceremony cannot reach it. The edge's
+/// public HTTP face grants it in its `--cap` ceiling, beside the intake doors it serves.
+pub const CAP_PASSKEY_CHALLENGE: &str = "urn:cap:passkey:challenge";
+
+/// Cap to show the enrollment page and post a registration (`urn:passkey:register`, both
+/// verbs). Declared for the same reason as [`CAP_PASSKEY_CHALLENGE`]; holding it is not
+/// enough to enroll anything, since a registration also needs the window opened at the box
+/// and its one-time code.
+pub const CAP_PASSKEY_REGISTER: &str = "urn:cap:passkey:register";
 
 /// How long a challenge stays good — long enough for a biometric prompt, short enough that a
 /// leaked one is stale almost at once. Measured on the MONOTONIC clock, so a backward jump of
@@ -979,7 +995,8 @@ impl Endpoint for PasskeyChallenge {
             .action(
                 ActionSpec::new(Verb::Source)
                     .summary("mint a challenge")
-                    .output("application/json; charset=utf-8"),
+                    .output("application/json; charset=utf-8")
+                    .requires(CAP_PASSKEY_CHALLENGE),
             )
             .output("application/json; charset=utf-8")
     }
@@ -1343,12 +1360,14 @@ impl Endpoint for PasskeyRegister {
             .action(
                 ActionSpec::new(Verb::Source)
                     .summary("show the enrolment page")
-                    .output("text/html; charset=utf-8"),
+                    .output("text/html; charset=utf-8")
+                    .requires(CAP_PASSKEY_REGISTER),
             )
             .action(
                 ActionSpec::new(Verb::Sink)
                     .summary("store a credential (needs an open window and its one-time code)")
-                    .output("text/html; charset=utf-8"),
+                    .output("text/html; charset=utf-8")
+                    .requires(CAP_PASSKEY_REGISTER),
             )
             .output("text/html; charset=utf-8")
     }
@@ -2152,6 +2171,67 @@ mod tests {
         );
         assert!(open(&Capability::root()).is_ok(), "root opens it");
         assert!(enrollment_open(), "now open");
+    }
+
+    /// `urn:passkey:challenge` and `urn:passkey:register` DECLARE their capabilities, so the
+    /// kernel's floor refuses a caller that holds neither, on any door that binds them, and the
+    /// manifold offers them only to a caller that does. The edge's public HTTP face grants both
+    /// in its ceiling; a door whose principals were never granted them cannot reach them.
+    #[test]
+    fn the_challenge_and_registration_declare_and_enforce_their_capabilities() {
+        isolate("caps");
+        TEST_RP.with(|r| *r.borrow_mut() = Some(test_relying_party()));
+        open_window();
+        let kernel = Kernel::new(std::sync::Arc::new(
+            ikigai_core::EndpointSpace::new()
+                .bind(
+                    ikigai_core::Exact::new("urn:passkey:challenge"),
+                    PasskeyChallenge,
+                )
+                .bind(
+                    ikigai_core::Exact::new("urn:passkey:register"),
+                    PasskeyRegister,
+                ),
+        ));
+        let ask = |iri: &str, verb: Verb, cap: &Capability| {
+            let mut req = Request::new(verb, Iri::parse(iri).unwrap());
+            if verb == Verb::Sink {
+                req = req.with_arg(
+                    "content",
+                    ArgRef::Inline(registration(b"cred-caps", Some(TEST_CODE)).into_bytes()),
+                );
+            }
+            futures::executor::block_on(kernel.issue(req, cap))
+        };
+        let none = Capability::scoped(Vec::<String>::new());
+        let wrong = Capability::scoped(["urn:cap:layer:say:talk"]);
+        for (iri, verb, cap) in [
+            ("urn:passkey:challenge", Verb::Source, CAP_PASSKEY_CHALLENGE),
+            ("urn:passkey:register", Verb::Source, CAP_PASSKEY_REGISTER),
+            ("urn:passkey:register", Verb::Sink, CAP_PASSKEY_REGISTER),
+        ] {
+            for held in [&none, &wrong] {
+                match ask(iri, verb, held) {
+                    Err(Error::Denied(why)) => {
+                        assert!(why.contains(cap), "{iri} {verb:?} names `{cap}`: {why}")
+                    }
+                    other => panic!("{iri} {verb:?} without `{cap}` is denied, got {other:?}"),
+                }
+            }
+        }
+        assert!(!is_enrolled(), "nothing enrolled without the grant");
+        // Granted, each works as before.
+        let challenge = ask(
+            "urn:passkey:challenge",
+            Verb::Source,
+            &Capability::scoped([CAP_PASSKEY_CHALLENGE]),
+        )
+        .expect("granted, a challenge");
+        assert!(String::from_utf8_lossy(&challenge.bytes).contains("\"challenge\""));
+        let register = Capability::scoped([CAP_PASSKEY_REGISTER]);
+        ask("urn:passkey:register", Verb::Source, &register).expect("granted, the page");
+        ask("urn:passkey:register", Verb::Sink, &register).expect("granted, it enrolls");
+        assert!(is_enrolled());
     }
 
     #[cfg(unix)]

@@ -673,8 +673,10 @@ fn a_layer_door_offers_no_validator_and_tells_each_participant_who_it_is() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// With NO `layers/` directory the door is the door it always was: no layer, no banner line, the same surface, and the same manifold as a door whose config home differs
-/// only by `layers/` — minus exactly the layer families.
+/// With NO `layers/` directory the door is the door it always was: no layer, no banner line, and
+/// the general served surface. With `layers/` the same config home serves the layers INSTEAD:
+/// every endpoint it adds is a layer endpoint, and nothing of the general surface remains
+/// (a layer door serves only its layers).
 #[test]
 fn without_a_layers_directory_serve_is_unchanged() {
     let home = scratch("none");
@@ -707,7 +709,7 @@ fn without_a_layers_directory_serve_is_unchanged() {
     // The same config home without `layers/`: the enrollment stays, so alice is still served.
     std::fs::remove_dir_all(config_home(&home).join("layers")).unwrap();
     let (_door, target, plain) = serve(&home, &certs, &[]);
-    assert!(banner.contains("surface: host + fs + layers"), "{banner}");
+    assert!(banner.contains("surface: layers;"), "{banner}");
     assert!(plain.contains("surface: host + fs;"), "{plain}");
     assert!(
         !plain.contains("ikigai: layers:"),
@@ -761,11 +763,26 @@ fn without_a_layers_directory_serve_is_unchanged() {
             "hosting layers adds ONLY layer endpoints, not {id}"
         );
     }
-    assert!(
-        without.is_subset(&with),
-        "and removes nothing: {:?}",
-        without.difference(&with).collect::<Vec<_>>()
-    );
+    // What both doors serve is only the kernel's own resources (the catalog, the manifold):
+    // the general served surface is not on the layer door at all.
+    let kept: Vec<&String> = with.intersection(&without).collect();
+    for id in &kept {
+        assert!(
+            id.starts_with("kernel-"),
+            "a layer door keeps nothing of the general surface, not {id}: {kept:?}"
+        );
+    }
+    for gone in [
+        "host-identity",
+        "host-info",
+        "passkey-challenge",
+        "passkey-register",
+    ] {
+        assert!(
+            without.contains(gone) && !with.contains(gone),
+            "{gone} is on the general door and not on the layer door"
+        );
+    }
 
     // A state directory for a door that hosts no layer is a flag that does nothing: refused.
     let out = run(
@@ -1028,10 +1045,12 @@ fn mcp_shows_only_the_layer_doors_tools_under_its_prefixes() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Ledger #1688 (threat model S4 gap 1, enforcement row L-18): the layer door binds the whole
-// served surface BEHIND the layers, so every endpoint `served_space` binds is reachable by name
-// from a participant's connection. These tests pin that a participant is refused every one that
-// holds protected state.
+// Ledger #1688 (threat model S4 gap 1, enforcement row L-18): the layer door used to bind the
+// whole served surface BEHIND the layers, so every endpoint `served_space` binds was reachable by
+// name from a participant's connection, and only the endpoints that declare a capability refused.
+// A layer door now binds the layers alone (the section after this one); these probes are what a
+// participant would have reached first, and the widened door below holds that putting the keys
+// and a relying party on such a door still opens none of them.
 // ---------------------------------------------------------------------------------------------
 
 /// What a protected endpoint is asked, and how its refusal must read.
@@ -1156,80 +1175,6 @@ fn files_under(dir: &Path) -> BTreeSet<String> {
     out
 }
 
-/// The families on the served surface that hold protected state or act. None may appear in a
-/// participant's manifold (`urn:kernel:actions` lists what the caller's capability can do).
-const PROTECTED_FAMILIES: [&str; 9] = [
-    "urn:contact:submit",
-    "urn:booking:submit",
-    "urn:space:",
-    "urn:decisions",
-    "urn:client:",
-    "urn:host:posture",
-    "urn:file:",
-    "urn:passkey:enroll-open",
-    "urn:kernel:catalog",
-];
-
-/// ★ Ledger #1688, on a door built the way the edge builds it: the layer configuration, the
-/// enrollment pair the layer host's own generator writes (so each participant's grant is exactly
-/// `urn:cap:collab:read:{collab}` and `urn:cap:layer:{verb}:{layer}`, the deployed `grants.json`
-/// shape), no `--cap`, and an EMPTY file root. A participant is refused every protected endpoint
-/// the served surface binds, its manifold offers none of them, and nothing is written.
-#[test]
-fn a_layer_participant_is_refused_every_protected_endpoint_the_served_surface_binds() {
-    let home = scratch("surface");
-    let certs = certs(&home);
-    configure_layers(&home, &certs);
-    let files = home.join("files");
-    std::fs::create_dir_all(&files).unwrap();
-    let (_door, target, _banner) = serve(&home, &certs, &[]);
-
-    let mut probes = protected_probes();
-    // On this door the decision links have no public key to verify against (the edge's layer
-    // door root is empty), so they refuse before a token is even read.
-    let link = "id=abcdefgh12&exp=99999999999&t=AAAA";
-    for (command, key) in [
-        ("sink urn:calendar-request:approve", "decide.pub"),
-        ("sink urn:contact-block", "contact-block.pub"),
-        ("sink urn:contact-label", "contact-block.pub"),
-    ] {
-        probes.push(probe(command, Some(link), key));
-    }
-    // And no relying party is configured here, so nothing can be enrolled.
-    probes.push(probe(
-        "sink urn:passkey:register",
-        Some("code=x&id=YWJj&spki=YWJj"),
-        "no passkey relying party",
-    ));
-
-    for who in ["alice", "bob"] {
-        assert_refused(&home, &certs, &target, who, &probes);
-        let manifold = ok(
-            ask(
-                &home,
-                &certs,
-                who,
-                &target,
-                "source urn:kernel:actions",
-                None,
-            ),
-            &format!("{who}'s manifold"),
-        );
-        for family in PROTECTED_FAMILIES {
-            assert!(
-                !manifold.lines().any(|l| l.trim().starts_with(family)),
-                "{who}'s manifold offers nothing under {family}:\n{manifold}"
-            );
-        }
-    }
-    assert_eq!(
-        files_under(&files),
-        BTreeSet::new(),
-        "no probe wrote anything under the door's file root"
-    );
-    let _ = std::fs::remove_dir_all(&home);
-}
-
 /// Sign `payload` with `key`, as the Mac (decide) and the edge (block, label) mint a link.
 fn signed(key: &ed25519_dalek::SigningKey, payload: &str) -> String {
     use base64::Engine;
@@ -1248,13 +1193,13 @@ fn write_public_key(path: PathBuf, key: &ed25519_dalek::SigningKey) {
 
 /// The same door WIDENED past what the edge deploys: the decision and block/label public keys
 /// in its file root, a passkey relying party configured, and links that are VALIDLY signed (a
-/// participant who has seen a leaked email link). The links verify, and the participant is
-/// still refused, because recording a decision is a drop into a space and its connection's
-/// capability holds no `urn:cap:space:out`. So the refusal is the participant's authority, not
-/// the door's missing configuration, and a later deploy that puts a key on this door does not
-/// open it.
+/// participant who has seen a leaked email link). None of it is reachable: a layer door binds
+/// neither the links nor the passkey endpoints, so what lands in its file root or on its command
+/// line cannot turn them into live gates on a door whose principals are outside collaborators.
+/// Before, the links verified here and only the participant's missing `urn:cap:space:out` stood
+/// between a leaked link and a recorded decision.
 #[test]
-fn a_layer_participant_with_a_valid_link_is_still_refused_by_its_own_capability() {
+fn a_widened_layer_door_still_binds_no_link_and_no_passkey_endpoint() {
     let home = scratch("widened");
     let certs = certs(&home);
     configure_layers(&home, &certs);
@@ -1279,43 +1224,22 @@ fn a_layer_participant_with_a_valid_link_is_still_refused_by_its_own_capability(
         "label=ham&id={enquiry}&exp={exp}&t={}",
         signed(&block, &format!("contact-label|ham|{enquiry}|{exp}"))
     );
-
-    // The links are valid: their SHOW face (GET, which records nothing) renders the decision
-    // page, not "That link didn't work". Without this the refusals below could be a bad token.
-    let shown = ok(
-        ask(
-            &home,
-            &certs,
-            "bob",
-            &target,
-            &format!(
-                "source urn:calendar-request:approve id={booking} exp={exp} t={approve_token}"
-            ),
-            None,
+    let unbound = "no endpoint resolved";
+    let show =
+        format!("source urn:calendar-request:approve id={booking} exp={exp} t={approve_token}");
+    let mut probes = vec![
+        probe(&show, None, unbound),
+        probe("sink urn:calendar-request:approve", Some(&approve), unbound),
+        probe("sink urn:contact-block", Some(&block_link), unbound),
+        probe("sink urn:contact-label", Some(&label_link), unbound),
+        probe("source urn:passkey:challenge", None, unbound),
+        probe(
+            "sink urn:passkey:register",
+            Some("code=x&id=YWJj&spki=YWJj"),
+            unbound,
         ),
-        "the approve link's page",
-    );
-    assert!(
-        shown.contains("Approve this request?"),
-        "the signed link verifies on this door:\n{shown}"
-    );
-
-    let mut probes = protected_probes();
-    for (command, body) in [
-        ("sink urn:calendar-request:approve", &approve),
-        ("sink urn:contact-block", &block_link),
-        ("sink urn:contact-label", &label_link),
-    ] {
-        probes.push(probe(command, Some(body), "urn:cap:space:out"));
-    }
-    // A relying party is configured, and still nothing enrolls: no window can be opened from
-    // this door, and a registration carries no code it could know (ledger #1689).
-    probes.push(probe(
-        "sink urn:passkey:register",
-        Some("code=x&id=YWJj&spki=YWJj"),
-        "no enrollment window is open",
-    ));
-
+    ];
+    probes.extend(general_surface_probes());
     for who in ["alice", "bob"] {
         assert_refused(&home, &certs, &target, who, &probes);
     }
@@ -1324,5 +1248,178 @@ fn a_layer_participant_with_a_valid_link_is_still_refused_by_its_own_capability(
         before,
         "nothing was dropped, recorded or enrolled under the door's file root"
     );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+// ---------------------------------------------------------------------------------------------
+// A layer door serves the layer spaces and nothing else. Its principals are collaborators whose
+// grants name layer verbs only, so the general served surface a public door carries (the intake
+// doors, the airlock spaces, the decision and block/label links, the passkey endpoints, the
+// host's own resources, the demo endpoints, the file module) is not bound on it at all: a name
+// it does not serve resolves nowhere, under every grant.
+// ---------------------------------------------------------------------------------------------
+
+/// Whether a manifold line names something a layer door serves: the layer families, and the
+/// kernel's own resources (the manifold itself), which every kernel answers under their own
+/// capabilities.
+fn on_a_layer_door(iri: &str) -> bool {
+    ["urn:layer:", "urn:layers:", "urn:collab:", "urn:kernel:"]
+        .iter()
+        .any(|family| iri.starts_with(family))
+}
+
+/// Every endpoint the general served surface binds that a participant could name, the ones a
+/// participant's grant would have reached first: each must resolve nowhere on a layer door.
+fn general_surface_probes() -> Vec<Probe> {
+    let link = "id=abcdefgh12&exp=99999999999&t=AAAA";
+    let unbound = "no endpoint resolved";
+    let mut probes = vec![
+        probe("source urn:passkey:challenge", None, unbound),
+        probe("source urn:passkey:register", None, unbound),
+        probe(
+            "sink urn:passkey:register",
+            Some("code=x&id=YWJj&spki=YWJj"),
+            unbound,
+        ),
+        probe("source urn:passkey:js", None, unbound),
+        probe("sink urn:calendar-request:approve", Some(link), unbound),
+        probe("sink urn:contact-block", Some(link), unbound),
+        probe("sink urn:contact-label", Some(link), unbound),
+        probe("source urn:host:identity", None, unbound),
+        probe("source urn:host:info", None, unbound),
+        probe("source urn:demo:greeter", None, unbound),
+        probe("source urn:data:page", None, unbound),
+        probe("source urn:time:now", None, unbound),
+    ];
+    // And every protected one, which no longer reaches its capability floor: it is not there.
+    probes.extend(
+        protected_probes()
+            .into_iter()
+            .filter(|p| !p.command.contains("urn:kernel:"))
+            .map(|p| Probe {
+                refused_with: unbound.to_string(),
+                ..p
+            }),
+    );
+    probes
+}
+
+/// A participant on a layer door reaches the layers and NOTHING else: every endpoint of the
+/// general served surface resolves nowhere (the passkey challenge and page, the decision and
+/// block/label links, the host's identity and info, the demo greeter among them), its manifold
+/// names only the layer families, a missing key's path is never in an answer, and the layers
+/// themselves still work. The banner says the door's surface is the layers.
+#[test]
+fn a_layer_door_serves_its_layers_and_nothing_else() {
+    let home = scratch("only");
+    let certs = certs(&home);
+    configure_layers(&home, &certs);
+    let files = home.join("files");
+    std::fs::create_dir_all(&files).unwrap();
+    let (_door, target, banner) = serve(&home, &certs, &[]);
+
+    let probes = general_surface_probes();
+    for who in ["alice", "bob"] {
+        assert_refused(&home, &certs, &target, who, &probes);
+        for p in &probes {
+            let out = ask(&home, &certs, who, &target, &p.command, p.stdin.as_deref());
+            let said = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                !said.contains(home.to_str().unwrap()) && !said.contains("public key"),
+                "{who}'s `{}` names no path and no key: {said}",
+                p.command
+            );
+        }
+        let manifold = ok(
+            ask(
+                &home,
+                &certs,
+                who,
+                &target,
+                "source urn:kernel:actions",
+                None,
+            ),
+            &format!("{who}'s manifold"),
+        );
+        let named: Vec<&str> = manifold
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("urn:"))
+            .collect();
+        assert!(
+            named.contains(&"urn:layer:talk:say"),
+            "{who}'s manifold was read:\n{manifold}"
+        );
+        for iri in named {
+            assert!(
+                on_a_layer_door(iri),
+                "{who}'s manifold names only the layer families, not {iri}:\n{manifold}"
+            );
+        }
+    }
+
+    // The layers themselves: a say is admitted and attributed, and each participant is told who
+    // the door minted it as.
+    let said = first_line(
+        ask(
+            &home,
+            &certs,
+            "bob",
+            &target,
+            "sink urn:layer:talk:say",
+            Some(&message("still served")),
+        ),
+        "bob says",
+    );
+    assert!(said.starts_with("urn:layer:talk:entry:"), "{said}");
+    let me = ok(
+        ask(
+            &home,
+            &certs,
+            "alice",
+            &target,
+            "source urn:layers:me as=application/json",
+            None,
+        ),
+        "alice's urn:layers:me",
+    );
+    assert!(me.contains(ALICE), "{me}");
+    assert_eq!(
+        files_under(&files),
+        BTreeSet::new(),
+        "nothing was written under the door's file root"
+    );
+    assert!(banner.contains("surface: layers;"), "{banner}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A layer door refuses to start with a ceiling that would open a face beside the layers
+/// (inference, the calendar, the governed eval) or with a mount, which would re-serve a peer's
+/// surface to every participant: either is a wider surface than the layers, and a layer door
+/// serves only its layers. It says why, and the same flags on a door without `layers/` serve.
+#[test]
+fn a_layer_door_refuses_a_face_or_a_mount_beside_its_layers() {
+    let home = scratch("faces");
+    let certs = certs(&home);
+    configure_layers(&home, &certs);
+    for extra in [
+        &["--cap", "urn:cap:net:localhost"][..],
+        &["--cap", "urn:cap:personal:calendar:read:freebusy"][..],
+        &["--cap", "urn:cap:lisp"][..],
+        &["--prefer", "urn:elsewhere:=quic://127.0.0.1:9"][..],
+    ] {
+        let (code, stderr) =
+            start_or_refuse(&home, &certs, extra).expect_err("a layer door serves only its layers");
+        assert_ne!(code, 0, "{extra:?}: {stderr}");
+        assert!(
+            stderr.contains("serves only its layers"),
+            "{extra:?}: the refusal says why: {stderr}"
+        );
+        assert!(!stderr.contains("serving on"), "{extra:?}: {stderr}");
+    }
     let _ = std::fs::remove_dir_all(&home);
 }
