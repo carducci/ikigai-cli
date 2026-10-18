@@ -26,7 +26,7 @@ immediately-ready (the `fn`/`fs`-localStorage demos), but it breaks the moment r
 work appears:
 
 - **HTTP** pins the driving thread for the whole round-trip (`ureq` blocks; the
-  `async` signatures don't yield). `compose` over several `urn:httpGet` markers runs
+  `async` signatures don't yield). `compose` over several `urn:http:get` markers runs
   them *sequentially* despite the existing `try_join_all`.
 - **Re-entrant `compose` on a bounded pool deadlocks** under `block_on`: a parent
   blocks a thread waiting for a child; fill the pool with parents and no thread is
@@ -395,7 +395,7 @@ thread it attached to, when it was queued vs attached, and whether it parked:
 trace urn:data:page                                         [scheduler pool:4]
 └─ urn:data:page             T0  q+0ms  a+0ms    2ms        [computed]
    ├─ urn:iki:fn:toUpper      T1  q+0ms  a+0ms    1ms        [computed]
-   ├─ urn:httpGet (api)       T2  q+0ms  a+0ms    PARK 84ms  [computed]   ← parked on I/O; T2 freed
+   ├─ urn:http:get (api)      T2  q+0ms  a+0ms    PARK 84ms  [computed]   ← parked on I/O; T2 freed
    └─ urn:data:about          T3  q+0ms  a+1ms    1ms        [cached]
       └─ urn:iki:fn:toUpper    T1  q+1ms  a+2ms    1ms        [cached]
    q = queued at · a = attached to a thread at · PARK = released its thread while awaiting

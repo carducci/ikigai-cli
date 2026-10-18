@@ -39,12 +39,12 @@
 //!   is in `ikigai-web`'s `negotiate`: a face the client named concretely is always handed
 //!   over, and `as` is withheld only for a client that named no face at all.
 //! - Every step is issued THROUGH the kernel (`inv.issue`), never called as a library:
-//!   `urn:httpGet` fetches, `urn:xslt:transform` styles, `urn:rdf:transrept` re-serializes,
+//!   `urn:http:get` fetches, `urn:xslt:transform` styles, `urn:rdf:transrept` re-serializes,
 //!   `urn:jsonld:compact` shortens. That is what makes the capability, the cache and the
 //!   golden threads propagate — the result is no fresher than the fetched document and
 //!   depends on the stylesheet and context files, so an edit to either on disk cuts the
 //!   derived face and nothing else.
-//! - **Authority IS the allowlist.** This endpoint does not validate `src`. `urn:httpGet`
+//! - **Authority IS the allowlist.** This endpoint does not validate `src`. `urn:http:get`
 //!   enforces `urn:cap:net:<host>[/<prefix>]` and owns redirect-following, re-running that
 //!   ACL against every hop, so `--cap urn:cap:net:w3id.org/people --cap
 //!   urn:cap:net:www.bosatsu.net/foaf` on the HTTP unit is the whole policy: a `src`
@@ -145,7 +145,7 @@ impl Endpoint for Foaf {
         //    ride along: the kernel meets this result's expiry with every dependency's.
         let doc = inv
             .issue(
-                Request::new(Verb::Source, iri("urn:httpGet"))
+                Request::new(Verb::Source, iri("urn:http:get"))
                     .with_arg("url", ArgRef::Inline(src.as_bytes().to_vec())),
             )
             .await?;
@@ -240,7 +240,7 @@ impl Endpoint for Foaf {
                     .default_value("false"),
             )
             // The net ACL is parameterized (`urn:cap:net:<host-rule>`); the wildcard form
-            // is the family, satisfied by any grant under it. The inner `urn:httpGet`
+            // is the family, satisfied by any grant under it. The inner `urn:http:get`
             // enforces the host.
             .requires("urn:cap:net:*");
         for face in FACES {

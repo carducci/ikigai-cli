@@ -2271,10 +2271,14 @@ impl ikigai_http::HttpTransport for UreqTransport {
     }
 }
 
-/// The HTTP-client module space (`urn:httpGet`…`urn:httpDelete`) on the native
+/// The HTTP-client module space (`urn:http:get`…`urn:http:delete`) on the native
 /// transport — mounted only on the *local* kernel for now, alongside the personal
 /// space, since outbound HTTP from a wire-served kernel awaits capability-on-the-wire.
-fn http_space() -> EndpointSpace {
+///
+/// Since ikigai-http 0.2 this is core's `Alias` overlay over the six bindings, so the
+/// deprecated `urn:httpGet`…`urn:httpDelete` IRIs still resolve, to the same cache entry
+/// and golden thread as the new names, until ikigai-http 0.3 removes them.
+fn http_space() -> impl Space {
     ikigai_http::space(Arc::new(UreqTransport))
 }
 
