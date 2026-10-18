@@ -86,6 +86,13 @@ serde_yaml = { version = "0.9", optional = true }
 sha2 = "0.10"
 base64 = "0.22"
 mime_guess = "2.0"
+# The ecosystem's one `Authorization` reader and base64 encoder (ledger #1857): the layers
+# front's `bearer()` reads its header through `ikigai_http::auth::scheme`, and the clipboard's
+# OSC-52 payload is `ikigai_http::base64::encode`, so neither carries a private copy. 0.2.1 is
+# the first release with the `auth` and `base64` modules, so it is this crate's floor, above
+# the workspace's 0.2.0 (which is ikigai-embedded's, and does not need them). Read the caret
+# as a RANGE: `^0.2.1` is `<0.3.0`.
+ikigai-http = "0.2.1"
 oxttl = { workspace = true }
 oxrdf = { workspace = true }
 # `layers save` refuses a file name that would arm something on the reader's machine, by the
