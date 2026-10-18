@@ -21,14 +21,22 @@ use ikigai_web::{CorsPolicy, Route, RouteTable};
 /// unbound, and before this the route then loaded with no ceiling at all, which is the
 /// server's default capability: fail-open. `?capCount` counts the cap triples on their own,
 /// so [`parse_route_solutions`] can refuse a route that has caps but reads as none.
+///
+/// The CORS lists (`ik:corsOrigin`, `ik:corsMethod`, `ik:corsHeader`) are read the same way,
+/// each with its own count. One IRI among them used to drop the whole list silently, and an
+/// empty method or header list is not "none allowed": it means the resource's own `Allow`
+/// list, or echo the requested headers, which is wider than what was authored.
 const ROUTE_QUERY: &str = r#"
 PREFIX ik: <https://ikigai-rs.dev/ns#>
 SELECT ?match ?target ?order ?csp ?corsCredentials ?corsMaxAge
        (GROUP_CONCAT(DISTINCT STR(?cap); SEPARATOR="\n") AS ?caps)
        (COUNT(DISTINCT ?cap) AS ?capCount)
-       (GROUP_CONCAT(DISTINCT ?corsOrigin; SEPARATOR="\n") AS ?corsOrigins)
-       (GROUP_CONCAT(DISTINCT ?corsMethod; SEPARATOR="\n") AS ?corsMethods)
-       (GROUP_CONCAT(DISTINCT ?corsHeader; SEPARATOR="\n") AS ?corsHeaders)
+       (GROUP_CONCAT(DISTINCT STR(?corsOrigin); SEPARATOR="\n") AS ?corsOrigins)
+       (COUNT(DISTINCT ?corsOrigin) AS ?corsOriginCount)
+       (GROUP_CONCAT(DISTINCT STR(?corsMethod); SEPARATOR="\n") AS ?corsMethods)
+       (COUNT(DISTINCT ?corsMethod) AS ?corsMethodCount)
+       (GROUP_CONCAT(DISTINCT STR(?corsHeader); SEPARATOR="\n") AS ?corsHeaders)
+       (COUNT(DISTINCT ?corsHeader) AS ?corsHeaderCount)
 WHERE {
   ?route a ik:Route ;
          ik:match  ?match ;
@@ -200,7 +208,8 @@ fn routes_from_value(v: &serde_json::Value) -> Result<RouteTable, String> {
 /// Fail-closed on capabilities: a solution whose `capCount` says the route has `ik:cap`
 /// values but whose `caps` yields none (a blank node has no string form and unbinds the
 /// aggregate; an empty literal concatenates to nothing) is a load ERROR, never a route
-/// without a ceiling.
+/// without a ceiling. The CORS lists get the same check against `corsOriginCount`,
+/// `corsMethodCount` and `corsHeaderCount`.
 pub fn parse_route_solutions(json: &[u8]) -> Result<RouteTable, String> {
     let v: serde_json::Value =
         serde_json::from_slice(json).map_err(|e| format!("route results are not JSON: {e}"))?;
@@ -235,9 +244,24 @@ pub fn parse_route_solutions(json: &[u8]) -> Result<RouteTable, String> {
             _ => continue,
         };
 
-        let origins = list("corsOrigins");
-        let methods = list("corsMethods");
-        let headers = list("corsHeaders");
+        let origins = counted(
+            &pattern,
+            "ik:corsOrigin",
+            list("corsOrigins"),
+            val("corsOriginCount"),
+        )?;
+        let methods = counted(
+            &pattern,
+            "ik:corsMethod",
+            list("corsMethods"),
+            val("corsMethodCount"),
+        )?;
+        let headers = counted(
+            &pattern,
+            "ik:corsHeader",
+            list("corsHeaders"),
+            val("corsHeaderCount"),
+        )?;
         let credentials = val("corsCredentials") == Some("true");
         let max_age = val("corsMaxAge")
             .and_then(|s| s.parse::<u32>().ok())
@@ -259,20 +283,7 @@ pub fn parse_route_solutions(json: &[u8]) -> Result<RouteTable, String> {
             None
         };
 
-        let caps = list("caps");
-        let cap_count = match val("capCount") {
-            None => 0,
-            Some(n) => n
-                .parse::<u64>()
-                .map_err(|_| format!("route `{pattern}`: `capCount` is not a count: `{n}`"))?,
-        };
-        if cap_count > 0 && caps.is_empty() {
-            return Err(format!(
-                "route `{pattern}` has {cap_count} `ik:cap` value(s) and none reads as a \
-                 capability (a blank node or an empty string?); refusing to load it without \
-                 its ceiling"
-            ));
-        }
+        let caps = counted(&pattern, "ik:cap", list("caps"), val("capCount"))?;
         routes.push(Route {
             pattern,
             iri_template,
@@ -282,6 +293,36 @@ pub fn parse_route_solutions(json: &[u8]) -> Result<RouteTable, String> {
         });
     }
     Ok(RouteTable::new(routes))
+}
+
+/// A `GROUP_CONCAT` list checked against its own `COUNT`: when the route has values for
+/// `prop` (`count` > 0) and none reads as a string (a blank node has no `STR`, which unbinds
+/// the aggregate; an empty literal concatenates to nothing), loading it without them would
+/// silently change what the route allows, so it is a load ERROR naming the route.
+fn counted(
+    pattern: &str,
+    prop: &str,
+    values: Vec<String>,
+    count: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let lost = if prop == "ik:cap" {
+        "its ceiling"
+    } else {
+        "that list"
+    };
+    let count = match count {
+        None => 0,
+        Some(n) => n
+            .parse::<u64>()
+            .map_err(|_| format!("route `{pattern}`: the `{prop}` count is not a count: `{n}`"))?,
+    };
+    if count > 0 && values.is_empty() {
+        return Err(format!(
+            "route `{pattern}` has {count} `{prop}` value(s) and none reads as a string (a \
+             blank node or an empty string?); refusing to load it without {lost}"
+        ));
+    }
+    Ok(values)
 }
 
 #[cfg(test)]
@@ -559,5 +600,98 @@ routes:
             panic!("a counted cap with no value loaded without its ceiling");
         };
         assert!(err.contains("/a"), "{err}");
+    }
+
+    /// The parser's half for a CORS list: a solution that counts origins but carries none.
+    #[test]
+    fn a_counted_cors_origin_with_no_value_is_refused_by_the_parser() {
+        let json = br#"{"head":{"vars":[]},"results":{"bindings":[
+          {"match":{"type":"literal","value":"/a"},"target":{"type":"literal","value":"urn:a"},
+           "corsOriginCount":{"type":"literal","value":"2",
+                       "datatype":"http://www.w3.org/2001/XMLSchema#integer"}}
+        ]}}"#;
+        let Err(err) = parse_route_solutions(json) else {
+            panic!("a counted origin with no value loaded without its list");
+        };
+        assert!(err.contains("/a") && err.contains("ik:corsOrigin"), "{err}");
+    }
+
+    // ---- The CORS lists: the same aggregate hazard as `ik:cap` ----------------------------
+
+    /// The CORS policy of the route matching `pattern`, its lists sorted.
+    fn cors_of(table: &RouteTable, pattern: &str) -> Option<CorsPolicy> {
+        let route = table.routes.iter().find(|r| r.pattern == pattern)?;
+        route.cors.clone().map(|mut c| {
+            c.allowed_origins.sort();
+            c.allowed_methods.sort();
+            c.allowed_headers.sort();
+            c
+        })
+    }
+
+    fn strings(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn literal_cors_lists_load() {
+        let table = load_turtle(
+            r#"<urn:test:route:a> a ik:Route ; ik:match "/a" ; ik:target "urn:a" ;
+                 ik:cors [ ik:corsOrigin "https://a.example" , "https://b.example" ;
+                           ik:corsMethod "GET" ; ik:corsHeader "x-one" ] ."#,
+        )
+        .expect("loads");
+        let cors = cors_of(&table, "/a").expect("a CORS policy");
+        assert_eq!(
+            cors.allowed_origins,
+            strings(&["https://a.example", "https://b.example"])
+        );
+        assert_eq!(cors.allowed_methods, strings(&["GET"]));
+        assert_eq!(cors.allowed_headers, strings(&["x-one"]));
+    }
+
+    /// `GROUP_CONCAT` over a set holding even one IRI leaves the WHOLE aggregate unbound, so
+    /// an origin authored as `<https://…>` silently dropped every origin on the route, and an
+    /// empty method or header list then means "the resource's own Allow list" or "echo the
+    /// requested headers": a WIDER policy than the one authored. `STR(…)` reads both.
+    #[test]
+    fn iri_cors_values_load_beside_literals() {
+        let table = load_turtle(
+            r#"<urn:test:route:a> a ik:Route ; ik:match "/a" ; ik:target "urn:a" ;
+                 ik:cors [ ik:corsOrigin <https://a.example> , "https://b.example" ;
+                           ik:corsMethod <urn:test:GET> , "POST" ;
+                           ik:corsHeader <urn:test:x-one> , "x-two" ] ."#,
+        )
+        .expect("loads");
+        let cors = cors_of(&table, "/a").expect("a CORS policy");
+        assert_eq!(
+            cors.allowed_origins,
+            strings(&["https://a.example", "https://b.example"])
+        );
+        assert_eq!(cors.allowed_methods, strings(&["POST", "urn:test:GET"]));
+        assert_eq!(cors.allowed_headers, strings(&["urn:test:x-one", "x-two"]));
+    }
+
+    /// A CORS list whose triples exist but read as no string (a blank node, an empty literal)
+    /// is a load error naming the route and the property, never a policy that silently lost
+    /// the list.
+    #[test]
+    fn a_cors_list_that_reads_as_nothing_is_a_load_error() {
+        for prop in ["ik:corsOrigin", "ik:corsMethod", "ik:corsHeader"] {
+            for (label, value) in [("a blank node", "[]"), ("an empty literal", r#""""#)] {
+                let body = format!(
+                    r#"<urn:test:route:ok> a ik:Route ; ik:match "/ok" ; ik:target "urn:ok" .
+                       <urn:test:route:bad> a ik:Route ; ik:match "/bad" ; ik:target "urn:bad" ;
+                         ik:cors [ {prop} {value} ; ik:corsMaxAge 600 ] ."#
+                );
+                let Err(err) = load_turtle(&body) else {
+                    panic!("{prop}, {label}: the route loaded without its list");
+                };
+                assert!(
+                    err.contains("/bad") && err.contains(prop),
+                    "{prop}, {label}: {err}"
+                );
+            }
+        }
     }
 }
