@@ -3018,6 +3018,7 @@ dependencies = [
  "ikigai-discovery",
  "ikigai-embedded",
  "ikigai-engine",
+ "ikigai-http",
  "ikigai-ipc",
  "ikigai-layers",
  "ikigai-mcp",
@@ -3227,11 +3228,12 @@ dependencies = [
 
 [[package]]
 name = "ikigai-http"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4a1600ec4e3de64e3fc87aec1ebc38d9313b42945d9ec01cd01846afa8be2ac"
+checksum = "f9d05f32ac83d00da7ef5c77d3e5b7b6a1155147b366115879a3cf98f3bcc50a"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "ikigai-core",
  "url",
 ]

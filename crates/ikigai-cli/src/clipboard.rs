@@ -73,33 +73,10 @@ fn emit_osc52(text: &str) {
 /// The OSC-52 sequence that sets the terminal's clipboard (`c`) to `text`:
 /// `ESC ] 52 ; c ; <base64> BEL`.
 fn osc52_sequence(text: &str) -> String {
-    format!("\x1b]52;c;{}\x07", base64(text.as_bytes()))
-}
-
-/// Standard (RFC 4648) base64 with padding — hand-rolled to keep the crate free
-/// of a base64 dependency for this one use.
-fn base64(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[(n >> 18 & 63) as usize] as char);
-        out.push(ALPHABET[(n >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[(n >> 6 & 63) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[(n & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
+    format!(
+        "\x1b]52;c;{}\x07",
+        ikigai_http::base64::encode(text.as_bytes())
+    )
 }
 
 /// Read the system clipboard, or `None` if no reader is available or it fails.
@@ -140,15 +117,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn base64_matches_known_vectors() {
-        // RFC 4648 examples, including the padding cases.
-        assert_eq!(base64(b""), "");
-        assert_eq!(base64(b"f"), "Zg==");
-        assert_eq!(base64(b"fo"), "Zm8=");
-        assert_eq!(base64(b"foo"), "Zm9v");
-        assert_eq!(base64(b"foob"), "Zm9vYg==");
-        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
-        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    fn osc52_payload_is_padded_standard_base64() {
+        // RFC 4648 examples, including the padding cases, through the shared encoder
+        // (ledger #1857), so a change of alphabet or padding there shows up here.
+        for (text, b64) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(
+                osc52_sequence(text),
+                format!("\x1b]52;c;{b64}\x07"),
+                "{text}"
+            );
+        }
     }
 
     #[test]

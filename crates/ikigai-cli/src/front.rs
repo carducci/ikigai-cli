@@ -68,6 +68,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ikigai_core::{ArgRef, Error, Iri, Kernel, Request, Verb};
+use ikigai_http::auth::Scheme;
 use ikigai_web::{EdgeConfig, HttpRequest, Response};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
@@ -274,11 +275,14 @@ pub fn route(req: &HttpRequest) -> Result<Routed, Response> {
     })
 }
 
-/// The token an `Authorization: Bearer <token>` header presents.
+/// The token an `Authorization: Bearer <token>` header presents, read through the shared
+/// header reader (ledger #1857): the scheme matches case-insensitively, and only SP and HTAB
+/// separate it from the token or pad the value (RFC 9110 §11.4).
 fn bearer(req: &HttpRequest) -> Option<&str> {
-    let value = req.header("authorization")?.trim();
-    let (scheme, token) = value.split_once(char::is_whitespace)?;
-    (scheme.eq_ignore_ascii_case("bearer") && !token.trim().is_empty()).then(|| token.trim())
+    match ikigai_http::auth::scheme(req.header("authorization")?) {
+        Some((Scheme::Bearer, token)) if !token.is_empty() => Some(token),
+        _ => None,
+    }
 }
 
 /// The `401` every authentication failure gets, whatever the reason: a stranger learns nothing
@@ -851,5 +855,10 @@ mod tests {
             assert_eq!(bearer(&with), None, "{value}");
         }
         assert_eq!(bearer(&req("GET", "/layers/me", &[], b"")), None);
+        // A tab separates and pads too; any other whitespace does not (RFC 9110 §11.4).
+        with.headers = vec![("authorization".into(), "Bearer\tiklt_abc\t".into())];
+        assert_eq!(bearer(&with), Some("iklt_abc"));
+        with.headers = vec![("authorization".into(), "Bearer\u{a0}iklt_abc".into())];
+        assert_eq!(bearer(&with), None);
     }
 }
