@@ -87,6 +87,7 @@ header of its own.
 | `Vary` | added to the names the door already varies on |
 | `Set-Cookie` | one header per line; only on an answer no cache can hold (a write, or an uncacheable read), and only at a door that adds `EndpointHeader::SetCookie` (it is not in the defaults) |
 | `Content-Disposition`, `Content-Language` | as given; left off a `304` |
+| `Location` | makes the answer `303 See Other` (Post/Redirect/Get); only on a write's answer, and only to a same-origin relative reference: an absolute path (`/…`, never `//…`) or a query alone (`?…`, resolved against the request's own path) |
 
 Everything else is refused: the hop-by-hop headers and the framing (`Connection`,
 `Transfer-Encoding`, `Content-Length`), and every header the door owns (`ETag`, `Allow`, the

@@ -34,7 +34,7 @@
 //! Replay of a *valid* token is harmless: deciding takes the pending tuple, so a second
 //! decision for the same booking finds nothing and says so.
 
-use crate::file_root;
+use crate::{file_root, prg};
 use base64::Engine;
 use ed25519_dalek::pkcs8::{spki::DecodePublicKey, DecodePrivateKey};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -519,23 +519,89 @@ fn show_body(id: &str, exp: i64, token: &str, verb_word: &str, note: &str) -> St
     )
 }
 
+/// The outcome words a decision POST redirects with (see [`crate::prg`]): the decision was
+/// recorded, the link did not verify, or the passkey step was missing. Beside them,
+/// [`prg::ALREADY`].
+const RECORDED: &str = "recorded";
+const INVALID: &str = "invalid";
+const PASSKEY: &str = "passkey";
+
+/// One answer for every kind of bad link.
+fn bad_link_page() -> Representation {
+    page(
+        "That link didn't work",
+        "<p>It may have expired, or already been used. You can still decide it on \
+         your Mac.</p>",
+    )
+}
+
+/// The page a decision POST redirects to: what happened, for the `action` in the path. Generic
+/// by design, since its URL carries no booking: it names the decision, never the booking or who
+/// asked for it. An unknown word is the bad-link page.
+fn outcome_page(action: &str, word: &str) -> Representation {
+    match word {
+        RECORDED => {
+            let what = match action {
+                "approve" => "Approved — the invitation goes out once your Mac picks this up.",
+                "approve-zoom" => {
+                    "Approved with Zoom — a meeting is scheduled and the invitation, with the \
+                     join link, goes out once your Mac picks this up."
+                }
+                "block" => "Blocked — this and future requests from that address are dropped.",
+                _ => "Declined — they'll be told, and asked to suggest other times.",
+            };
+            page("Recorded", &format!("<p>{what}</p>"))
+        }
+        prg::ALREADY => page(
+            "Already recorded",
+            "<p>This link's decision was recorded before. Nothing more was done.</p>",
+        ),
+        PASSKEY => page(
+            "Your passkey is needed",
+            "<p>This decision needs a tap on your registered device. Reopen the link and try \
+             again.</p>",
+        ),
+        _ => bad_link_page(),
+    }
+}
+
+/// The `outcome` a GET of the page may carry: the word a decision POST redirected with.
+fn outcome_spec(words: &[&str]) -> ArgSpec {
+    ArgSpec::new(prg::OUTCOME)
+        .optional()
+        .class(crate::XSD_STRING)
+        .one_of(words.iter().copied())
+        .summary(
+            "the outcome a decision POST redirected to (Post/Redirect/Get); with it, the page \
+             shows what happened and needs no link fields",
+        )
+}
+
 #[async_trait::async_trait]
 impl Endpoint for CalendarRequest {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         let action = action_of(inv);
+        // The page a decision POST redirected to (Post/Redirect/Get, ledger #1879): no token,
+        // so nothing to verify, and nothing in it but the outcome word.
+        if inv.request.verb == Verb::Source {
+            let word = param(inv, prg::OUTCOME);
+            if !word.is_empty() {
+                return Ok(outcome_page(&action, &word));
+            }
+        }
         let (id, token) = (param(inv, "id"), param(inv, "t"));
         let exp: i64 = param(inv, "exp").parse().unwrap_or(0);
 
         let key = verifying_key_at(&self.key_path)?;
-        if !token_valid(&id, &action, exp, &token, &key, now_secs()) {
+        let now = now_secs();
+        if !token_valid(&id, &action, exp, &token, &key, now) {
             // One answer for every kind of bad link — expired, forged, malformed, wrong
             // action. A prober learns nothing, and for a real person the cause is almost
             // always age.
-            return Ok(page(
-                "That link didn't work",
-                "<p>It may have expired, or already been used. You can still decide it on \
-                 your Mac.</p>",
-            ));
+            return Ok(match inv.request.verb {
+                Verb::Sink => prg::see_other(INVALID, bad_link_page()),
+                _ => bad_link_page(),
+            });
         }
 
         match inv.request.verb {
@@ -570,10 +636,13 @@ impl Endpoint for CalendarRequest {
                 // Passkey second factor — inert until a credential is enrolled, then required.
                 // The assertion rides in the POST body (pk_* fields the glue-JS adds).
                 if crate::passkey::require_passkey(inv).is_err() {
-                    return Ok(page(
-                        "Your passkey is needed",
-                        "<p>This decision needs a tap on your registered device. Reopen the \
-                         link and try again.</p>",
+                    return Ok(prg::see_other(PASSKEY, outcome_page(&action, PASSKEY)));
+                }
+                // Once per link: a second POST of the same decision records nothing.
+                if !prg::claim("calendar-request", &self.key_path, &token, exp, now)? {
+                    return Ok(prg::see_other(
+                        prg::ALREADY,
+                        outcome_page(&action, prg::ALREADY),
                     ));
                 }
                 let tuple = format!(
@@ -583,24 +652,20 @@ impl Endpoint for CalendarRequest {
                     quoted(&exp.to_string()),
                     quoted(&token)
                 );
-                inv.issue(
-                    Request::new(
-                        Verb::Sink,
-                        Iri::parse(DECISIONS_SPACE).expect("literal IRI"),
+                let dropped = inv
+                    .issue(
+                        Request::new(
+                            Verb::Sink,
+                            Iri::parse(DECISIONS_SPACE).expect("literal IRI"),
+                        )
+                        .with_arg("content", ArgRef::Inline(tuple.into_bytes())),
                     )
-                    .with_arg("content", ArgRef::Inline(tuple.into_bytes())),
-                )
-                .await?;
-                let what = match action.as_str() {
-                    "approve" => "Approved — the invitation goes out once your Mac picks this up.",
-                    "approve-zoom" => {
-                        "Approved with Zoom — a meeting is scheduled and the invitation, with the \
-                         join link, goes out once your Mac picks this up."
-                    }
-                    "block" => "Blocked — this and future requests from that address are dropped.",
-                    _ => "Declined — they'll be told, and asked to suggest other times.",
-                };
-                Ok(page("Recorded", &format!("<p>{what}</p>")))
+                    .await;
+                if let Err(e) = dropped {
+                    prg::release("calendar-request", &self.key_path, &token);
+                    return Err(e);
+                }
+                Ok(prg::see_other(RECORDED, outcome_page(&action, RECORDED)))
             }
             other => Err(Error::Endpoint(format!(
                 "a calendar request is shown with Source or decided with Sink, not {other:?}"
@@ -622,7 +687,7 @@ impl Endpoint for CalendarRequest {
             )
             .action(
                 ActionSpec::new(Verb::Source)
-                    .summary("show — what this link would decide")
+                    .summary("show — what this link would decide, or what a decision did")
                     .input(action_binding())
                     .input(
                         ArgSpec::new("id")
@@ -656,6 +721,7 @@ impl Endpoint for CalendarRequest {
                     // On the ACTION: an explicit `ActionSpec` is taken WHOLE by
                     // `action_specs()`, which never folds the flat `.output()` below into
                     // it — so the flat declaration alone left both faces unannounced.
+                    .input(outcome_spec(&[RECORDED, prg::ALREADY, INVALID, PASSKEY]))
                     .output("text/html; charset=utf-8"),
             )
             .action(
@@ -691,7 +757,9 @@ impl Endpoint for CalendarRequest {
                                  when they are not named arguments",
                             ),
                     )
-                    .output("text/html; charset=utf-8"),
+                    // Every POST answers Post/Redirect/Get: the outcome page wrapped in an
+                    // ikigai-web entity envelope whose `Location` makes it a `303` (ledger #1879).
+                    .output(prg::HTTP_ENTITY),
             )
             .output("text/html; charset=utf-8")
     }
@@ -1184,6 +1252,28 @@ mod endpoint_tests {
             "offers a POST button: {html}"
         );
         assert!(w.dropped().is_empty(), "a GET must record nothing");
+    }
+
+    /// ★ Ledger #1879: the POST answers Post/Redirect/Get (a `Location` to the outcome, which
+    /// carries no booking), and the same link POSTed again records nothing more.
+    #[test]
+    fn a_post_redirects_to_its_outcome_and_a_replay_acts_once() {
+        let w = world("prg");
+        let (exp, token) = w.valid("decline");
+        let first = w.call(Verb::Sink, "decline", ID, exp, &token);
+        assert!(first.starts_with("Content-Type: text/html"), "{first}");
+        assert!(
+            first.contains("\r\nLocation: ?outcome=recorded\r\n"),
+            "{first}"
+        );
+        assert!(!first.contains(ID), "the outcome names no booking: {first}");
+        let again = w.call(Verb::Sink, "decline", ID, exp, &token);
+        assert!(
+            again.contains("\r\nLocation: ?outcome=already\r\n"),
+            "{again}"
+        );
+        assert!(again.contains("Already recorded"), "{again}");
+        assert_eq!(w.dropped().len(), 1, "the replay dropped nothing");
     }
 
     #[test]

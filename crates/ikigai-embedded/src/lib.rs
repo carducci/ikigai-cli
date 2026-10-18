@@ -64,6 +64,7 @@ pub mod layers;
 pub mod lisp;
 pub mod passkey;
 pub mod people;
+mod prg;
 // `urn:host:posture` — what THIS PROCESS composed at startup (mounts, trusted client
 // certificates, surface, ceiling), and the one place the startup banner's mount and client
 // lines are rendered. A module rather than another block in this file because the doors in
