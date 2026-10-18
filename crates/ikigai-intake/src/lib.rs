@@ -646,6 +646,15 @@ impl Endpoint for IntakeEndpoint {
             "the submission itself: a urlencoded or JSON body carrying the fields \
                      above (a form POST's body, or a pipeline's upstream value)",
         ));
+        // ★ …and the fields ARRIVE INSIDE IT: an argument ENVELOPE with `content` as its
+        // carrier (ledger #1885, argspec design note 5.2). Declared, every projection reads the
+        // contract instead of guessing: MCP's input schema and ikigai-web's OpenAPI body show
+        // the fields, never `content` as a field of its own body, and an MCP call that gives
+        // the fields is serialized into `content` as one JSON object, which `parse_body`
+        // reads. Core's checker holds a call to the fields' rules when it gives fields and to
+        // the carrier's when it gives the body whole (a form POST, a pipe), and refuses one
+        // that gives both. Nothing changes for a caller that sends the body.
+        action = action.envelope("content");
         // ★ THE FACE IS A FUNCTION OF `redirect`, and it is declared ON THE ACTION.
         //
         // Two things this one line gets wrong if written the obvious way. First, a
@@ -913,6 +922,21 @@ mod tests {
                 "the ACTION's declaration — the one a consumer of the manifold reads"
             );
         }
+    }
+
+    /// ★ Ledger #1885: the fields arrive INSIDE `content`, and the action says so as an
+    /// argument envelope, so a projection shows the fields as the body's and `content` as no
+    /// field of its own. A body-only call (a form POST, a pipe) is what the checker holds to the
+    /// carrier, and it conforms.
+    #[test]
+    fn the_sink_declares_its_fields_an_envelope_carried_in_content() {
+        let specs = submit(config()).describe().action_specs();
+        assert_eq!(
+            specs[0].arguments,
+            ikigai_core::Arguments::Envelope("content".to_string())
+        );
+        let body_only = ikigai_core::ProposedArgs::parse("content=name%3DA");
+        assert!(specs[0].check(&body_only).is_empty());
     }
 
     #[test]

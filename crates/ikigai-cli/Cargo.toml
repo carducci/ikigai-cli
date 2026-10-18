@@ -160,3 +160,7 @@ base64 = "0.22"
 # does in the binary, because what an aggregate does with an IRI `ik:cap` is the query's behavior,
 # not the parser's (ledger #30). Already in the graph through ikigai-embedded; no new package.
 ikigai-sparql = { workspace = true }
+# `tests/intake_envelope.rs` builds an intake and reads its contract through the two projections
+# that meet here, MCP's input schema and ikigai-web's OpenAPI (ledger #1885). Already in the graph
+# through ikigai-embedded, and published before this crate in the lockstep release.
+ikigai-intake = { workspace = true }
