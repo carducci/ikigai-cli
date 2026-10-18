@@ -932,12 +932,11 @@ mod tests {
         assert!(is_tool_name(&"x".repeat(MAX_TOOL_NAME)));
 
         // Every id in the live shapes projects to a certified name that parses back.
-        for id in [
-            "echo",
-            "urn:llm:config",
-            "meeting",
-            "browse-explain-versions",
-        ] {
+        // These are ids the host really binds, read from the locked releases: `echo`
+        // (core's builtins), `llm-config` (ikigai-llm 0.15), `meeting` (ikigai-meeting
+        // 0.3) and `browse-explain-versions` (ikigai-browse 0.18.10). A URI-shaped id is
+        // the next test's subject, not a live one.
+        for id in ["echo", "llm-config", "meeting", "browse-explain-versions"] {
             let name = checked_tool_name(id, Verb::Source).expect(id);
             assert!(is_tool_name(&name), "{name}");
             assert_eq!(parse_tool_name(&name).unwrap().0, sanitize_id(id));

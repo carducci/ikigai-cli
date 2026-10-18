@@ -6625,10 +6625,10 @@ pub fn trusted_kernel_with_mounts(nature: &'static str, mounts: Vec<MountSpec>) 
 /// personal space**: the door resolves every request under the operator's `--cap`
 /// ceiling (or the public, empty capability), so `urn:personal:*` stays off it.
 ///
-/// The chain — `urn:httpGet`, `urn:rdf:transrept`, `urn:xslt:transform`, `urn:jsonld:*`
+/// The chain — `urn:http:get`, `urn:rdf:transrept`, `urn:xslt:transform`, `urn:jsonld:*`
 /// — was bound only in the embedded root until 2026-09-09; `served_space` had none of
 /// it, so an endpoint issuing through it resolved to nothing on the edge even though the
-/// binary linked every crate. Binding it here widens REACH, not authority: `urn:httpGet`
+/// binary linked every crate. Binding it here widens REACH, not authority: `urn:http:get`
 /// is default-deny without a `urn:cap:net:<host>` grant, the transreptors are pure, and
 /// a stylesheet or context read runs under the caller's capability. Under `--routes-only`
 /// (the edge's posture) an un-routed path never reaches any of them: the route table is
@@ -6678,7 +6678,7 @@ pub fn kernel_for_with_mounts(nature: &'static str, mounts: Vec<MountSpec>) -> K
         //
         // `Expiry::At(deadline)` is meaningless to a kernel that cannot ask what time it is,
         // so the kernel treats such a result as live and recomputes on every request. The
-        // door binds `http_space()`, and `urn:httpGet` turns an origin's
+        // door binds `http_space()`, and `urn:http:get` turns an origin's
         // `Cache-Control: max-age` into exactly that expiry — so the FOAF face re-fetched
         // `src=` from w3id.org on every hit, and `urn:time:now` recomputed per render tick.
         // `kernel()`'s own doc comment has said why the clock is there since it was written;
