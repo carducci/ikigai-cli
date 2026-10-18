@@ -9289,9 +9289,10 @@ mod tests {
     /// since 0.1.20 the intake declares `content` — the urlencoded or JSON body the fields
     /// are actually parsed out of — because a mutating action that does not declare where
     /// its payload arrives is undrivable from a pipe or a manifold. That input belongs to
-    /// the TRANSPORT, not to the form (`ikigai-web` reserves both `as` and `content` on the
-    /// way in and no longer projects them on the way out), so a reader asking "what does the
-    /// form ask for" must not see it. `content_is_declared_and_is_last` holds the other half.
+    /// the TRANSPORT, not to the form (the action declares it the carrier of an argument
+    /// envelope, ledger #1885, so MCP and ikigai-web project the fields and not `content`), so a
+    /// reader asking "what does the form ask for" must not see it.
+    /// `content_is_declared_and_is_last` holds the other half.
     fn offered_fields() -> Vec<String> {
         ikigai_intake::submit(booking_intake())
             .describe()

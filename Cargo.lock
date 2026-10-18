@@ -3019,6 +3019,7 @@ dependencies = [
  "ikigai-embedded",
  "ikigai-engine",
  "ikigai-http",
+ "ikigai-intake",
  "ikigai-ipc",
  "ikigai-layers",
  "ikigai-mcp",
