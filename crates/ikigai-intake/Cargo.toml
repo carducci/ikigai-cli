@@ -9,6 +9,8 @@ repository.workspace = true
 
 [dependencies]
 ikigai-core = { workspace = true }
+# `ikigai_fn::html`: the redirect shim escapes and checks its URL with the shared rule (ledger #1868).
+ikigai-fn = { workspace = true }
 async-trait = "0.1"
 serde_json = { workspace = true }
 # The IANA time-zone database, so a submitted zone is checked against real tzdata at the

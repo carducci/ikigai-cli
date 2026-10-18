@@ -1094,7 +1094,11 @@ ikigai-vocab = "0.1.98" # 0.1.98 = core 0.1.98's lockstep release, past the YANK
 # CEILING. The lock alone was holding `ikigai-fn` at 0.2.0 and shipping a manifold that
 # contradicted itself. Refresh the lock when you touch these, and diff the lock FILE.
 # The reusable function library, linked in as a published module crate.
-ikigai-fn = "0.4.1" # 0.4.1 = the 0.4 line names its `space()` `urn:iki:space:fn` (ledger #987), so `answered_by`,
+ikigai-fn = "0.5.0" # 0.5.0 = `ikigai_fn::html` (`html_text`, `attr`, `url_segment`, `safe_href`), the one
+# escaper and link check every page this host builds from data calls (ledger #1868, replacing intake's
+# `html_escape`, ikigai-web's error-page escape and two `urlencode` copies). A floor by API. Behavior change
+# with it: compose's `$h{…}` (and `html_text`) maps a C0 control other than tab, LF and CR to U+FFFD.
+# Beneath it, still true: 0.4.1 = the 0.4 line names its `space()` `urn:iki:space:fn` (ledger #987), so `answered_by`,
 # `urn:kernel:topology` and `urn:diagram:*` show that name where this host mounts it plain, and
 # the cache partitions under it. Under 0.x the old caret was a CEILING below the named release. ⚠
 # `base_space` EXTENDS `ikigai_fn::space()` with `bind`, and core 0.1.89 drops the name there, so

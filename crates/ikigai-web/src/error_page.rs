@@ -5,6 +5,7 @@
 //! accessible HTML page; anything else (curl's `*/*`, a script asking for JSON, no `Accept`
 //! at all) gets it as `text/plain`, exactly as before. The status is the same either way.
 use crate::{bare_media, match_of, parse_accept, MatchedBy, Resp};
+use ikigai_fn::html::html_text;
 
 /// Answer `resp` as the client asked, when it is an error whose body is a plain sentence:
 /// rewritten as a page for a client that asks for HTML, and in either case marked `Vary:
@@ -49,34 +50,18 @@ fn wants_html(accept: Option<&str>) -> bool {
 /// </html>
 /// ```
 pub(crate) fn page(status: u16, reason: &str, message: &str) -> String {
-    let title = escape(format!("{status} {reason}").trim());
+    let title = html_text(format!("{status} {reason}").trim());
     let message = message.trim();
     let paragraph = if message.is_empty() {
         String::new()
     } else {
-        format!("<p>{}</p>", escape(message))
+        format!("<p>{}</p>", html_text(message))
     };
     format!(
         "<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <title>{title}</title></head>\n<body><main><h1>{title}</h1>{paragraph}</main></body>\n</html>\n"
     )
-}
-
-/// Escape text for an HTML element or attribute value.
-fn escape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -115,5 +100,28 @@ mod tests {
         assert!(!html.contains("<script>"), "{html}");
         // An empty sentence is a heading alone.
         assert!(!page(431, "Request Header Fields Too Large", "").contains("<p>"));
+    }
+
+    /// The escape is `ikigai_fn::html::html_text` (ledger #1868): a C0 control other than tab,
+    /// line feed and carriage return becomes U+FFFD, so the page stays parseable as XML too, and
+    /// a `javascript:` URL in the message is text, never a link.
+    #[test]
+    fn a_control_character_in_the_message_becomes_u_fffd() {
+        let html = page(
+            400,
+            "Bad Request",
+            "bad\u{0}byte\u{1b}[31m\there \"javascript:alert(1)\"",
+        );
+        assert!(
+            html.contains(
+                "<p>bad\u{FFFD}byte\u{FFFD}[31m\there &quot;javascript:alert(1)&quot;</p>"
+            ),
+            "{html}"
+        );
+        assert!(
+            !html.contains('\u{0}') && !html.contains('\u{1b}'),
+            "{html}"
+        );
+        assert!(!html.contains("href"), "{html}");
     }
 }

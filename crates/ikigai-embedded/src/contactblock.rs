@@ -90,7 +90,7 @@ use ikigai_core::{
     ActionSpec, ArgRef, ArgSpec, Description, Endpoint, Error, Invocation, Iri, ReprType,
     Representation, Request, Result, Verb,
 };
-use ikigai_intake::html_escape;
+use ikigai_fn::html::{attr, html_text};
 
 /// Mint a block or label link. Held by the edge daemon (where the enquiry email is composed).
 pub const CAP_CONTACTBLOCK_MINT: &str = "urn:cap:contactblock:mint";
@@ -481,18 +481,13 @@ fn bad_link() -> Representation {
 fn confirm_form(fields: &[(&str, &str)], button: &str) -> String {
     let hidden: String = fields
         .iter()
-        .map(|(name, value)| {
-            format!(
-                "<input type=hidden name={name} value=\"{}\">",
-                html_escape(value)
-            )
-        })
+        .map(|(name, value)| format!("<input type=hidden name={name} value=\"{}\">", attr(value)))
         .collect();
     format!(
         "<form method=\"post\" id=\"act\">{hidden}\
          <button>{}</button>\
          </form>",
-        html_escape(button)
+        html_text(button)
     )
 }
 
@@ -542,7 +537,7 @@ impl Endpoint for ContactBlock {
                          silently.{teaches}</p>{form}\
                          <p class=muted>They are told nothing; from their side the form \
                          still accepts. You can undo this on the box.</p>{js}",
-                        shown = html_escape(&email),
+                        shown = html_text(&email),
                         form = confirm_form(&fields, "Block"),
                         js = crate::passkey::DECISION_PASSKEY_JS,
                     ),
@@ -575,7 +570,7 @@ impl Endpoint for ContactBlock {
                     &format!(
                         "<p>Enquiries from <code>{}</code> will be dropped once the edge \
                          picks this up — usually at once.</p>",
-                        html_escape(&email)
+                        html_text(&email)
                     ),
                 ))
             }
@@ -703,7 +698,7 @@ impl Endpoint for ContactLabel {
             )
         };
         // Escaped anyway, so the page does not depend on the gate above (ledger #1516).
-        let short = html_escape(&enquiry[..12]);
+        let short = html_text(&enquiry[..12]);
 
         match inv.request.verb {
             Verb::Source => {
@@ -1223,6 +1218,31 @@ mod endpoint_tests {
             "{form}"
         );
         assert!(form.contains(">Go &amp; &lt;b&gt;</button>"), "{form}");
+    }
+
+    /// Through `ikigai_fn::html` (ledger #1868): a C0 control in a value or the button becomes
+    /// U+FFFD, and a hostile value (`javascript:`, quotes, a `<script>`) stays text inside its
+    /// quoted attribute. The form builds no `href` from data, so nothing can become a link.
+    #[test]
+    fn the_confirm_form_maps_controls_and_keeps_a_hostile_value_inert() {
+        let form = confirm_form(
+            &[
+                ("t", "x\u{0}y\u{7}z"),
+                ("email", "javascript:alert(1)'\"><script>"),
+            ],
+            "Go\u{1b}",
+        );
+        assert!(
+            form.contains("name=t value=\"x\u{FFFD}y\u{FFFD}z\""),
+            "{form}"
+        );
+        assert!(form.contains("<button>Go\u{FFFD}</button>"), "{form}");
+        assert!(
+            form.contains("name=email value=\"javascript:alert(1)&#39;&quot;&gt;&lt;script&gt;\""),
+            "{form}"
+        );
+        assert!(!form.contains("<script>"), "{form}");
+        assert!(!form.contains("href="), "{form}");
     }
 
     #[test]

@@ -5763,19 +5763,9 @@ fn booking_url() -> String {
         .unwrap_or_else(|_| "https://www.bosatsu.net/book.html".to_string())
 }
 
-/// Percent-encode a query VALUE (RFC 3986 unreserved set kept, everything else escaped).
-fn urlencode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for b in value.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
+// Percent-encode a query VALUE (RFC 3986 unreserved set kept, everything else escaped):
+// `ikigai_fn::html::url_segment` (ledger #1868), the same encoder the link pages use.
+use ikigai_fn::html::url_segment as urlencode;
 
 /// A URL-safe opaque token. 16 bytes of OS randomness, hex — inside the alphabet and
 /// length `ikigai_intake::token_shaped` will accept.

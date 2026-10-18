@@ -183,19 +183,9 @@ pub(crate) fn parse_signing_key(bytes: &[u8]) -> std::result::Result<SigningKey,
     SigningKey::from_pkcs8_der(bytes).map_err(|e| format!("not a PKCS8 Ed25519 key: {e}"))
 }
 
-/// Percent-encode a query VALUE (RFC 3986 unreserved kept).
-pub(crate) fn urlencode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for b in value.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
+// Percent-encode a query VALUE (RFC 3986 unreserved kept): the ecosystem's one encoder,
+// `ikigai_fn::html::url_segment` (ledger #1868), under the name this module's callers use.
+pub(crate) use ikigai_fn::html::url_segment as urlencode;
 
 /// Percent-decode a form value over BYTES.
 ///
@@ -515,7 +505,7 @@ fn action_of(inv: &Invocation<'_>) -> String {
 /// Every interpolated value is escaped (ledger #1516). The shape gate keeps markup out of a link
 /// that verifies today, but the page must not depend on a check that lives somewhere else.
 fn show_body(id: &str, exp: i64, token: &str, verb_word: &str, note: &str) -> String {
-    let esc = ikigai_intake::html_escape;
+    use ikigai_fn::html::html_text as esc;
     let (id, token, verb_word, note) = (esc(id), esc(token), esc(verb_word), esc(note));
     format!(
         "<p>Booking <code>{id}</code>.</p>\
@@ -915,6 +905,37 @@ mod tests {
             body.contains("name=t value=\"t&quot;&gt;&lt;i&gt;z&lt;/i&gt;\""),
             "a quote cannot close the attribute: {body}"
         );
+    }
+
+    /// The page escapes through `ikigai_fn::html::html_text` (ledger #1868): a C0 control other
+    /// than tab, line feed and carriage return becomes U+FFFD, and a hostile value (quotes, a
+    /// `<script>`, a `javascript:` URL) stays text inside its attribute. The page builds no
+    /// `href` from data at all, so the `javascript:` URL has no link to become.
+    #[test]
+    fn the_show_page_maps_controls_and_keeps_a_hostile_value_inert() {
+        let body = show_body(
+            "a\u{1}b\u{1b}c\td",
+            EXP,
+            "javascript:alert(1)\"><script>alert('x')</script>",
+            "Approve",
+            "a note",
+        );
+        assert!(
+            body.contains("<code>a\u{FFFD}b\u{FFFD}c\td</code>"),
+            "controls as U+FFFD, tab kept: {body}"
+        );
+        assert!(
+            !body.contains('\u{1}') && !body.contains('\u{1b}'),
+            "{body}"
+        );
+        assert!(!body.contains("<script>"), "{body}");
+        assert!(
+            body.contains(
+                "name=t value=\"javascript:alert(1)&quot;&gt;&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;\""
+            ),
+            "{body}"
+        );
+        assert!(!body.contains("href=\"javascript:"), "{body}");
     }
 
     #[test]
