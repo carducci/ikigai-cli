@@ -5580,7 +5580,7 @@ mod mount_cert_tests {
         let spec = resolve_one_mount(mounts.remove(0)).expect("the expanded socket dials");
         let entries = spec.resolver.entries().expect("the peer lists its catalog");
         assert!(
-            entries.iter().any(|e| e.endpoint == "toUpper"),
+            entries.iter().any(|e| e.endpoint == "to-upper"),
             "the mount reached the peer at the expanded path: {entries:?}"
         );
         let _ = std::fs::remove_file(&path);
@@ -5629,7 +5629,7 @@ mod mount_cert_tests {
             .entries()
             .expect("entries() dials the live peer");
         assert!(
-            entries.iter().any(|e| e.endpoint == "toUpper"),
+            entries.iter().any(|e| e.endpoint == "to-upper"),
             "the peer's catalog is visible without any prior resolution: {entries:?}"
         );
         let _ = std::fs::remove_file(&path);

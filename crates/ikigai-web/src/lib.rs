@@ -6275,8 +6275,11 @@ mod tests {
         ] {
             let out = get(addr, "/test/faces", accept).await;
             assert!(out.starts_with("HTTP/1.1 200 "), "{who}: {out}");
+            // The adapter forces no `as`, so the kernel fills the DECLARED default before
+            // the endpoint runs (core 0.1.105, ledger #19): the default face is
+            // `text/plain`, spelled out, where the fixture once fell back to its own word.
             assert!(
-                out.ends_with("default"),
+                out.ends_with("text/plain"),
                 "{who} gets the default face: {out}"
             );
             let out = get(addr, "/test/plain-only", accept).await;
