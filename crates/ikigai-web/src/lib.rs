@@ -1889,8 +1889,9 @@ fn merge_json(target: &mut serde_json::Value, patch: &serde_json::Value) {
 }
 
 /// Check `If-Match` / `If-None-Match` against the resource's current state (fetched via
-/// `Source` under the same cap). Returns `Some(resp)` to short-circuit (412/403), or
-/// `None` if the precondition holds and the write should proceed.
+/// `Source` under the same cap). Returns `Some(resp)` to short-circuit (412, or the read's
+/// own failure status when the state could not be read: 403, 503, …), or `None` if the
+/// precondition holds and the write should proceed.
 async fn check_write_precondition(
     config: &EdgeConfig,
     kernel: &Kernel,
@@ -1904,13 +1905,15 @@ async fn check_write_precondition(
         .await
     {
         Ok(repr) => Some(etag_of(&served_content(repr))),
-        Err(ikigai_core::Error::NotFound(_)) => None,
-        // Can't read to verify (denied) — surface that rather than guessing.
-        Err(ikigai_core::Error::Denied(m)) => {
-            return Some(error_resp(config, &ikigai_core::Error::Denied(m)))
-        }
-        // Any other read failure: treat as "can't confirm existence" → absent.
-        Err(_) => None,
+        // Only an answer that SAYS the resource is absent is absent: the bound endpoint's
+        // NotFound, or no endpoint bound at all.
+        Err(ikigai_core::Error::NotFound(_) | ikigai_core::Error::Unresolved(_)) => None,
+        // Any other failure (denied, a transient Unavailable or Timeout, an endpoint error)
+        // means the state could not be read, and a precondition cannot be judged against a
+        // state nobody read. Answer the failure's own status and write nothing (ledger
+        // #1883): counting it as "absent" let a create-only `If-None-Match: *` write over a
+        // resource whose store was briefly unavailable.
+        Err(e) => return Some(error_resp(config, &e)),
     };
     let failed = |detail: &str| Some(Resp::text(412, "Precondition Failed", detail));
 
@@ -3765,6 +3768,30 @@ mod tests {
                 .verb(Verb::Source)
                 .verb(Verb::Sink),
         );
+        // A resource whose backing store is briefly unavailable (ledger #1883): it exists
+        // ("v1"), but its FIRST Source answers the transient `Unavailable`, as a store
+        // between connections would. A Sink replaces the state, so a write that slipped past
+        // a precondition shows on the next read.
+        let flaky_state = std::sync::Arc::new(std::sync::Mutex::new(b"v1".to_vec()));
+        let flaky_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flaky = FnEndpoint::new("flaky", move |inv: &Invocation<'_>| {
+            if inv.request.verb == Verb::Source {
+                if flaky_down.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    return Err(Error::Unavailable("the store is reconnecting".into()));
+                }
+                let state = flaky_state.lock().unwrap().clone();
+                Ok(Representation::new(ReprType::new("text/plain"), state))
+            } else {
+                let body = inv.inline_arg("content").unwrap_or_default().to_vec();
+                *flaky_state.lock().unwrap() = body.clone();
+                Ok(Representation::new(ReprType::new("text/plain"), body))
+            }
+        })
+        .with_description(
+            Description::new("flaky")
+                .verb(Verb::Source)
+                .verb(Verb::Sink),
+        );
         // A resource that exists once: first Delete succeeds, later Deletes → NotFound.
         let present = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let vanishing = FnEndpoint::new("vanishing", move |_inv: &Invocation<'_>| {
@@ -4067,6 +4094,7 @@ mod tests {
             .bind(Exact::new("urn:test:missing"), missing)
             .bind(Exact::new("urn:test:doc"), doc)
             .bind(Exact::new("urn:test:newdoc"), newdoc)
+            .bind(Exact::new("urn:test:flaky"), flaky)
             .bind(Exact::new("urn:test:vanishing"), vanishing)
             .bind(Exact::new("urn:test:ghost"), ghost)
             .bind(Exact::new("urn:test:tuples"), tuples)
@@ -5006,6 +5034,52 @@ mod tests {
         )
         .await;
         assert!(resp.starts_with("HTTP/1.1 204"), "got: {resp}");
+    }
+
+    /// ★ Ledger #1883. A create-only write (`If-None-Match: *`) whose read of the current
+    /// state fails TRANSIENTLY must not go ahead: the resource may well exist, and the read
+    /// only failed to say so. It answers the failure's own status (503 for `Unavailable`) and
+    /// writes nothing. It used to count any failed read as "absent", so the write ran over
+    /// the existing state.
+    #[tokio::test]
+    async fn if_none_match_star_under_a_transient_read_failure_refuses_and_writes_nothing() {
+        let addr = start().await;
+        let resp = roundtrip(
+            addr,
+            "PUT /test/flaky HTTP/1.1\r\nHost: x\r\nIf-None-Match: *\r\nContent-Length: 2\r\n\r\nv2",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+            "got: {resp}"
+        );
+        let after = roundtrip(addr, "GET /test/flaky HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(
+            after.ends_with("\r\n\r\nv1"),
+            "nothing was written: {after}"
+        );
+    }
+
+    /// …and `If-Match` the same way (ledger #1883): a transient read failure is not "the
+    /// resource is absent, so the precondition failed" (a 412 telling the caller its state is
+    /// stale when nothing was compared). It answers 503 and writes nothing.
+    #[tokio::test]
+    async fn if_match_under_a_transient_read_failure_answers_the_failure_and_writes_nothing() {
+        let addr = start().await;
+        let resp = roundtrip(
+            addr,
+            "PUT /test/flaky HTTP/1.1\r\nHost: x\r\nIf-Match: *\r\nContent-Length: 2\r\n\r\nv2",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+            "got: {resp}"
+        );
+        let after = roundtrip(addr, "GET /test/flaky HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(
+            after.ends_with("\r\n\r\nv1"),
+            "nothing was written: {after}"
+        );
     }
 
     #[tokio::test]
