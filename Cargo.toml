@@ -91,8 +91,78 @@ members = ["crates/*"]
 # whose tree version is ahead of crates.io. ⚠ So this comment names NO crate as
 # behind or ahead — that was a snapshot of the registry, true for one afternoon
 # and wrong the next, in the most authoritative place in the tree. Ask the gate.
-# 0.1.63: THE CONFORMANCE 0.8 WAVE, ARGUMENT HELP, THE SPAM FILTER AND ONE-SPACE READS.
-# Stacks on 0.1.62, which is already on crates.io; nothing unpublished sits beneath it.
+# 0.1.64: THE RENAMED MODULE RELEASES, ROUTE LOADERS THAT READ IRIS, ENROLLMENT AND A LIVE TRUST LIST.
+# Stacks on 0.1.63, which is already on crates.io (its `.cargo_vcs_info.json` names `960f2d1`).
+# Nothing unpublished sits beneath it. It carries PRs #503-#541.
+# ⚠ Published as a patch in the lockstep 0.1 line, but three changes break a narrow use of the
+# library API: `ikigai_web::SecurityHeaders` gains a `pub coop` field (PR #535) and `EdgeConfig`
+# gains `endpoint_headers` (PR #516), so a struct literal without `..Default::default()` stops
+# compiling; and `ikigai_mcp::serve_io`'s `output` now needs `Send` (PR #527). No ikigai repo
+# does either (re-checked across ~/git-personal for this release: every literal ends
+# `..EdgeConfig::default()`, and nothing outside this workspace calls `serve_io`).
+# Operators, read these first:
+# - The http IRIs are renamed (PR #539, ikigai-http 0.2, with llm 0.15, meeting 0.3, secret 0.2,
+#   browse 0.18.10 and linkeddata 0.2.6): `urn:http:get` ... `urn:http:delete`. The old
+#   `urn:httpGet` ... `urn:httpDelete` still resolve, as aliases to the same cache entry and golden
+#   thread, until ikigai-http 0.3 removes them. Module endpoint ids follow (`http-get` ...
+#   `http-delete`, `secret`, `meeting`).
+# - The RDF route loader reads `ik:cap` (PR #540) and the CORS lists `ik:corsOrigin`,
+#   `ik:corsMethod`, `ik:corsHeader` (PR #541) as a literal OR an IRI. Before, one IRI value
+#   silently dropped the whole list; for `ik:cap` that loaded the route with the server's default
+#   capability. A route whose values exist but read as nothing (a blank node, an empty literal)
+#   is now a load error naming the route. ⚠ This must ship before ikigai-core 0.1.105, which
+#   makes `ik:cap` an IRI in JSON-LD.
+# - `serve quic://... --require-enrollment` (PR #537): the door refuses to start without a
+#   `clients.json`. ⚠ An unenrolled pinned client is now refused: a trusted certificate with no
+#   entry in `clients.json` is refused whatever `default` says, and removing an entry refuses that
+#   client at its next connection (PR #536). `default` now serves only enrolled entries, which may
+#   leave `grant` out to take it.
+# - Pinned client certificates honor their validity window (PR #537): one before its `notBefore`
+#   or after its `notAfter` is refused at the handshake. Certificates our own tools mint are valid
+#   1975-4096, so none of them is refused.
+# - The trust list (`client.crt` and `clients/*.crt` under `--cert-dir`) is re-read at every
+#   handshake (PR #536): a certificate added is trusted, and one removed refused, at its next
+#   connection, with no restart. A list that does not read trusts nobody until it reads again.
+# - `EdgeConfig::html_door([origin])` (PR #535): a one-call preset for a door that serves HTML,
+#   with an Origin check on every non-GET/HEAD/OPTIONS request and a page CSP, nosniff,
+#   no-referrer and COOP. Opt-in: no existing door changes.
+# - A layer door serves only the layer spaces (bd9a4f5).
+# - Passkey enrollment takes a one-time code (PR #528): `sink urn:passkey:enroll-open` prints a
+#   code that must be typed on `/passkey/register`. A window opened by an older binary closes.
+# Doors:
+# - PR #529: the passkey challenge store is bounded; per-client rate limits at the HTTP door.
+# - PR #530: an IPC door refuses a live server's socket, caps connections, and times out silent
+#   ones. PR #506: it binds before its banner (`bind`, `serve_on`, `serve_shared`). PR #511: its
+#   `urn:host:info` reports Remote (IPC).
+# - PR #525: a QUIC door answers a connection's calls concurrently, up to 16 per connection.
+#   PR #527: `ikigai mcp` runs each `tools/call` on its own thread, up to 16.
+# - PR #531: a repeated named argument is refused at every door instead of keeping one value.
+# - PR #512: every door watches the workspace, so a file replaced on disk is served fresh.
+# - PR #513: a mount never caches a peer's answer, so a cut on the peer reaches it; PR #514 pins
+#   what that costs (`urn:kernel:uncached` names the mounted read). PR #515: a mount reads its
+#   peer's contract once per name per TTL (`CONTRACT_TTL`).
+# HTTP (`ikigai-web`):
+# - PR #516: endpoint response headers (`with_headers`), error pages, and HEAD with no body on
+#   every path. PR #508: HEAD names the length GET sends. PR #517, #519: `write_response` checks a
+#   door's own headers and status line; the layers front answers HEAD; `refuse_busy` is public over
+#   any stream. PR #520: no `Content-Length` on a 204 or a 304.
+# Pages, intray and plans:
+# - PR #503: public link pages escape every interpolated value. PR #509: the alias prelude escapes
+#   with `ikigai_fn::escape_markers`. PR #522: `lang` and `main` on the embedded pages, live
+#   passkey status, `NO_COLOR` in the TUI.
+# - PR #518: a staged intray tuple always has its whole note, and a rescan drains every inbox.
+#   PR #532: triple-term nesting is bounded at the intray space and the plan doors. PR #533: the
+#   plan walk is iterative and a plan's size is bounded before SHACL (`MAX_PLAN_TRIPLES`, 4096).
+# - PR #505: a file-watcher rescan cuts every cached file read.
+# The cli:
+# - PR #524: `ikigai layers post brief|issue|file` and `ikigai layers save`. PR #534: `layers save`
+#   refuses names that arm something on the reader's machine, and defaults to Downloads.
+# - PR #510: an unresolved name reports the running build; `--version --verbose` lists the linked
+#   crates. PR #507: help names the transports a build lacks.
+# - Tests and docs only: PRs #504, #514, #521, #523, #526, #538.
+#
+# 0.1.63 was THE CONFORMANCE 0.8 WAVE, ARGUMENT HELP, THE SPAM FILTER AND ONE-SPACE READS.
+# Stacked on 0.1.62, which was already on crates.io; nothing unpublished sits beneath it.
 # A patch: every API change below is additive, and no consumer has to adapt.
 # - PR #497 (the 2026-10-14 conformance wave): `urn:tz:convert` with neither `in` nor a piped
 #   `content` is refused as a typed `MissingArgument("in")`, and a present but unreadable `in`
@@ -798,7 +868,7 @@ members = ["crates/*"]
 #
 # 0.1.36 was THE SECURITY RELEASE from the review-value experiment (ledger #723, #733, #741, #738).
 #
-version = "0.1.63"
+version = "0.1.64"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -1741,17 +1811,17 @@ ikigai-bayes = "0.1.0"
 # that reconciles personal/org/rdf THROUGH the kernel. Published since 0.1.14 (#296):
 # ikigai-embedded depends on it, and a path-only dependency makes every crate above it
 # in this workspace unpublishable, the `ikigai` binary included.
-ikigai-view = { path = "crates/ikigai-view", version = "0.1.63" }
+ikigai-view = { path = "crates/ikigai-view", version = "0.1.64" }
 # Timezone conversion (urn:tz:convert, IANA/DST-correct) + a zoned clock (urn:tz:now).
 # Published since 0.1.14 (#296); keeps the tzdata dependency out of the lean modules.
-ikigai-tz = { path = "crates/ikigai-tz", version = "0.1.63" }
+ikigai-tz = { path = "crates/ikigai-tz", version = "0.1.64" }
 # The intray / tuplespace (urn:space:{name}: out/rd). Published since 0.1.14 (#296);
 # a dir-backed space under file_root. The scheduling booking-inbox drops into it.
-ikigai-intray = { path = "crates/ikigai-intray", version = "0.1.63" }
+ikigai-intray = { path = "crates/ikigai-intray", version = "0.1.64" }
 # Outbound email (urn:email:send): a cap-gated Sink submitting over SMTP to a local MTA
 # that relays onward. Published since 0.1.14 (#296); the contact service and the
 # scheduling confirm-link both need it.
-ikigai-email = { path = "crates/ikigai-email", version = "0.1.63" }
+ikigai-email = { path = "crates/ikigai-email", version = "0.1.64" }
 # Public form intake (urn:*:submit): parse an untrusted urlencoded/JSON body, validate
 # declared fields, drop an escaped s-expr tuple into a space. Contact + booking share it.
 # API history — 0.1.17 = `IntakeField::max_len` and `IntakeField::legacy` (#300, the bounded
@@ -1763,9 +1833,9 @@ ikigai-email = { path = "crates/ikigai-email", version = "0.1.63" }
 # the caret resolves against the registry — `^0.1.14` picked the live 0.1.16, which
 # predates both methods, and ikigai-embedded failed to verify with four E0599s. Nothing
 # else catches this: the gates pass, CI passes, and the break waits for release day.
-ikigai-intake = { path = "crates/ikigai-intake", version = "0.1.63" }
+ikigai-intake = { path = "crates/ikigai-intake", version = "0.1.64" }
 # WebAuthn (ES256) assertion verifier: the second factor gating the edge decision links.
-ikigai-passkey = { path = "crates/ikigai-passkey", version = "0.1.63" }
+ikigai-passkey = { path = "crates/ikigai-passkey", version = "0.1.64" }
 # Sibling workspace crates pinned to the current release: a published crate requires
 # its siblings at this version too, so ANY subset of the workspace can publish in
 # dependency order (resolve → wire → engine → …) and a crate never builds against an
@@ -1773,15 +1843,15 @@ ikigai-passkey = { path = "crates/ikigai-passkey", version = "0.1.63" }
 # — `crates/ikigai-cli/tests/lockstep_pins.rs` enforces it here — and says nothing
 # about the REGISTRY, which only matches the tree after a full wave. The two parted for
 # weeks without anything saying so (ledger #494); `registry-drift` is what says so now.
-ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.1.63" } # naming_entry: the most specific catalog row names a target (the engine's trace labels use it)
-ikigai-wire = { path = "crates/ikigai-wire", version = "0.1.63" } # v6 hello + ErrorTyped/WireError
+ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.1.64" } # naming_entry: the most specific catalog row names a target (the engine's trace labels use it)
+ikigai-wire = { path = "crates/ikigai-wire", version = "0.1.64" } # v6 hello + ErrorTyped/WireError
 # API history — 0.1.16 = `Spawner::width()`: the scheduler answers how many tasks make progress AT ONCE
 # (1 for `single`), which is what the engine's fan-out routing sizes itself by. Core
 # defaults that method to `None` = unknown, and a caller reading unknown as "wide" is the
 # ~1.8x-slower case — so below this floor the routing is silently inert, not merely older.
 # API history — 0.1.15 = SchedulerSpec: a spec parsed WITHOUT building, so `--scheduler pool:xyz` is
 # rejected while argv is read instead of by spawning a threadpool to find out.
-ikigai-scheduler = { path = "crates/ikigai-scheduler", version = "0.1.63" }
+ikigai-scheduler = { path = "crates/ikigai-scheduler", version = "0.1.64" }
 # ⚠⚠ EXEMPT from the lockstep above — deliberately, and this pin must NOT be raised to the
 # workspace version. ikigai-time is the eighteenth member and the only one that does not take
 # `version.workspace = true`: it declares its own `version` in its own manifest and is
@@ -1813,7 +1883,7 @@ ikigai-scheduler = { path = "crates/ikigai-scheduler", version = "0.1.63" }
 ikigai-time = { path = "crates/ikigai-time", version = "0.4.2" }
 # Inbound HTTP transport (method↔verb, path↔iri, cap-per-request). A published
 # transport like ipc/quic/mcp; only the `web`-featured CLI pulls it (and Tokio).
-ikigai-web = { path = "crates/ikigai-web", version = "0.1.63" }
+ikigai-web = { path = "crates/ikigai-web", version = "0.1.64" }
 futures = "0.3"
 # Turtle parsing for the engine's plan face — reading a stored `ik:Process` graph back.
 # Default features only: no tokio, so `ikigai-engine` still compiles to wasm. oxttl pins
