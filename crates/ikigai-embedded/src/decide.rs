@@ -399,8 +399,38 @@ pub struct CalendarRequest {
     pub key_path: std::path::PathBuf,
 }
 
-/// A small self-contained page. No stylesheet to fetch — this renders on a phone, once,
-/// probably on cellular, and it should not depend on anything else being up.
+/// Where the page shell's stylesheet is served: the mechanical path of [`PAGE_CSS_IRI`], so a door
+/// with no route table serves it as it stands, and a `--routes-only` door needs one route line
+/// (`/decide/css` → `urn:decide:css`).
+pub const PAGE_CSS_PATH: &str = "/decide/css";
+
+/// The resource the page shell's stylesheet is: [`PageCss`].
+pub const PAGE_CSS_IRI: &str = "urn:decide:css";
+
+/// The one stylesheet every page through [`page`] links: the decision, contact-block, label and
+/// passkey pages. It holds what used to be inline `style=` attributes, unchanged in value, so
+/// the pages look as they did, and the pages carry no inline style at all: an HTML door's CSP
+/// (`style-src 'self'`, ikigai-web's `HTML_DOOR_CSP`, ledger #1834) admits a same-origin
+/// stylesheet and refuses every `style=` attribute and `<style>` element. The edge's default
+/// CSP (`default-src 'self'`) refuses them too, so a browser was already dropping the inline
+/// styles there.
+///
+/// The muted color is the `--muted` token by its UX-conventions name; `#666` on white is 5.7:1.
+/// The class names are this module's own, used by [`show_body`], `contactblock`'s pages and
+/// `passkey`'s.
+const PAGE_CSS: &str = "\
+:root{--muted:#666}
+body{font:16px/1.5 system-ui;margin:3rem auto;max-width:32rem;padding:0 1rem}
+h1{font-size:1.3rem}
+button{font:inherit;padding:.6rem 1.2rem}
+.field{font:inherit;padding:.4rem;width:100%;max-width:20rem}
+.muted{color:var(--muted)}
+";
+
+/// A small page. It links one same-origin stylesheet ([`PAGE_CSS_PATH`]) and carries no inline
+/// style, so it renders under an HTML door's CSP. It renders on a phone, once, probably on
+/// cellular, so the stylesheet is tiny and served by the same door as the page; if it fails to
+/// load, the page is still a readable, working form in the browser's defaults.
 ///
 /// It states its language and holds its heading and body in one `<main>` (ACCESSIBILITY.md,
 /// ledger #1624). `title` and `body` go in as markup, unescaped: escaping an interpolated value
@@ -412,11 +442,45 @@ pub(crate) fn page(title: &str, body: &str) -> Representation {
             "<!doctype html><html lang=\"en\">\
              <meta name=viewport content=\"width=device-width,initial-scale=1\">\
              <title>{title}</title>\
-             <body style=\"font:16px/1.5 system-ui;margin:3rem auto;max-width:32rem;padding:0 1rem\">\
-             <main><h1 style=\"font-size:1.3rem\">{title}</h1>{body}</main></body></html>"
+             <link rel=stylesheet href=\"{PAGE_CSS_PATH}\">\
+             <body><main><h1>{title}</h1>{body}</main></body></html>"
         )
         .into_bytes(),
     )
+}
+
+/// Serves the pages' stylesheet (`PAGE_CSS`) as a same-origin `text/css` file, so an HTML door's
+/// `style-src 'self'` admits it. `X-Content-Type-Options: nosniff` is set on the door, so the type
+/// must be right.
+pub struct PageCss;
+
+#[async_trait::async_trait]
+impl Endpoint for PageCss {
+    async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
+        Ok(Representation::new(
+            ReprType::new("text/css").with_param("charset", "utf-8"),
+            PAGE_CSS.as_bytes().to_vec(),
+        ))
+    }
+    fn name(&self) -> &str {
+        "decide-css"
+    }
+    fn describe(&self) -> Description {
+        Description::new("decide-css")
+            .title("The decision pages' stylesheet")
+            .summary(
+                "The same-origin stylesheet the decision, contact-block, label and passkey pages \
+                 link, so they carry no inline style.",
+            )
+            // On the ACTION, as `passkey-js` declares its face: an explicit `ActionSpec` is
+            // taken whole, so a flat `.output()` alone is invisible to the manifold's actions.
+            .action(
+                ActionSpec::new(Verb::Source)
+                    .summary("the stylesheet")
+                    .output("text/css; charset=utf-8"),
+            )
+            .output("text/css; charset=utf-8")
+    }
 }
 
 /// The action this resource IS, from the last segment of its own IRI
@@ -459,8 +523,8 @@ fn show_body(id: &str, exp: i64, token: &str, verb_word: &str, note: &str) -> St
          <input type=hidden name=id value=\"{id}\">\
          <input type=hidden name=exp value=\"{exp}\">\
          <input type=hidden name=t value=\"{token}\">\
-         <button style=\"font:inherit;padding:.6rem 1.2rem\">{verb_word}</button>\
-         </form><p style=\"color:#666\">{note}</p>{js}",
+         <button>{verb_word}</button>\
+         </form><p class=muted>{note}</p>{js}",
         js = crate::passkey::DECISION_PASSKEY_JS,
     )
 }
@@ -724,6 +788,22 @@ impl Endpoint for DecideAccept {
     }
 }
 
+/// Test-only: `html` carries no inline style, neither a `style=` attribute nor a `<style>`
+/// element, which an HTML door's `style-src 'self'` refuses (ledger #1834). Shared by the page
+/// tests here, in `contactblock` and in `passkey`.
+#[cfg(test)]
+pub(crate) fn assert_no_inline_style(html: &str) {
+    let lower = html.to_ascii_lowercase();
+    assert!(
+        !lower.contains("style="),
+        "an inline style= attribute: {html}"
+    );
+    assert!(
+        !lower.contains("<style"),
+        "an inline <style> element: {html}"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,7 +843,56 @@ mod tests {
             html.contains("width=device-width,initial-scale=1"),
             "{html}"
         );
-        assert!(html.contains("max-width:32rem"), "{html}");
+        // The width cap moved to the stylesheet with the rest of the inline styles (ledger #1834).
+        assert!(PAGE_CSS.contains("max-width:32rem"), "{PAGE_CSS}");
+    }
+
+    /// Ledger #1834 (UX conventions D6/D12): the page shell carries no inline style, so an HTML
+    /// door's `style-src 'self'` CSP renders it as written; its look is one linked same-origin
+    /// stylesheet instead, which defines every class the pages use.
+    #[test]
+    fn the_page_shell_links_its_stylesheet_and_carries_no_inline_style() {
+        for html in [
+            String::from_utf8(page("Approve this request?", "<p>the body</p>").bytes).unwrap(),
+            show_body(ID, EXP, "tok", "Approve", "a note"),
+        ] {
+            assert_no_inline_style(&html);
+        }
+        let html = String::from_utf8(page("t", "").bytes).unwrap();
+        assert_eq!(
+            html.matches(&format!("<link rel=stylesheet href=\"{PAGE_CSS_PATH}\">"))
+                .count(),
+            1,
+            "{html}"
+        );
+        let head = &html[..html.find("<body>").expect("a body")];
+        assert!(
+            head.contains("<link rel=stylesheet"),
+            "linked in the head: {html}"
+        );
+        // The mechanical path of the IRI (`/decide/css` ⇄ `urn:decide:css`), so a door with no
+        // route table serves it too.
+        assert_eq!(
+            PAGE_CSS_IRI,
+            format!("urn{}", PAGE_CSS_PATH.replace('/', ":"))
+        );
+        for class in [".muted{", ".field{", "button{", "h1{", "body{"] {
+            assert!(PAGE_CSS.contains(class), "{class} is styled: {PAGE_CSS}");
+        }
+    }
+
+    #[test]
+    fn the_stylesheet_is_served_as_text_css() {
+        let kernel = ikigai_core::Kernel::new(std::sync::Arc::new(
+            ikigai_core::EndpointSpace::new().bind(ikigai_core::Exact::new(PAGE_CSS_IRI), PageCss),
+        ));
+        let rep = futures::executor::block_on(kernel.issue(
+            Request::new(Verb::Source, Iri::parse(PAGE_CSS_IRI).unwrap()),
+            &ikigai_core::Capability::root(),
+        ))
+        .expect("the stylesheet resolves");
+        assert_eq!(rep.repr_type.canonical(), "text/css;charset=utf-8");
+        assert_eq!(rep.bytes, PAGE_CSS.as_bytes());
     }
 
     /// Ledger #1516: every value the SHOW page interpolates is escaped, in text and in an
@@ -1024,6 +1153,8 @@ mod endpoint_tests {
         let (exp, token) = w.valid("approve");
         let html = w.call(Verb::Source, "approve", ID, exp, &token);
         assert!(html.contains("Approve this request?"), "{html}");
+        // No inline style, so it renders under an HTML door's CSP (ledger #1834).
+        assert_no_inline_style(&html);
         // The page a phone opens from the email: its language and its one landmark (ledger #1624).
         assert!(html.contains("<html lang=\"en\">"), "{html}");
         assert_eq!(html.matches("<main>").count(), 1, "{html}");

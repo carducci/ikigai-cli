@@ -490,7 +490,7 @@ fn confirm_form(fields: &[(&str, &str)], button: &str) -> String {
         .collect();
     format!(
         "<form method=\"post\" id=\"act\">{hidden}\
-         <button style=\"font:inherit;padding:.6rem 1.2rem\">{}</button>\
+         <button>{}</button>\
          </form>",
         html_escape(button)
     )
@@ -540,7 +540,7 @@ impl Endpoint for ContactBlock {
                     &format!(
                         "<p>Future enquiries from <code>{shown}</code> will be dropped, \
                          silently.{teaches}</p>{form}\
-                         <p style=\"color:#666\">They are told nothing; from their side the form \
+                         <p class=muted>They are told nothing; from their side the form \
                          still accepts. You can undo this on the box.</p>{js}",
                         shown = html_escape(&email),
                         form = confirm_form(&fields, "Block"),
@@ -718,7 +718,7 @@ impl Endpoint for ContactLabel {
                     title,
                     &format!(
                         "<p>{effect}</p><p>Enquiry <code>{short}</code>.</p>{form}\
-                         <p style=\"color:#666\">The sender is told nothing. Clicking the other \
+                         <p class=muted>The sender is told nothing. Clicking the other \
                          link in the email later changes the label.</p>{js}",
                         form = confirm_form(&fields, button),
                         js = crate::passkey::DECISION_PASSKEY_JS,
@@ -1234,6 +1234,8 @@ mod endpoint_tests {
         let html = w.call(Verb::Source, EMAIL, exp, &token);
         assert!(html.contains("Block this sender?"), "{html}");
         assert!(html.contains(EMAIL), "{html}");
+        // No inline style, so it renders under an HTML door's CSP (ledger #1834).
+        crate::decide::assert_no_inline_style(&html);
         assert!(
             html.contains("method=\"post\""),
             "offers a POST button: {html}"
@@ -1369,6 +1371,7 @@ mod endpoint_tests {
             .unwrap();
         assert!(get.contains("Not spam?"), "{get}");
         assert!(get.contains("method=\"post\""), "{get}");
+        crate::decide::assert_no_inline_style(&get);
         assert!(w.dropped().is_empty(), "a GET must record nothing");
 
         // POST records exactly one label tuple naming the enquiry by id.

@@ -1703,6 +1703,10 @@ fn served_space(nature: &'static str) -> EndpointSpace {
         // which forbids inline scripts) admits it — the decision + register pages carry only a
         // `<script src="/passkey/app.js">` tag.
         .bind(Exact::new("urn:passkey:js"), passkey::PasskeyJs)
+        // The pages' stylesheet, served same-origin for the same reason (ledger #1834): the
+        // decision, contact-block, label and passkey pages carry no inline style, only a
+        // `<link rel=stylesheet href="/decide/css">`, so a `style-src 'self'` CSP admits them.
+        .bind(Exact::new(decide::PAGE_CSS_IRI), decide::PageCss)
         // Attribution for handed-out links. The edge grants `urn:cap:client:read` and
         // nothing filesystem-shaped, so this can name a client and do nothing else.
         .bind(

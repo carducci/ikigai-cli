@@ -707,7 +707,7 @@ pub fn is_enrolled() -> bool {
 /// markup so it exists before the script writes a message into it: a screen reader announces a
 /// change to a region it already knows. `#666` on white is 5.7:1.
 pub(crate) const DECISION_PASSKEY_JS: &str = "<p id=pkstatus role=status aria-live=polite \
-     style=\"color:#666\"></p><script src=\"/passkey/app.js\"></script>";
+     class=muted></p><script src=\"/passkey/app.js\"></script>";
 
 /// The registration page body: a labeled field for the window's one-time code, and a button
 /// (wired by `PASSKEY_APP_JS` via `id="reg"`) that runs `navigator.credentials.create`, then
@@ -715,9 +715,9 @@ pub(crate) const DECISION_PASSKEY_JS: &str = "<p id=pkstatus role=status aria-li
 /// region, like [`DECISION_PASSKEY_JS`]'s.
 const REGISTER_PAGE_BODY: &str = r#"<p>Create a passkey for this site — your device will ask you to confirm with Face/Touch ID.</p>
 <p><label for=code>One-time code (shown at the box when the window was opened)</label><br>
-<input id=code name=code autocomplete=one-time-code autocapitalize=characters spellcheck=false required style="font:inherit;padding:.4rem;width:100%;max-width:20rem"></p>
-<button id=reg style="font:inherit;padding:.6rem 1.2rem">Create passkey</button>
-<p id=status role=status aria-live=polite style="color:#666"></p>
+<input id=code name=code autocomplete=one-time-code autocapitalize=characters spellcheck=false required class=field></p>
+<button id=reg>Create passkey</button>
+<p id=status role=status aria-live=polite class=muted></p>
 <script src="/passkey/app.js"></script>"#;
 
 /// What `/passkey/register` shows on an edge started without `--passkey-rp-id`.
@@ -1436,6 +1436,18 @@ mod tests {
                 "the script writes #{id}"
             );
         }
+    }
+
+    /// Ledger #1834: the passkey pages' bodies carry no inline style (their look is the shell's
+    /// linked stylesheet), so they render under an HTML door's `style-src 'self'` CSP.
+    #[test]
+    fn the_passkey_bodies_carry_no_inline_style() {
+        for html in [DECISION_PASSKEY_JS, REGISTER_PAGE_BODY, NOT_CONFIGURED_BODY] {
+            crate::decide::assert_no_inline_style(html);
+        }
+        // The classes they use are the stylesheet's.
+        assert!(REGISTER_PAGE_BODY.contains("class=field"));
+        assert!(DECISION_PASSKEY_JS.contains("class=muted"));
     }
 
     const RP_ID: &str = "edge.test";

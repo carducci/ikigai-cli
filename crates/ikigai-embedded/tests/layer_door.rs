@@ -109,11 +109,12 @@ fn ask(kernel: &Kernel, verb: Verb, iri: &str) -> Result<(), Error> {
 
 /// What the general served surface answers and a layer door must not: every endpoint the
 /// security review reached on a layer door, and the protected ones beside them.
-const PROBES: [(Verb, &str); 20] = [
+const PROBES: [(Verb, &str); 21] = [
     (Verb::Source, "urn:passkey:challenge"),
     (Verb::Source, "urn:passkey:register"),
     (Verb::Sink, "urn:passkey:register"),
     (Verb::Source, "urn:passkey:js"),
+    (Verb::Source, "urn:decide:css"),
     (Verb::Sink, "urn:calendar-request:approve"),
     (Verb::Sink, "urn:contact-block"),
     (Verb::Sink, "urn:contact-label"),
