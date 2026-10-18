@@ -14,10 +14,18 @@ use ikigai_web::{CorsPolicy, Route, RouteTable};
 /// One row per `ik:Route`; multi-valued fields (`ik:cap`, the CORS lists) are folded with
 /// `GROUP_CONCAT` (newline-separated) so each route is a single solution. Ordered by
 /// `ik:order` so first-match-wins is deterministic.
+///
+/// ★ `ik:cap` is read as `STR(?cap)`, so a capability authored as a literal
+/// (`ik:cap "urn:cap:…"`) and one authored as an IRI (`ik:cap <urn:cap:…>`) both load
+/// (ledger #30). `GROUP_CONCAT` over a set holding even one IRI leaves the WHOLE aggregate
+/// unbound, and before this the route then loaded with no ceiling at all, which is the
+/// server's default capability: fail-open. `?capCount` counts the cap triples on their own,
+/// so [`parse_route_solutions`] can refuse a route that has caps but reads as none.
 const ROUTE_QUERY: &str = r#"
 PREFIX ik: <https://ikigai-rs.dev/ns#>
 SELECT ?match ?target ?order ?csp ?corsCredentials ?corsMaxAge
-       (GROUP_CONCAT(DISTINCT ?cap; SEPARATOR="\n") AS ?caps)
+       (GROUP_CONCAT(DISTINCT STR(?cap); SEPARATOR="\n") AS ?caps)
+       (COUNT(DISTINCT ?cap) AS ?capCount)
        (GROUP_CONCAT(DISTINCT ?corsOrigin; SEPARATOR="\n") AS ?corsOrigins)
        (GROUP_CONCAT(DISTINCT ?corsMethod; SEPARATOR="\n") AS ?corsMethods)
        (GROUP_CONCAT(DISTINCT ?corsHeader; SEPARATOR="\n") AS ?corsHeaders)
@@ -188,6 +196,11 @@ fn routes_from_value(v: &serde_json::Value) -> Result<RouteTable, String> {
 }
 
 /// Parse SPARQL SELECT results (`application/sparql-results+json`) into a [`RouteTable`].
+///
+/// Fail-closed on capabilities: a solution whose `capCount` says the route has `ik:cap`
+/// values but whose `caps` yields none (a blank node has no string form and unbinds the
+/// aggregate; an empty literal concatenates to nothing) is a load ERROR, never a route
+/// without a ceiling.
 pub fn parse_route_solutions(json: &[u8]) -> Result<RouteTable, String> {
     let v: serde_json::Value =
         serde_json::from_slice(json).map_err(|e| format!("route results are not JSON: {e}"))?;
@@ -247,6 +260,19 @@ pub fn parse_route_solutions(json: &[u8]) -> Result<RouteTable, String> {
         };
 
         let caps = list("caps");
+        let cap_count = match val("capCount") {
+            None => 0,
+            Some(n) => n
+                .parse::<u64>()
+                .map_err(|_| format!("route `{pattern}`: `capCount` is not a count: `{n}`"))?,
+        };
+        if cap_count > 0 && caps.is_empty() {
+            return Err(format!(
+                "route `{pattern}` has {cap_count} `ik:cap` value(s) and none reads as a \
+                 capability (a blank node or an empty string?); refusing to load it without \
+                 its ceiling"
+            ));
+        }
         routes.push(Route {
             pattern,
             iri_template,
@@ -399,5 +425,139 @@ routes:
         // A non-file resource has no local mtime to poll.
         assert_eq!(watch_path("urn:web:routes", root), None);
         assert_eq!(watch_path("https://example.com/routes.ttl", root), None);
+    }
+
+    // ---- The RDF face through the real `urn:sparql:select` (ledger #30, step 1) ----------
+    //
+    // The tests above hand `parse_route_solutions` canned results, so they cannot see what the
+    // QUERY does with an `ik:cap` value. These run `ROUTE_QUERY` through ikigai-sparql exactly
+    // as `load_route_table` does in the binary, over a Turtle route graph that a fixture
+    // endpoint serves at `urn:test:routes`.
+
+    /// `load_route_table` over the Turtle `body` (the `ik:` prefix is supplied).
+    fn load_turtle(body: &str) -> Result<RouteTable, String> {
+        use ikigai_core::{Exact, FnEndpoint, Invocation, ReprType, Representation};
+        let ttl = format!("@prefix ik: <https://ikigai-rs.dev/ns#> .\n{body}");
+        let doc = FnEndpoint::new("routes-fixture", move |_inv: &Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("text/turtle"),
+                ttl.clone().into_bytes(),
+            ))
+        });
+        let kernel = Kernel::new(std::sync::Arc::new(
+            ikigai_sparql::space().bind(Exact::new("urn:test:routes"), doc),
+        ));
+        futures::executor::block_on(load_route_table(
+            &kernel,
+            "urn:test:routes",
+            &Capability::root(),
+        ))
+    }
+
+    /// The sorted caps of the route matching `pattern`.
+    fn caps_of(table: &RouteTable, pattern: &str) -> Option<Vec<String>> {
+        let route = table
+            .routes
+            .iter()
+            .find(|r| r.pattern == pattern)
+            .unwrap_or_else(|| {
+                let patterns: Vec<&str> = table.routes.iter().map(|r| r.pattern.as_str()).collect();
+                panic!("no route `{pattern}` in {patterns:?}")
+            });
+        route.cap.clone().map(|mut caps| {
+            caps.sort();
+            caps
+        })
+    }
+
+    #[test]
+    fn a_literal_cap_loads() {
+        let table = load_turtle(
+            r#"<urn:test:route:a> a ik:Route ; ik:match "/a" ; ik:target "urn:a" ;
+                 ik:cap "urn:cap:a" , "urn:cap:b" ."#,
+        )
+        .expect("loads");
+        assert_eq!(
+            caps_of(&table, "/a"),
+            Some(vec!["urn:cap:a".to_string(), "urn:cap:b".to_string()])
+        );
+    }
+
+    /// The hazard the design note measured: `GROUP_CONCAT(?cap)` over a set holding one IRI
+    /// leaves the WHOLE aggregate unbound, so the route loaded with no ceiling at all and the
+    /// server's default capability applied. Fail-open; `STR(?cap)` reads both spellings.
+    #[test]
+    fn an_iri_cap_loads_as_its_ceiling() {
+        let table = load_turtle(
+            r#"<urn:test:route:a> a ik:Route ; ik:match "/a" ; ik:target "urn:a" ;
+                 ik:cap <urn:cap:a> ."#,
+        )
+        .expect("loads");
+        assert_eq!(caps_of(&table, "/a"), Some(vec!["urn:cap:a".to_string()]));
+    }
+
+    #[test]
+    fn a_mixed_table_loads_every_cap_on_every_route() {
+        let table = load_turtle(
+            r#"<urn:test:route:lit> a ik:Route ; ik:match "/lit" ; ik:target "urn:lit" ;
+                 ik:order 1 ; ik:cap "urn:cap:lit" .
+               <urn:test:route:iri> a ik:Route ; ik:match "/iri" ; ik:target "urn:iri" ;
+                 ik:order 2 ; ik:cap <urn:cap:iri> .
+               <urn:test:route:both> a ik:Route ; ik:match "/both" ; ik:target "urn:both" ;
+                 ik:order 3 ; ik:cap <urn:cap:x> , "urn:cap:y" .
+               <urn:test:route:none> a ik:Route ; ik:match "/none" ; ik:target "urn:none" ;
+                 ik:order 4 ."#,
+        )
+        .expect("loads");
+        assert_eq!(table.routes.len(), 4);
+        assert_eq!(
+            caps_of(&table, "/lit"),
+            Some(vec!["urn:cap:lit".to_string()])
+        );
+        assert_eq!(
+            caps_of(&table, "/iri"),
+            Some(vec!["urn:cap:iri".to_string()])
+        );
+        assert_eq!(
+            caps_of(&table, "/both"),
+            Some(vec!["urn:cap:x".to_string(), "urn:cap:y".to_string()])
+        );
+        // A route that declares no cap is still the server default, by design.
+        assert_eq!(caps_of(&table, "/none"), None);
+    }
+
+    /// A route whose `ik:cap` triples exist but read as no capability string must not load
+    /// as a route without a ceiling. A blank node has no `STR`, so the aggregate comes back
+    /// unbound; an empty literal concatenates to nothing. Both are refused, naming the route.
+    #[test]
+    fn a_route_whose_caps_read_as_nothing_is_a_load_error() {
+        for (label, cap) in [("a blank node", "[]"), ("an empty literal", r#""""#)] {
+            let body = format!(
+                r#"<urn:test:route:ok> a ik:Route ; ik:match "/ok" ; ik:target "urn:ok" .
+                   <urn:test:route:bad> a ik:Route ; ik:match "/bad" ; ik:target "urn:bad" ;
+                     ik:cap {cap} ."#
+            );
+            let Err(err) = load_turtle(&body) else {
+                panic!("{label}: the route loaded without its ceiling");
+            };
+            assert!(
+                err.contains("/bad") && err.contains("ik:cap"),
+                "{label}: {err}"
+            );
+        }
+    }
+
+    /// The same check on the parsed results: a solution that counts caps but carries none.
+    #[test]
+    fn a_counted_cap_with_no_value_is_refused_by_the_parser() {
+        let json = br#"{"head":{"vars":[]},"results":{"bindings":[
+          {"match":{"type":"literal","value":"/a"},"target":{"type":"literal","value":"urn:a"},
+           "capCount":{"type":"literal","value":"1",
+                       "datatype":"http://www.w3.org/2001/XMLSchema#integer"}}
+        ]}}"#;
+        let Err(err) = parse_route_solutions(json) else {
+            panic!("a counted cap with no value loaded without its ceiling");
+        };
+        assert!(err.contains("/a"), "{err}");
     }
 }
