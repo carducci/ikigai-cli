@@ -110,6 +110,7 @@ const OWN: &[(&str, &str)] = &[
     ("contactlabel-link", "ikigai-embedded"),
     ("control", "ikigai-embedded"),
     ("decide-accept", "ikigai-embedded"),
+    ("decide-css", "ikigai-embedded"),
     ("decide-link", "ikigai-embedded"),
     ("decisions", "ikigai-embedded"),
     ("foaf", "ikigai-embedded"),

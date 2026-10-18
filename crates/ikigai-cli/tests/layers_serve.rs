@@ -1282,6 +1282,7 @@ fn general_surface_probes() -> Vec<Probe> {
             unbound,
         ),
         probe("source urn:passkey:js", None, unbound),
+        probe("source urn:decide:css", None, unbound),
         probe("sink urn:calendar-request:approve", Some(link), unbound),
         probe("sink urn:contact-block", Some(link), unbound),
         probe("sink urn:contact-label", Some(link), unbound),
