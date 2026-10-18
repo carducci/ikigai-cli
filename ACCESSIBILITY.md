@@ -36,10 +36,12 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
   and the message as escaped text; no style, no script. Its status code is the same as the text
   answer's, and both carry `Vary: Accept`.
 - An embedded-host page (`decide::page`) and the intake's redirect page have `<html lang="en">`
-  and one `<main>` holding the heading and the content. They keep the viewport meta and a
-  32rem column, so they read on a phone. Their look is one linked same-origin stylesheet
-  (`/decide/css`, `urn:decide:css`) and no inline style, so a door's `style-src 'self'` CSP
-  applies it; without it the page is still a readable, working form in the browser's defaults.
+  and one `<main>` holding the heading and the content, and the viewport meta, so they read on
+  a phone. An embedded-host page keeps a 32rem column, and its look is one linked same-origin
+  stylesheet (`/decide/css`, `urn:decide:css`) and no inline style, so a door's `style-src
+  'self'` CSP applies it; without it the page is still a readable, working form in the
+  browser's defaults. The intake's redirect page redirects at once and carries no style at all:
+  its fallback link reads in the browser's defaults.
 - A message a script writes after the page loads goes into a status line that is a polite live
   region (`role=status aria-live=polite`), present and empty in the served markup before the
   script runs: the passkey pages' `#status` and `#pkstatus`. Its gray (`#666`) is 5.7:1 on white.
@@ -66,7 +68,9 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
   live regions, their place before the script, and that the script writes into them;
   `the_page_shell_links_its_stylesheet_and_carries_no_inline_style` and
   `crates/ikigai-cli/tests/html_door_pages.rs` pin that the pages carry no inline style or
-  script and that the stylesheet and script they name are served same-origin with their types;
+  script and that the stylesheet and script they name are served same-origin with their types,
+  and the intake's `the_redirect_shim_carries_no_inline_style_or_script` pins the same for the
+  redirect page;
   `the_register_page_has_a_labeled_code_field_the_script_sends` pins that the enrollment code
   field has a `<label>` tied to it by `for`, and comes before the button.
 - The full-screen REPL is rendered against ratatui's test backend in `tui.rs`'s tests, mostly for
@@ -93,6 +97,7 @@ Found by reading the source on 2026-10-15, not by testing:
 | 2026-10-15 | `ikigai layers post` and `ikigai layers save` (ledger #1629) add terminal text under the same rules: plain lines, no color, the entry's IRI or a `saved …` line on stdout, and every refusal on stderr starting with `ikigai:`. |
 | 2026-10-16 | The passkey register page gains a field for the enrollment window's one-time code (ledger #1689): a visible `<label>` tied to the input by `for`, `autocomplete=one-time-code`, placed before the button; a missing code is reported in the existing `#status` live region and moves focus to the field. |
 | 2026-10-17 | The embedded host's pages move their inline styles, unchanged in value, into one served stylesheet, `/decide/css` (ledger #1834). The door's CSP had been dropping the inline styles in a browser, so on the edge the column width, the button padding and the muted gray now apply where they did not. |
+| 2026-10-18 | The intake's redirect page drops its inline `<style>` (ledger #1866). The door's CSP had been dropping it in a browser already, so on the edge the page looks as it did: browser defaults, for the instant before the redirect. |
 
 ## Contributing
 

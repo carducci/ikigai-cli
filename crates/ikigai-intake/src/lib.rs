@@ -226,6 +226,12 @@ pub fn submit(config: IntakeConfig) -> IntakeEndpoint {
 /// `'` become entities and every other character passes through. Enough for a URL and a page;
 /// the public link pages in `ikigai-embedded` use it for every value they interpolate.
 ///
+/// ⚠ A private copy of the ecosystem's escape, `ikigai_fn::html::html_text` (ledger #1813),
+/// kept only because no published `ikigai-fn` carries the `html` module yet (0.4.1, the newest
+/// on crates.io, does not). Once one does, this becomes a call to it (ledger #1866); the one
+/// difference is that `html_text` also replaces a C0 control other than tab, line feed and
+/// carriage return with U+FFFD.
+///
 /// ```
 /// assert_eq!(
 ///     ikigai_intake::html_escape(r#"<a href="x">Tom & Jerry's</a>"#),
@@ -246,8 +252,8 @@ pub fn html_escape(s: &str) -> String {
 }
 
 /// The response to a submission the endpoint accepted (a real one, or a honeypot hit that must
-/// look identical). With no `redirect`, a plain `received` body; with one, a small self-
-/// contained HTML shim that bounces straight to the redirect URL (a styled confirmation page
+/// look identical). With no `redirect`, a plain `received` body; with one, a small unstyled
+/// HTML shim that bounces straight to the redirect URL (a styled confirmation page
 /// on the site, which carries the actual "message received" wording).
 fn accepted(config: &IntakeConfig) -> Representation {
     match &config.redirect {
@@ -262,14 +268,15 @@ fn accepted(config: &IntakeConfig) -> Representation {
             // SHIM, not the confirmation: the redirect target is the site's own styled
             // thank-you page, which carries the "message received" wording. So the refresh is
             // instant (`0;url=`) and the copy is neutral — no second "Thank you" flashing
-            // before the real one, and no interstitial CSS to keep in sync with the site.
+            // before the real one. And the shim carries NO style (ledger #1866): an HTML door's
+            // CSP (`style-src 'self'`, or the default's `default-src 'self'`) blocks an inline
+            // `<style>`, and this library cannot know which stylesheet route a door serves, so
+            // the fallback link renders as the browser's default rather than half-styled.
             let page = format!(
                 "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
                  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
                  <meta http-equiv=\"refresh\" content=\"0;url={url}\">\
                  <title>Redirecting\u{2026}</title>\
-                 <style>body{{font-family:system-ui,sans-serif;max-width:32rem;margin:20vh auto;\
-                 padding:0 1.5rem;text-align:center;line-height:1.5}}a{{color:inherit}}</style>\
                  </head><body><main>\
                  <p>Taking you to the confirmation\u{2026}</p>\
                  <p><a href=\"{url}\">Continue</a> if you are not redirected.</p>\
@@ -970,6 +977,37 @@ mod tests {
         assert_eq!(real, trapped, "the two responses must be byte-identical");
         // …and the honeypot really did discard it: only the real one dropped a tuple.
         assert_eq!(dropped.lock().unwrap().len(), 1);
+    }
+
+    /// The shim is served by an HTML door whose CSP refuses inline style and script, so it
+    /// carries neither: the meta refresh and the fallback link work as written under
+    /// `style-src 'self'` (ledger #1866).
+    #[test]
+    fn the_redirect_shim_carries_no_inline_style_or_script() {
+        let (k, _) = redirecting_kernel("https://x.example/thanks");
+        let page = String::from_utf8(
+            block_on(k.issue(post("name=A&email=a%40x.example&message=hi"), &cap()))
+                .unwrap()
+                .bytes,
+        )
+        .unwrap()
+        .to_ascii_lowercase();
+        assert!(!page.contains("<style"), "an inline style element: {page}");
+        assert!(
+            !page.contains("style="),
+            "an inline style attribute: {page}"
+        );
+        assert!(!page.contains("<script"), "an inline script: {page}");
+        assert!(
+            page.contains(
+                "<meta http-equiv=\"refresh\" content=\"0;url=https://x.example/thanks\">"
+            ),
+            "the redirect itself: {page}"
+        );
+        assert!(
+            page.contains("<a href=\"https://x.example/thanks\">continue</a>"),
+            "the fallback link: {page}"
+        );
     }
 
     #[test]

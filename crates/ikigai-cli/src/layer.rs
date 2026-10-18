@@ -32,7 +32,6 @@
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
-use base64::Engine as _;
 use icu_properties::props::GeneralCategory;
 use ikigai_engine::{Action, Engine};
 use sha2::{Digest, Sha256};
@@ -822,10 +821,7 @@ fn encode(data: &[u8]) -> (&'static str, String) {
             return ("text", text.to_string());
         }
     }
-    (
-        "base64",
-        base64::engine::general_purpose::STANDARD.encode(data),
-    )
+    ("base64", ikigai_http::base64::encode(data))
 }
 
 /// Names an agent, a shell or a tool loads as configuration, or as credentials, from the
@@ -1267,8 +1263,7 @@ impl Node {
         let content = self.one("content")?;
         let data = match self.one("encoding")? {
             "text" => content.as_bytes().to_vec(),
-            "base64" => base64::engine::general_purpose::STANDARD
-                .decode(content)
+            "base64" => ikigai_http::base64::decode(content)
                 .map_err(|e| format!("{}: its base64 does not decode: {e}", self.iri))?,
             other => {
                 return Err(format!(
@@ -1841,6 +1836,29 @@ mod tests {
             .bytes()
             .unwrap_err();
         assert!(err.contains("it says 7"), "{err}");
+    }
+
+    /// A file's base64 decodes by the ecosystem's one profile (`ikigai_http::base64`, ledger
+    /// #1857 and #1866): canonical RFC 4648 §4, so nonzero pad bits are refused, and the
+    /// refusal names the rule without echoing a byte or an offset of the content.
+    #[test]
+    fn a_file_entry_whose_base64_is_not_canonical_is_refused_by_the_shared_profile() {
+        let data = [0x89u8, 0, 0, 1];
+        let (encoding, b64) = encode(&data);
+        assert_eq!((encoding, b64.as_str()), ("base64", "iQAAAQ=="));
+        let good = file_entry("a.bin", &data, None, Thread::default())
+            .unwrap()
+            .turtle
+            .replace("<urn:layer:new>", "<urn:layer:t:entry:1>");
+        // `R` differs from `Q` only in the low bits that padding leaves unused.
+        let bad = good.replace("\"iQAAAQ==\"", "\"iQAAAR==\"");
+        assert_ne!(bad, good, "the fixture names the content literal");
+        let err = Node::of(&bad, "urn:layer:t:entry:1")
+            .unwrap()
+            .bytes()
+            .unwrap_err();
+        assert!(err.contains("not canonical base64"), "{err}");
+        assert!(!err.contains("offset"), "{err}");
     }
 
     #[test]
