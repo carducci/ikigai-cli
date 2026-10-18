@@ -671,16 +671,40 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
         .iter()
         .map(|i| i.name.as_str())
         .chain(shape.synthesized.iter().map(|a| a.name.as_str()));
+    //
+    // A LIST argument (ledger #1547) is the one exception: it takes an ARRAY of scalars,
+    // which is joined below with its separator's canonical character, exactly as the engine
+    // joins `graph=A graph=B`.
+    let is_list = |arg: &str| {
+        action
+            .inputs
+            .iter()
+            .any(|i| i.name == arg && i.list.is_some())
+    };
     for arg in named {
-        if let Some(value @ (Value::Array(_) | Value::Object(_))) = args_map.get(arg) {
-            let kind = if value.is_array() {
-                "an array"
-            } else {
-                "an object"
-            };
-            return tool_error(format!(
-                "`{arg}` takes one value (a string, number or boolean), not {kind}"
-            ));
+        match args_map.get(arg) {
+            Some(Value::Array(items)) if is_list(arg) => {
+                if items
+                    .iter()
+                    .any(|item| matches!(item, Value::Array(_) | Value::Object(_)))
+                {
+                    return tool_error(format!(
+                        "`{arg}` is a list of values (strings, numbers or booleans), and an \
+                         item of it is not one"
+                    ));
+                }
+            }
+            Some(value @ (Value::Array(_) | Value::Object(_))) => {
+                let kind = if value.is_array() {
+                    "an array"
+                } else {
+                    "an object"
+                };
+                return tool_error(format!(
+                    "`{arg}` takes one value (a string, number or boolean), not {kind}"
+                ));
+            }
+            _ => {}
         }
     }
     let supplied: std::collections::BTreeSet<String> = action
@@ -706,32 +730,51 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
     // Route each supplied argument: a Binding-source input substitutes into the
     // endpoint IRI template ({name} → value); an Argument-source input becomes a
     // request argument.
+    //
+    // Pre-flight the JSON arguments against the action's declared contract with core's one
+    // checker (structured, so a value with a newline/& validates correctly). A
+    // non-conforming call comes back as the SHACL report — data the model reads
+    // and repairs from — without touching the endpoint.
+    if let Some(report) = crate::validate_arguments(&description, &action, &endpoint_arguments) {
+        return tool_error(format!("arguments failed validation:\n{report}"));
+    }
+    // One value per name: a list's array joined with its separator (ledger #1547). The
+    // checker above has refused every other repeat, so this cannot fail on a call it passed.
+    let joined = match action.join_repeats(&crate::proposed_args(&endpoint_arguments)) {
+        Ok(joined) => joined,
+        Err(e) => return tool_error(format!("{e}")),
+    };
     let mut req_args: Vec<(String, String)> = Vec::new();
+    // On an ENVELOPE action the fields a caller gave are serialized into the carrier, as
+    // one JSON object: the body the endpoint reads (ledger #358). The checker has refused a
+    // call that gives both the carrier and fields.
+    let carrier = crate::envelope_carrier(&action);
+    let mut fields = serde_json::Map::new();
     // Bindings whose value carries IRI structure (RFC 3986's gen-delims): such a value can
     // turn the row's template into ANOTHER endpoint's IRI, so the target is checked below to
     // still reach this tool's endpoint (ledger #86). Delimiters themselves are legitimate,
     // since `urn:file:{path}` and `urn:repo:{repo}:file:{path}` take `/` and `:`; what is
     // refused is a call answered by an endpoint the tool does not name.
     let mut structural: Vec<&str> = Vec::new();
-    for input in &action.inputs {
-        let Some(value) = arguments.get(&input.name).and_then(crate::scalar) else {
-            continue;
-        };
-        if input.source == ikigai_core::InputSource::Binding {
-            if value.contains([':', '/', '?', '#', '[', ']', '@']) {
-                structural.push(&input.name);
+    for (name, value) in joined.pairs() {
+        let input = action.inputs.iter().find(|i| i.name == name);
+        match input {
+            Some(input) if input.source == ikigai_core::InputSource::Binding => {
+                if value.contains([':', '/', '?', '#', '[', ']', '@']) {
+                    structural.push(&input.name);
+                }
+                target = target.replace(&format!("{{{}}}", input.name), value);
             }
-            target = target.replace(&format!("{{{}}}", input.name), &value);
-        } else {
-            req_args.push((input.name.clone(), value));
+            Some(input) if carrier.is_some_and(|c| c != input.name) => {
+                fields.insert(input.name.clone(), Value::String(value.to_string()));
+            }
+            // A declared argument, or (on an OPEN argument set, which the checker admitted)
+            // any other name: a request argument either way.
+            _ => req_args.push((name.to_string(), value.to_string())),
         }
     }
-    // Pre-flight the JSON arguments against the action's declared contract
-    // (structured, so a value with a newline/& validates correctly). A
-    // non-conforming call comes back as the SHACL report — data the model reads
-    // and repairs from — without touching the endpoint.
-    if let Some(report) = crate::validate_arguments(&description, &action, &endpoint_arguments) {
-        return tool_error(format!("arguments failed validation:\n{report}"));
+    if let (Some(carrier), false) = (carrier, fields.is_empty()) {
+        req_args.push((carrier.to_string(), Value::Object(fields).to_string()));
     }
 
     // An OMITTED optional binding leaves its `{var}` in the row's pattern, and the literal
@@ -1087,6 +1130,163 @@ mod tests {
         Kernel::new(Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:demo:pick"), pick),
         ))
+    }
+
+    /// An endpoint over the ArgSpec shape (ledger #1547) that echoes what it was handed: a
+    /// LIST `graph` beside a plain `query` (Source), an OPEN `compose` whose extra names are
+    /// template arguments (Source), and an ENVELOPE `submit` whose fields arrive inside
+    /// `content` (Sink).
+    fn shape_kernel() -> Kernel {
+        use ikigai_core::ListSeparator;
+        let arg = |inv: &ikigai_core::Invocation<'_>, name: &str| {
+            inv.inline_str(name).unwrap_or("-").to_string()
+        };
+        let graphs = FnEndpoint::new("graphs", move |inv| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("graph={} query={}", arg(inv, "graph"), arg(inv, "query")).into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("graphs")
+                .verb(Verb::Source)
+                .input(
+                    ArgSpec::new("graph")
+                        .optional()
+                        .list(ListSeparator::CommaOrWhitespace),
+                )
+                .input(ArgSpec::new("query").optional()),
+        );
+        let compose = FnEndpoint::new("compose", move |inv| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("src={} title={}", arg(inv, "src"), arg(inv, "title")).into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("compose")
+                .verb(Verb::Source)
+                .input(ArgSpec::new("src"))
+                .open_arguments("each fills a {name} marker in the body"),
+        );
+        let submit = FnEndpoint::new("submit", move |inv| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("content={}", arg(inv, "content")).into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("submit")
+                .verb(Verb::Sink)
+                .input(ArgSpec::new("email"))
+                .input(ArgSpec::new("note").optional())
+                .input(ArgSpec::new("content"))
+                .envelope("content"),
+        );
+        Kernel::new(Arc::new(
+            EndpointSpace::new()
+                .bind(Exact::new("urn:demo:graphs"), graphs)
+                .bind(Exact::new("urn:demo:compose"), compose)
+                .bind(Exact::new("urn:demo:submit"), submit),
+        ))
+    }
+
+    fn call_text(k: &Kernel, tool: &str, arguments: Value) -> (bool, String) {
+        let reply = handle(
+            k,
+            &Capability::root(),
+            &ToolFilter::default(),
+            &json!({"jsonrpc":"2.0","id":9,"method":"tools/call",
+                    "params":{"name": tool, "arguments": arguments}}),
+        )
+        .unwrap();
+        let result = &reply["result"];
+        (
+            result["isError"].as_bool().unwrap_or(false),
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+        )
+    }
+
+    /// ledger #1547: a LIST argument takes a JSON array, joined on the way in with its
+    /// separator's canonical character, so `["A","B"]` reaches the endpoint as the engine's
+    /// `graph=A graph=B` does; an array for a non-list argument is still refused by name.
+    #[test]
+    fn a_list_argument_takes_an_array_and_joins_it() {
+        let k = shape_kernel();
+        assert_eq!(
+            call_text(&k, "graphs__source", json!({"graph": ["urn:a", "urn:b"]})),
+            (false, "graph=urn:a,urn:b query=-".to_string())
+        );
+        assert_eq!(
+            call_text(&k, "graphs__source", json!({"graph": "urn:a urn:b"})),
+            (false, "graph=urn:a urn:b query=-".to_string()),
+            "the joined spelling is the caller's own"
+        );
+        let (error, text) = call_text(&k, "graphs__source", json!({"query": ["a", "b"]}));
+        assert!(error && text.contains("`query` takes one value"), "{text}");
+        let (error, text) = call_text(&k, "graphs__source", json!({"graph": [["urn:a"]]}));
+        assert!(error && text.contains("an item of it is not one"), "{text}");
+        // The schema says so.
+        let list = handle(
+            &k,
+            &Capability::root(),
+            &ToolFilter::default(),
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .unwrap();
+        let tool = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "graphs__source")
+            .unwrap()
+            .clone();
+        assert_eq!(tool["inputSchema"]["properties"]["graph"]["type"], "array");
+        assert_eq!(tool["inputSchema"]["additionalProperties"], json!(false));
+    }
+
+    /// ledger #1547 (#607): an OPEN action passes the names it does not declare through as
+    /// request arguments, where a closed one refuses them in the report.
+    #[test]
+    fn an_open_action_passes_unknown_names_through() {
+        let k = shape_kernel();
+        assert_eq!(
+            call_text(
+                &k,
+                "compose__source",
+                json!({"src": "urn:x", "title": "Hi"})
+            ),
+            (false, "src=urn:x title=Hi".to_string())
+        );
+        let (error, text) = call_text(&k, "graphs__source", json!({"title": "Hi"}));
+        assert!(error && text.contains("unknown argument `title`"), "{text}");
+    }
+
+    /// ledger #1547 (#358): an ENVELOPE action's fields are serialized into its carrier, as
+    /// one JSON object, so a client fills the form and the endpoint reads the body it reads;
+    /// a required field missing is refused by the checker before anything runs.
+    #[test]
+    fn an_envelope_actions_fields_are_serialized_into_its_carrier() {
+        let k = shape_kernel();
+        assert_eq!(
+            call_text(
+                &k,
+                "submit__sink",
+                json!({"email": "a@example.org", "note": "hello"})
+            ),
+            (
+                false,
+                r#"content={"email":"a@example.org","note":"hello"}"#.to_string()
+            )
+        );
+        let (error, text) = call_text(&k, "submit__sink", json!({"note": "hello"}));
+        assert!(
+            error && text.contains("required input `email` is missing"),
+            "{text}"
+        );
     }
 
     const GIVEN_TWICE_TEXT: &str =

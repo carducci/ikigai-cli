@@ -1536,20 +1536,17 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
     if !declared.is_empty() && !declared.contains(&verb) {
         return method_not_allowed(allow);
     }
-    // A REPEATED ARGUMENT is refused (ledger #387). A `Request` holds one value per name, so
+    // A REPEATED ARGUMENT (ledger #387, #1547). A `Request` holds one value per name, so
     // `?graph=A&graph=B` reached the resource as `graph=B` and a join answered 200 with an
-    // empty table; `?as=` kept the FIRST. No argument can be declared repeatable yet, so any
-    // repeat of a name the request carries is a 400 naming it, before anything is counted or
-    // built.
-    if let Some(name) = repeated_argument(req, verb) {
-        return error_resp(
-            config,
-            &ikigai_core::Error::InvalidArgument {
-                name: name.to_string(),
-                detail: "given twice; an argument takes one value, so name it once".to_string(),
-            },
-        );
-    }
+    // empty table; `?as=` kept the FIRST. Now the repeats of a LIST argument are JOINED with
+    // its separator's canonical character (core's `ActionSpec::join_repeats`, the rule the
+    // engine and MCP apply), so `?graph=A&graph=B` and `?graph=A,B` are one request and one
+    // cache key; a repeat of any other name the request carries is a 400 naming it, before
+    // anything is counted or built.
+    let forwarded = match joined_query(req, verb, described.as_ref()) {
+        Ok(forwarded) => forwarded,
+        Err(refused) => return error_resp(config, &refused),
+    };
     // PER-SOURCE RATE LIMIT (ledger #1717): counted once the request is one the resource would
     // run, and refused before anything is built or invoked. `OPTIONS` and `?description` have
     // answered above and are never counted.
@@ -1585,8 +1582,8 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
         }
         Negotiated::NotAcceptable => return not_acceptable(&faces, explicit, req),
     }
-    for (k, v) in forwarded_query(req, verb) {
-        request = request.with_arg(k.to_string(), ArgRef::Inline(v.as_bytes().to_vec()));
+    for (k, v) in forwarded {
+        request = request.with_arg(k, ArgRef::Inline(v.into_bytes()));
     }
     if verb == Verb::Sink {
         request = request.with_arg("content", ArgRef::Inline(req.body.clone()));
@@ -1981,24 +1978,34 @@ fn forwarded_query(req: &HttpRequest, verb: Verb) -> impl Iterator<Item = (&str,
         .map(|(k, v)| (k.as_str(), v.as_str()))
 }
 
-/// The first query name the request would carry into the kernel twice: `as`, or any name
-/// [`forwarded_query`] passes on (ledger #387). Reserved names the door drops are not
-/// arguments of the request, so their repeats are not counted.
-fn repeated_argument(req: &HttpRequest, verb: Verb) -> Option<&str> {
-    let names = req
-        .query
-        .iter()
-        .filter(|(k, _)| k == "as")
-        .map(|(k, _)| k.as_str())
-        .chain(forwarded_query(req, verb).map(|(k, _)| k));
-    let mut seen: Vec<&str> = Vec::new();
-    for name in names {
-        if seen.contains(&name) {
-            return Some(name);
-        }
-        seen.push(name);
+/// The query arguments [`forwarded_query`] passes on, one value per name: the repeats of a
+/// LIST argument of the resource's `verb` action joined with its separator's canonical
+/// character (ledger #1547, core's `ActionSpec::join_repeats`), in first-seen order. A
+/// repeat of `as` or of any other forwarded name is the typed `InvalidArgument … given
+/// twice` (ledger #387). Reserved names the door drops are not arguments of the request, so
+/// their repeats are not counted. With no contract, nothing is a list.
+fn joined_query(
+    req: &HttpRequest,
+    verb: Verb,
+    described: Option<&ikigai_core::Description>,
+) -> Result<Vec<(String, String)>, ikigai_core::Error> {
+    let given_twice = |name: &str| ikigai_core::Error::InvalidArgument {
+        name: name.to_string(),
+        detail: ikigai_core::GIVEN_TWICE.to_string(),
+    };
+    if req.query.iter().filter(|(k, _)| k == "as").count() > 1 {
+        return Err(given_twice("as"));
     }
-    None
+    // The verb's action, or one with no inputs (nothing is a list) when there is no contract.
+    let action = described
+        .and_then(|d| d.action_specs().into_iter().find(|a| a.verb == verb))
+        .unwrap_or_else(|| ikigai_core::ActionSpec::new(verb));
+    let proposed = ikigai_core::ProposedArgs::from_pairs(forwarded_query(req, verb));
+    Ok(action
+        .join_repeats(&proposed)?
+        .pairs()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect())
 }
 
 /// What a DELETE tombstone is keyed on: the target IRI AND the query arguments the kernel was
@@ -3223,28 +3230,40 @@ fn openapi_of(
         op.insert("summary".to_string(), json!(summary));
         op.insert("operationId".to_string(), json!(operation_id(method, path)));
         if action.verb == Verb::Sink {
-            let (props, required) = schema_properties(&action.inputs);
-            op.insert(
-                "requestBody".to_string(),
-                json!({
-                    "content": { "application/json": {
-                        "schema": { "type": "object", "properties": props, "required": required }
-                    } }
+            let (props, required) = schema_properties(action);
+            let schema = json!({ "type": "object", "properties": props, "required": required });
+            // ★ An ENVELOPE action (ledger #358, #1547) declares its body: the fields ARE the
+            // request body's properties and the carrier is the body itself, so it is no
+            // property. A form submission is urlencoded as often as it is JSON, and the
+            // contract says the fields are the carrier's either way.
+            let content = match envelope_carrier(action) {
+                Some(_) => json!({
+                    "application/json": { "schema": schema },
+                    "application/x-www-form-urlencoded": { "schema": schema },
                 }),
-            );
+                None => json!({ "application/json": { "schema": schema } }),
+            };
+            op.insert("requestBody".to_string(), json!({ "content": content }));
         } else {
             let params: Vec<Value> = action
                 .inputs
                 .iter()
                 .filter(|a| projected(a))
                 .map(|a| {
-                    json!({
+                    let mut param = json!({
                         "name": a.name,
                         "in": "query",
                         "required": a.required,
                         "description": a.summary,
                         "schema": arg_schema(a),
-                    })
+                    });
+                    // A LIST argument (ledger #1547) may be repeated, `?graph=A&graph=B`,
+                    // which the door joins: OpenAPI's form style, exploded.
+                    if a.list.is_some() {
+                        param["style"] = json!("form");
+                        param["explode"] = json!(true);
+                    }
+                    param
                 })
                 .collect();
             if !params.is_empty() {
@@ -3318,11 +3337,25 @@ fn projected(input: &ikigai_core::ArgSpec) -> bool {
         && input.source != ikigai_core::InputSource::Binding
 }
 
-fn schema_properties(inputs: &[ikigai_core::ArgSpec]) -> (serde_json::Value, Vec<String>) {
+/// The carrier of an ENVELOPE action (`Arguments::Envelope`, ledger #358): the input whose
+/// body the other inputs are fields of.
+fn envelope_carrier(action: &ikigai_core::ActionSpec) -> Option<&str> {
+    match &action.arguments {
+        ikigai_core::Arguments::Envelope(carrier) => Some(carrier.as_str()),
+        _ => None,
+    }
+}
+
+fn schema_properties(action: &ikigai_core::ActionSpec) -> (serde_json::Value, Vec<String>) {
     use serde_json::{Map, Value};
+    let carrier = envelope_carrier(action);
     let mut props = Map::new();
     let mut required = Vec::new();
-    for a in inputs.iter().filter(|a| projected(a)) {
+    for a in action
+        .inputs
+        .iter()
+        .filter(|a| projected(a) && Some(a.name.as_str()) != carrier)
+    {
         props.insert(a.name.clone(), arg_schema(a));
         if a.required {
             required.push(a.name.clone());
@@ -3331,18 +3364,28 @@ fn schema_properties(inputs: &[ikigai_core::ArgSpec]) -> (serde_json::Value, Vec
     (Value::Object(props), required)
 }
 
-/// One input's JSON-Schema: type from its `class` (XSD datatype), `enum` from `one_of`,
-/// `default`, and its summary as the description.
+/// One input's JSON-Schema: type from its `class` (XSD datatype), `enum` from `one_of`
+/// (`[]` for an empty enumeration, which accepts nothing: ledger #41), `default`, and its
+/// summary as the description. A LIST argument (ledger #1547) is an array of such items.
 fn arg_schema(a: &ikigai_core::ArgSpec) -> serde_json::Value {
     use serde_json::{json, Map, Value};
     let ty = a.class.as_deref().map(xsd_to_json_type).unwrap_or("string");
-    let mut s = Map::new();
-    s.insert("type".to_string(), json!(ty));
+    let mut item = Map::new();
+    item.insert("type".to_string(), json!(ty));
+    if a.is_enumerated() {
+        item.insert("enum".to_string(), json!(a.one_of));
+    }
+    let mut s = match a.list {
+        Some(_) => {
+            let mut array = Map::new();
+            array.insert("type".to_string(), json!("array"));
+            array.insert("items".to_string(), Value::Object(item));
+            array
+        }
+        None => item,
+    };
     if !a.summary.is_empty() {
         s.insert("description".to_string(), json!(a.summary));
-    }
-    if !a.one_of.is_empty() {
-        s.insert("enum".to_string(), json!(a.one_of));
     }
     if let Some(d) = &a.default {
         s.insert("default".to_string(), json!(d));
@@ -3961,7 +4004,48 @@ mod tests {
             ))
         })
         .with_description(Description::new("big").verb(Verb::Source));
+        // ledger #1547: a LIST argument (`graph`) beside a plain one (`query`), echoed; and an
+        // ENVELOPE write whose form fields arrive inside `content`.
+        let graphs = FnEndpoint::new("graphs", |inv: &Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!(
+                    "graph={} query={}",
+                    inv.inline_str("graph").unwrap_or("-"),
+                    inv.inline_str("query").unwrap_or("-")
+                )
+                .into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("graphs")
+                .verb(Verb::Source)
+                .input(
+                    ArgSpec::new("graph")
+                        .optional()
+                        .list(ikigai_core::ListSeparator::CommaOrWhitespace),
+                )
+                .input(ArgSpec::new("query").optional()),
+        );
+        let form = FnEndpoint::new("form", |inv: &Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                inv.inline_arg("content").unwrap_or(b"").to_vec(),
+            ))
+        })
+        .with_description(
+            Description::new("form").action(
+                ikigai_core::ActionSpec::new(Verb::Sink)
+                    .summary("submit the form")
+                    .input(ArgSpec::new("email").summary("where to answer"))
+                    .input(ArgSpec::new("note").optional())
+                    .input(ArgSpec::new("content"))
+                    .envelope("content"),
+            ),
+        );
         let space = EndpointSpace::new()
+            .bind(Exact::new("urn:test:graphs"), graphs)
+            .bind(Exact::new("urn:test:form"), form)
             .bind(UriTemplate::parse("urn:test:seg:{key}").unwrap(), seg)
             .bind(Exact::new("urn:test:big"), big)
             .bind(Exact::new("urn:test:board"), board)
@@ -5660,6 +5744,67 @@ mod tests {
     fn openapi_body(resp: &str) -> serde_json::Value {
         let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
         serde_json::from_str(body).unwrap_or_else(|e| panic!("openapi json ({e}): {resp}"))
+    }
+
+    /// ledger #1547: a LIST argument repeated in the query string is JOINED with its
+    /// separator's canonical character, so `?graph=A&graph=B` and `?graph=A,B` are one
+    /// request; a repeat of a non-list name is still the typed 400.
+    #[tokio::test]
+    async fn a_list_argument_repeated_in_the_query_is_joined() {
+        let addr = start().await;
+        for query in [
+            "graph=urn:a&query=q&graph=urn:b",
+            "graph=urn:a,urn:b&query=q",
+        ] {
+            let resp = get(addr, &format!("/test/graphs?{query}"), None).await;
+            assert!(resp.starts_with("HTTP/1.1 200 "), "{query}: {resp}");
+            assert!(
+                resp.ends_with("graph=urn:a,urn:b query=q"),
+                "{query}: {resp}"
+            );
+        }
+        let resp = get(addr, "/test/graphs?query=a&query=b", None).await;
+        assert!(resp.starts_with("HTTP/1.1 400 "), "{resp}");
+        assert!(
+            resp.ends_with(
+                "invalid argument `query`: given twice; an argument takes one value, so name it \
+                 once"
+            ),
+            "{resp}"
+        );
+        // The description says the list may repeat.
+        let resp = get(addr, "/test/graphs?description", None).await;
+        let v = openapi_body(&resp);
+        let graph = &v["paths"]["/test/graphs"]["get"]["parameters"][0];
+        assert_eq!(graph["name"], "graph", "{v}");
+        assert_eq!(graph["schema"]["type"], "array", "{v}");
+        assert_eq!(graph["explode"], true, "{v}");
+    }
+
+    /// ledger #1547 (#358): an ENVELOPE action's request body IS the carrier, so the fields
+    /// are its properties and the carrier is not one of them, as JSON and as a urlencoded
+    /// form alike.
+    #[tokio::test]
+    async fn the_openapi_of_an_envelope_projects_its_fields_as_the_body() {
+        let addr = start().await;
+        let resp = get(addr, "/test/form?description", None).await;
+        let v = openapi_body(&resp);
+        let content = &v["paths"]["/test/form"]["post"]["requestBody"]["content"];
+        for media in ["application/json", "application/x-www-form-urlencoded"] {
+            let schema = &content[media]["schema"];
+            let names: Vec<&str> = schema["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{media}: {v}"))
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(names, ["email", "note"], "{media}: {v}");
+            assert_eq!(
+                schema["required"],
+                serde_json::json!(["email"]),
+                "{media}: {v}"
+            );
+        }
     }
 
     #[tokio::test]

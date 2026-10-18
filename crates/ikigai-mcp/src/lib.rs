@@ -14,7 +14,7 @@
 
 pub mod server;
 
-use ikigai_core::{ActionSpec, ArgSpec, Description, InputSource, Verb};
+use ikigai_core::{ActionSpec, ArgSpec, Description, Verb};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeSet;
 
@@ -617,53 +617,266 @@ fn json_type(class: Option<&str>) -> &'static str {
     }
 }
 
-/// One input's JSON-Schema property node, from its [`ArgSpec`].
-fn property(input: &ArgSpec) -> Value {
-    let mut node = Map::new();
-    node.insert("type".into(), json!(json_type(input.class.as_deref())));
-    if !input.summary.is_empty() {
-        node.insert("description".into(), json!(input.summary));
+/// A lexical form as the JSON value of type `ty` (ledger #19, Q11: a default is typed as
+/// declared): `"50"` is `50` for an `integer`, `"true"` is `true` for a `boolean`. A form
+/// that does not parse stays a string rather than being dropped, so the schema still shows
+/// what the contract says.
+fn typed(ty: &str, lexical: &str) -> Value {
+    let parsed = match ty {
+        "integer" => lexical.parse::<i64>().ok().map(Value::from),
+        "number" => lexical
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(Value::Number),
+        "boolean" => match lexical {
+            "true" => Some(Value::Bool(true)),
+            "false" => Some(Value::Bool(false)),
+            _ => None,
+        },
+        _ => None,
+    };
+    parsed.unwrap_or_else(|| Value::String(lexical.to_string()))
+}
+
+/// A whole value (a default, an example) as JSON: typed, and for a LIST argument an array
+/// of typed items split on its separator.
+fn json_value(input: &ArgSpec, ty: &str, lexical: &str) -> Value {
+    match input.list {
+        Some(separator) => Value::Array(
+            separator
+                .split(lexical)
+                .into_iter()
+                .map(|item| typed(ty, item))
+                .collect(),
+        ),
+        None => typed(ty, lexical),
     }
-    if !input.one_of.is_empty() {
-        node.insert("enum".into(), json!(input.one_of));
+}
+
+/// One input's JSON-Schema property node, from its [`ArgSpec`]: its type, an `enum` from an
+/// enumeration (`[]` for an empty one, which accepts nothing: ledger #41), a TYPED default,
+/// its examples, and its summary with each value's meaning as `word: meaning` lines (MCP has
+/// no per-enum description). A LIST argument is an array of such items (ledger #497); the
+/// server joins it on the way in.
+fn property(input: &ArgSpec) -> Value {
+    let ty = json_type(input.class.as_deref());
+    let mut item = Map::new();
+    item.insert("type".into(), json!(ty));
+    if input.is_enumerated() {
+        let values: Vec<Value> = input.one_of.iter().map(|v| typed(ty, v)).collect();
+        item.insert("enum".into(), Value::Array(values));
+    }
+    let mut node = match input.list {
+        Some(_) => {
+            let mut array = Map::new();
+            array.insert("type".into(), json!("array"));
+            array.insert("items".into(), Value::Object(item));
+            array
+        }
+        None => item,
+    };
+    let mut description = input.summary.clone();
+    for (value, note) in &input.values {
+        if note.summary.is_empty() {
+            continue;
+        }
+        if !description.is_empty() {
+            description.push('\n');
+        }
+        description.push_str(&format!("{value}: {}", note.summary));
+    }
+    if !description.is_empty() {
+        node.insert("description".into(), json!(description));
     }
     if let Some(default) = &input.default {
-        node.insert("default".into(), json!(default));
+        node.insert("default".into(), json_value(input, ty, default));
+    }
+    if !input.examples.is_empty() {
+        let examples: Vec<Value> = input
+            .examples
+            .iter()
+            .map(|e| json_value(input, ty, e))
+            .collect();
+        node.insert("examples".into(), Value::Array(examples));
     }
     Value::Object(node)
+}
+
+/// The carrier of an [`Arguments::Envelope`](ikigai_core::Arguments::Envelope) action: the
+/// input whose BODY the other by-value inputs are fields of (ledger #358).
+pub fn envelope_carrier(action: &ActionSpec) -> Option<&str> {
+    match &action.arguments {
+        ikigai_core::Arguments::Envelope(carrier) => Some(carrier.as_str()),
+        _ => None,
+    }
+}
+
+/// Where each relation between inputs goes in a projected tool (ledger #1547, Q4).
+///
+/// A relation that a client accepts in a tool's `inputSchema` is projected as JSON Schema;
+/// one it refuses is stated in the tool's description instead, never dropped, and the
+/// server-side check ([`validate_arguments`]) refuses a call that breaks it either way.
+///
+/// ⚠ The Anthropic Messages API, which Claude Code hands every MCP tool to, refuses
+/// `oneOf`, `anyOf` and `allOf` at the TOP level of a tool's `input_schema` with a 400 for
+/// the WHOLE request (Claude Code's MCP reference, "Tools with invalid input schemas";
+/// anthropics/claude-code#27337). Claude Code rewrites such a root when a remote feature
+/// flag lets it (an `allOf` merged, a `oneOf`/`anyOf` branch's `required` moved into the
+/// description) and otherwise skips the tool or, with the flags off, sends it and fails
+/// every tool with it. An input group IS a top-level relation (exactly one of two
+/// properties), and several value dependencies need an `allOf` to sit side by side, so
+/// both fall back to the description here; a lone root `not` or `if`/`then` is not
+/// documented either way, so it is not risked. `dependentRequired` and
+/// `additionalProperties` are plain 2020-12 keywords the API takes, so input dependencies
+/// and the argument set stay in the schema. Hermes is untested (no scratch Hermes exists to
+/// try it against without touching the live one).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    /// In the `inputSchema`.
+    Schema,
+    /// In the tool's description text.
+    Description,
+}
+
+/// The placement of top-level combinators (`oneOf`, `anyOf`, `allOf`, `not`, `if`/`then`)
+/// in the projected tools. See [`Placement`] for why it is the description.
+pub const COMBINATORS: Placement = Placement::Description;
+
+/// The relations between an action's inputs that its schema cannot carry as properties:
+/// each as the JSON-Schema fragment that states it and the sentence that says it. Groups
+/// (exactly-one as `oneOf`, at-least-one as `anyOf`, at-most-one as `not` over every pair)
+/// and value dependencies (`if` the value, `then` its needs).
+pub fn relations(action: &ActionSpec) -> Vec<(Value, String)> {
+    let quoted = |names: &[String]| {
+        names
+            .iter()
+            .map(|n| format!("`{n}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let requires = |names: &[&String]| json!({ "required": names });
+    let mut out = Vec::new();
+    for group in &action.groups {
+        let members = &group.members;
+        let each: Vec<Value> = members.iter().map(|m| requires(&[m])).collect();
+        let (fragment, rule) = match group.kind {
+            ikigai_core::GroupKind::ExactlyOne => (json!({ "oneOf": each }), "exactly one of"),
+            ikigai_core::GroupKind::AtLeastOne => (json!({ "anyOf": each }), "at least one of"),
+            ikigai_core::GroupKind::AtMostOne => {
+                let mut pairs = Vec::new();
+                for (i, a) in members.iter().enumerate() {
+                    for b in &members[i + 1..] {
+                        pairs.push(requires(&[a, b]));
+                    }
+                }
+                (json!({ "not": { "anyOf": pairs } }), "at most one of")
+            }
+            _ => continue,
+        };
+        let mut sentence = format!("Give {rule} {}.", quoted(members));
+        if let Some(pipe) = &group.pipe {
+            sentence.push_str(&format!(" A piped value fills `{pipe}`."));
+        }
+        out.push((fragment, sentence));
+    }
+    for input in &action.inputs {
+        for (value, note) in &input.values {
+            if note.needs.is_empty() {
+                continue;
+            }
+            let condition = match input.list {
+                Some(_) => json!({ "contains": { "const": value } }),
+                None => json!({ "const": value }),
+            };
+            out.push((
+                json!({
+                    "if": {
+                        "properties": { input.name.clone(): condition },
+                        "required": [input.name],
+                    },
+                    "then": { "required": note.needs },
+                }),
+                format!("`{}={value}` needs {}.", input.name, quoted(&note.needs)),
+            ));
+        }
+    }
+    out
 }
 
 /// The JSON-Schema `inputSchema` object for an action — one property per declared
 /// input (binding-source inputs included: an MCP client has no IRI to template,
 /// so it supplies them as arguments and the server routes them into the IRI).
 /// `required` lists the required inputs.
+///
+/// Beside them (ledger #1547): `additionalProperties: false` on a CLOSED argument set, which
+/// states what the server-side check already enforces (Q8), and a string-valued
+/// `additionalProperties` described by the action's summary of what the extra names mean on
+/// an OPEN one; `dependentRequired` for every input that `needs` others; and, under
+/// [`COMBINATORS`], the [`relations`] folded under one `allOf`. On an ENVELOPE action the
+/// properties are the FIELDS: the carrier is not one, and the server serializes the fields
+/// into it.
 pub fn input_schema(action: &ActionSpec) -> Value {
+    let carrier = envelope_carrier(action);
     let mut properties = Map::new();
     let mut required = Vec::new();
+    let mut dependent = Map::new();
     for input in &action.inputs {
+        if Some(input.name.as_str()) == carrier {
+            continue;
+        }
         properties.insert(input.name.clone(), property(input));
         if input.required {
             required.push(Value::String(input.name.clone()));
         }
+        if !input.needs.is_empty() {
+            dependent.insert(input.name.clone(), json!(input.needs));
+        }
     }
-    json!({
-        "type": "object",
-        "properties": Value::Object(properties),
-        "required": required,
-    })
+    let mut schema = Map::new();
+    schema.insert("type".into(), json!("object"));
+    schema.insert("properties".into(), Value::Object(properties));
+    schema.insert("required".into(), Value::Array(required));
+    let additional = match &action.arguments {
+        ikigai_core::Arguments::Open(summary) => {
+            json!({ "type": "string", "description": summary })
+        }
+        _ => json!(false),
+    };
+    schema.insert("additionalProperties".into(), additional);
+    if !dependent.is_empty() {
+        schema.insert("dependentRequired".into(), Value::Object(dependent));
+    }
+    if COMBINATORS == Placement::Schema {
+        let fragments: Vec<Value> = relations(action).into_iter().map(|(f, _)| f).collect();
+        if !fragments.is_empty() {
+            schema.insert("allOf".into(), Value::Array(fragments));
+        }
+    }
+    Value::Object(schema)
 }
 
 /// Project one action into an MCP tool descriptor: `{ name, description,
 /// inputSchema }`. The description prefers the action's own summary, then the
-/// endpoint's, so the model reads what the verb does on this endpoint.
+/// endpoint's, so the model reads what the verb does on this endpoint; under
+/// [`COMBINATORS`] it then states each of the action's [`relations`], so a group or a
+/// value dependency the schema cannot carry is read, never dropped.
 pub fn action_to_tool(description: &Description, action: &ActionSpec) -> Value {
-    let summary = if !action.summary.is_empty() {
+    let mut summary = if !action.summary.is_empty() {
         action.summary.clone()
     } else if !description.summary.is_empty() {
         description.summary.clone()
     } else {
         description.title.clone()
     };
+    if COMBINATORS == Placement::Description {
+        for (_, sentence) in relations(action) {
+            if !summary.is_empty() {
+                summary.push('\n');
+            }
+            summary.push_str(&sentence);
+        }
+    }
     json!({
         "name": tool_name(&description.id, action.verb),
         "description": summary,
@@ -682,89 +895,54 @@ pub fn endpoint_tools(description: &Description) -> Vec<Value> {
         .collect()
 }
 
-/// Pre-flight a tool call's JSON `arguments` against an action's declared
-/// contract — required present (Binding inputs ride the IRI, so exempt),
-/// `one_of` honored, XSD scalars plausible, no unknown argument names. Returns
-/// `None` when it conforms, or `Some(report)` — a SHACL `ValidationReport` whose
-/// `sh:resultPath` joins each violation to the catalog's input node — when it
-/// does not. Structured JSON in, so a value carrying a newline or `&` (a text
+/// A tool call's JSON `arguments` as the [`ProposedArgs`](ikigai_core::ProposedArgs) the one
+/// checker reads: a scalar is one pair (numbers and booleans stringified), an ARRAY is one
+/// pair per item (the repeats of a list argument, joined by
+/// [`ActionSpec::join_repeats`]), and `null` is not given. An object, or an array item that
+/// is not a scalar, has no lexical form; it is proposed EMPTY so the name is still checked
+/// (an unknown name is still reported), and the server refuses it by name before it gets here.
+pub fn proposed_args(arguments: &Value) -> ikigai_core::ProposedArgs {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    if let Some(map) = arguments.as_object() {
+        for (name, value) in map {
+            match value {
+                Value::Null => {}
+                Value::Array(items) => {
+                    for item in items {
+                        pairs.push((name.clone(), scalar(item).unwrap_or_default()));
+                    }
+                }
+                other => pairs.push((name.clone(), scalar(other).unwrap_or_default())),
+            }
+        }
+    }
+    ikigai_core::ProposedArgs::from_pairs(pairs)
+}
+
+/// Pre-flight a tool call's JSON `arguments` against an action's declared contract with
+/// core's one checker ([`ActionSpec::check`], ledger #1547): every rule `urn:kernel:validate`
+/// applies (required inputs, groups, `needs`, `one_of` and class per list item, repeats, the
+/// argument set). Returns `None` when it conforms, or `Some(report)` — a SHACL
+/// `ValidationReport` whose `sh:resultPath` joins each violation to the catalog's node and
+/// whose `sh:sourceConstraintComponent` names the rule, as `urn:kernel:validate` renders it
+/// — when it does not. Structured JSON in, so a value carrying a newline or `&` (a text
 /// tool's `in`) validates correctly, unlike the kernel's flat `k=v` args face.
+///
+/// It used to be a hand copy of the kernel's rules, and it had already drifted: it built
+/// `sh:resultPath` from the raw input name where core encodes it (ledger #1352).
 pub fn validate_arguments(
     description: &Description,
     action: &ActionSpec,
     arguments: &Value,
 ) -> Option<String> {
-    let empty = Map::new();
-    let args = arguments.as_object().unwrap_or(&empty);
-
-    // The focus node is the CONTRACT checked — content-addressed, so a mounted copy with a
-    // different contract is a different node — and every contract owns its input nodes
-    // under its own IRI, explicit and synthesized alike. Exactly what `urn:kernel:validate`
-    // and the catalog mint (core 0.1.91, ledger #948), so resultPath joins to the catalog.
-    let action_iri = action.contract_iri(&description.id);
-    let input_ns = format!("{action_iri}:input:");
-
-    let mut violations: Vec<(String, Option<String>)> = Vec::new();
-    for input in &action.inputs {
-        let node = format!("{input_ns}{}", input.name);
-        let value = args.get(&input.name).and_then(scalar);
-        if input.required && input.source != InputSource::Binding && value.is_none() {
-            violations.push((
-                format!("required input `{}` is missing", input.name),
-                Some(node),
-            ));
-            continue;
-        }
-        let Some(value) = value else { continue };
-        if !input.one_of.is_empty() && !input.one_of.iter().any(|v| v == &value) {
-            violations.push((
-                format!(
-                    "`{value}` is not an accepted value of `{}` (one of: {})",
-                    input.name,
-                    input.one_of.join(", ")
-                ),
-                Some(node),
-            ));
-            continue;
-        }
-        if let Some(class) = &input.class {
-            let ok = match class.as_str() {
-                "http://www.w3.org/2001/XMLSchema#boolean" => value == "true" || value == "false",
-                "http://www.w3.org/2001/XMLSchema#integer" => value.parse::<i64>().is_ok(),
-                "http://www.w3.org/2001/XMLSchema#dateTime" => {
-                    let b = value.as_bytes();
-                    b.len() >= 10
-                        && b[..4].iter().all(u8::is_ascii_digit)
-                        && b[4] == b'-'
-                        && b[5..7].iter().all(u8::is_ascii_digit)
-                        && b[7] == b'-'
-                        && b[8..10].iter().all(u8::is_ascii_digit)
-                }
-                _ => true,
-            };
-            if !ok {
-                violations.push((
-                    format!(
-                        "`{value}` does not look like a {class} for `{}`",
-                        input.name
-                    ),
-                    Some(node),
-                ));
-            }
-        }
-    }
-    for key in args.keys() {
-        if !action.inputs.iter().any(|i| &i.name == key) {
-            violations.push((
-                format!("unknown argument `{key}` — not in this action's contract"),
-                None,
-            ));
-        }
-    }
-
+    let violations = action.check(&proposed_args(arguments));
     if violations.is_empty() {
         return None;
     }
+    // The focus node is the CONTRACT checked — content-addressed, so a mounted copy with a
+    // different contract is a different node — and every path hangs off it exactly as the
+    // catalog and `urn:kernel:validate` mint it (core 0.1.91, ledger #948).
+    let action_iri = action.contract_iri(&description.id);
     let escape = |s: &str| {
         s.replace('\\', "\\\\")
             .replace('"', "\\\"")
@@ -772,16 +950,24 @@ pub fn validate_arguments(
     };
     let mut ttl = String::from("@prefix sh: <http://www.w3.org/ns/shacl#> .\n\n");
     ttl.push_str("<urn:ikigai:validation:report> a sh:ValidationReport ;\n    sh:conforms false");
-    for (message, path) in &violations {
+    for violation in &violations {
         ttl.push_str(&format!(
-            " ;\n    sh:result [ a sh:ValidationResult ;\n        sh:resultSeverity sh:Violation ;\n        sh:focusNode <{action_iri}>"
+            " ;\n    sh:result [ a sh:ValidationResult ;\n        sh:resultSeverity sh:Violation ;\n        sh:focusNode <{}>",
+            ikigai_core::escape_iri_fragment(&action_iri)
         ));
-        if let Some(path) = path {
-            ttl.push_str(&format!(" ;\n        sh:resultPath <{path}>"));
+        if let Some(path) = &violation.path {
+            ttl.push_str(&format!(
+                " ;\n        sh:resultPath <{}>",
+                ikigai_core::escape_iri_fragment(&path.node_iri(&action_iri))
+            ));
         }
         ttl.push_str(&format!(
+            " ;\n        sh:sourceConstraintComponent <{}>",
+            violation.kind.component()
+        ));
+        ttl.push_str(&format!(
             " ;\n        sh:resultMessage \"{}\" ]",
-            escape(message)
+            escape(&violation.message)
         ));
     }
     ttl.push_str(" .\n");
@@ -844,6 +1030,222 @@ mod tests {
         let action = &d.action_specs()[0];
         let report = validate_arguments(&d, action, &json!({ "n": "1\r2" })).expect("a violation");
         assert!(!report.contains('\r'), "raw CR in the report: {report:?}");
+    }
+
+    /// ledger #1547: the JSON face reaches core's one checker with the SAME proposal the
+    /// shared validation vectors state. `tests/vectors/validation_vectors.json` is a copy of
+    /// ikigai-vocab 0.1.106's (computed by `ActionSpec::check`, and pinned by Python's and
+    /// Deno's `serve` too): each case's pairs become a JSON object (a name given several times
+    /// becomes an array, which is how an MCP client sends a list), and the violations
+    /// `validate_arguments` sees are the vector's, kind and path, in order. A core whose
+    /// checker answers differently fails here until the copy is refreshed.
+    #[test]
+    fn the_shared_validation_vectors_hold_through_the_json_face() {
+        let vectors: Value =
+            serde_json::from_str(include_str!("../tests/vectors/validation_vectors.json"))
+                .expect("the vectors parse");
+        let cases = vectors["cases"].as_array().expect("cases");
+        assert!(cases.len() > 30, "the whole table: {}", cases.len());
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let action: ActionSpec =
+                serde_json::from_value(case["action"].clone()).expect("an ActionSpec");
+            let mut object = Map::new();
+            for pair in case["args"].as_array().unwrap() {
+                let (k, v) = (pair[0].as_str().unwrap(), pair[1].clone());
+                match object.get_mut(k) {
+                    None => {
+                        object.insert(k.to_string(), v);
+                    }
+                    Some(Value::Array(items)) => items.push(v),
+                    Some(first) => *first = Value::Array(vec![first.clone(), v]),
+                }
+            }
+            let arguments = Value::Object(object);
+            let got: Vec<(String, Option<String>)> = action
+                .check(&proposed_args(&arguments))
+                .into_iter()
+                .map(|v| (v.kind.word().to_string(), v.path.map(|p| p.word())))
+                .collect();
+            let want: Vec<(String, Option<String>)> = case["violations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| {
+                    (
+                        v["kind"].as_str().unwrap().to_string(),
+                        v["path"].as_str().map(str::to_string),
+                    )
+                })
+                .collect();
+            assert_eq!(got, want, "{name}: {arguments}");
+            let description = Description::new("vector");
+            assert_eq!(
+                validate_arguments(&description, &action, &arguments).is_none(),
+                case["conforms"].as_bool().unwrap(),
+                "{name}"
+            );
+        }
+    }
+
+    /// The report names the RULE as `urn:kernel:validate` does (`sh:sourceConstraintComponent`)
+    /// and a group's node as its path, so a client repairs a group violation from the report.
+    #[test]
+    fn a_group_violation_is_reported_at_the_groups_node() {
+        use ikigai_core::InputGroup;
+        let d = Description::new("cut")
+            .verb(Verb::Sink)
+            .input(ArgSpec::new("thread").optional())
+            .input(ArgSpec::new("content").optional())
+            .group(InputGroup::exactly_one(["thread", "content"]).pipe("content"));
+        let action = &d.action_specs()[0];
+        assert!(validate_arguments(&d, action, &json!({"thread": "urn:x"})).is_none());
+        let report = validate_arguments(&d, action, &json!({})).expect("none given");
+        let contract = action.contract_iri("cut");
+        assert!(
+            report.contains(&format!(
+                "sh:resultPath <{contract}:group:exactly-one:content,thread>"
+            )),
+            "{report}"
+        );
+        assert!(report.contains("shacl#XoneConstraintComponent"), "{report}");
+        assert!(report.contains("got none"), "{report}");
+    }
+
+    /// ledger #1547's projection, construct by construct: a LIST is an array of its items'
+    /// type and enumeration; an EMPTY enumeration is `"enum": []`; a default is TYPED as
+    /// declared (`50` for an integer, `false` for a boolean, an array for a list); examples
+    /// ride along; a value's meaning is a `word: meaning` line; `needs` is
+    /// `dependentRequired`; a closed set is `additionalProperties: false`, an open one a
+    /// described string; an envelope's carrier is not a property.
+    #[test]
+    fn the_schema_projects_the_argspec_shape() {
+        use ikigai_core::{ListSeparator, ValueNote};
+        const INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
+        let d = Description::new("review")
+            .verb(Verb::Source)
+            .input(
+                ArgSpec::new("proposals")
+                    .optional()
+                    .list(ListSeparator::Comma)
+                    .one_of(["minor", "major"])
+                    .default_value("minor,major"),
+            )
+            .input(ArgSpec::new("limit").class(INTEGER).default_value("50"))
+            .input(ArgSpec::new("strict").default_value(false))
+            .input(ArgSpec::new("color").optional().example("#336699"))
+            .input(
+                ArgSpec::new("decision")
+                    .optional()
+                    .one_of(["publish", "retract"])
+                    .value(
+                        "retract",
+                        ValueNote::new()
+                            .summary("withdraw a published decision")
+                            .needs(["revises"]),
+                    ),
+            )
+            .input(ArgSpec::new("revises").optional())
+            .input(ArgSpec::new("endpoint").optional().needs(["verb"]))
+            .input(ArgSpec::new("verb").optional())
+            .input(
+                ArgSpec::new("provider")
+                    .optional()
+                    .one_of(Vec::<String>::new()),
+            );
+        let schema = input_schema(&d.action_specs()[0]);
+        let p = &schema["properties"];
+        assert_eq!(
+            p["proposals"],
+            json!({"type": "array", "items": {"type": "string", "enum": ["minor", "major"]},
+                   "default": ["minor", "major"]})
+        );
+        assert_eq!(p["limit"]["default"], json!(50));
+        assert_eq!(p["limit"]["type"], "integer");
+        assert_eq!(p["strict"]["default"], json!(false));
+        assert_eq!(p["strict"]["type"], "boolean");
+        assert_eq!(p["color"]["examples"], json!(["#336699"]));
+        assert_eq!(
+            p["decision"]["description"],
+            "retract: withdraw a published decision"
+        );
+        assert_eq!(p["provider"]["enum"], json!([]));
+        assert_eq!(schema["dependentRequired"], json!({"endpoint": ["verb"]}));
+        assert_eq!(schema["additionalProperties"], json!(false));
+        // No top-level combinator: Claude Code's API refuses them (see `Placement`).
+        for combinator in ["allOf", "oneOf", "anyOf", "not", "if"] {
+            assert!(schema.get(combinator).is_none(), "{combinator}: {schema}");
+        }
+
+        let open = ActionSpec::new(Verb::Source)
+            .input(ArgSpec::new("src"))
+            .open_arguments("each fills a {name} marker in the body");
+        assert_eq!(
+            input_schema(&open)["additionalProperties"],
+            json!({"type": "string", "description": "each fills a {name} marker in the body"})
+        );
+
+        let envelope = ActionSpec::new(Verb::Sink)
+            .input(ArgSpec::new("email"))
+            .input(ArgSpec::new("note").optional())
+            .input(ArgSpec::new("content"))
+            .envelope("content");
+        let schema = input_schema(&envelope);
+        assert!(schema["properties"].get("content").is_none(), "{schema}");
+        assert_eq!(schema["required"], json!(["email"]));
+    }
+
+    /// ledger #1547, Q4: a relation the schema cannot carry at the top level (a group, a
+    /// value's `needs`) is STATED in the tool's description, never dropped; the JSON-Schema
+    /// fragment for each is still built, so a client that accepts combinators can be given
+    /// them by flipping [`COMBINATORS`].
+    #[test]
+    fn relations_fall_back_to_the_tool_description() {
+        use ikigai_core::{InputGroup, ValueNote};
+        let d = Description::new("validate")
+            .summary("pre-flight a call")
+            .verb(Verb::Source)
+            .input(ArgSpec::new("action").optional())
+            .input(ArgSpec::new("endpoint").optional())
+            .input(ArgSpec::new("a").optional())
+            .input(ArgSpec::new("b").optional())
+            .input(
+                ArgSpec::new("decision")
+                    .optional()
+                    .one_of(["keep", "retract"])
+                    .value("retract", ValueNote::new().needs(["action"])),
+            )
+            .group(InputGroup::exactly_one(["action", "endpoint"]))
+            .group(InputGroup::at_most_one(["a", "b"]));
+        let action = &d.action_specs()[0];
+        let tool = action_to_tool(&d, action);
+        let text = tool["description"].as_str().unwrap();
+        assert!(text.starts_with("pre-flight a call\n"), "{text}");
+        assert!(
+            text.contains("Give exactly one of `action`, `endpoint`."),
+            "{text}"
+        );
+        assert!(text.contains("Give at most one of `a`, `b`."), "{text}");
+        assert!(
+            text.contains("`decision=retract` needs `action`."),
+            "{text}"
+        );
+
+        let fragments: Vec<Value> = relations(action).into_iter().map(|(f, _)| f).collect();
+        assert_eq!(
+            fragments[0],
+            json!({"oneOf": [{"required": ["action"]}, {"required": ["endpoint"]}]})
+        );
+        assert_eq!(
+            fragments[1],
+            json!({"not": {"anyOf": [{"required": ["a", "b"]}]}})
+        );
+        assert_eq!(
+            fragments[2],
+            json!({"if": {"properties": {"decision": {"const": "retract"}},
+                          "required": ["decision"]},
+                   "then": {"required": ["action"]}})
+        );
     }
 
     #[test]
