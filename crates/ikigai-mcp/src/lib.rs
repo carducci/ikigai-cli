@@ -935,7 +935,7 @@ mod tests {
         for id in [
             "echo",
             "urn:llm:config",
-            "urn:meeting:zoom:schedule",
+            "meeting",
             "browse-explain-versions",
         ] {
             let name = checked_tool_name(id, Verb::Source).expect(id);

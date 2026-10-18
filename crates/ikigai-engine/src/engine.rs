@@ -1544,7 +1544,7 @@ impl Engine {
     /// target is routed as named arguments; the **verbatim remainder** (untokenized,
     /// so whitespace and quotes survive) becomes the `content` argument. This keeps
     /// `sink urn:file:notes.txt remember   the milk` byte-exact when there are no
-    /// named args, while letting `sink urn:httpPost url=https://… the body` name the
+    /// named args, while letting `sink urn:http:post url=https://… the body` name the
     /// URL and still pass an arbitrary body. The contract is only consulted when the
     /// first word looks like `key=value`, so a plain content write needs no lookup.
     ///

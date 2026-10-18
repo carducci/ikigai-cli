@@ -1077,8 +1077,13 @@ ikigai-fs = "0.1.8" # 0.1.8 is a SECURITY floor (audit round 3, ledger #856): th
 # `foaf.rs` (the door's document store) and the conformance fixture kernel. The default
 # live mount is unchanged, so nothing else here moves.
 # 0.1.5 = path declared as Binding input (urn:file/orgfile rows in urn:kernel:actions)
-# Outbound HTTP-client module (urn:httpGet…), linked as a published module crate.
-ikigai-http = "0.1.9" # 0.1.9 = a host-DENY survives attenuate and clamp (core floor 0.1.86, ledger #874): a
+# Outbound HTTP-client module (urn:http:get…), linked as a published module crate.
+ikigai-http = "0.2.0" # 0.2.0 = the naming wave (ledger #11): the six ids are `http-get` … `http-delete` and the
+# IRIs `urn:http:get` … `urn:http:delete`; the old `urn:httpGet` … IRIs resolve as deprecated aliases through 0.2.x
+# (0.3.0 removes them), so this host's own wiring and text use the new names. `space()` returns core's `Alias`
+# overlay, held here as `Arc<dyn Space>`. `HttpTransport` is shared with ikigai-llm 0.15 and ikigai-meeting 0.3,
+# so the three move together: one transport is handed to all three spaces.
+# Beneath it, still true: 0.1.9 = a host-DENY survives attenuate and clamp (core floor 0.1.86, ledger #874): a
 # narrowed capability no longer reaches a denied path. A safety floor, and the version the lock
 # already built. Beneath it, still true: 0.1.8 = every input of the six verbs had been declared REQUIRED —
 # `authorization`, `range`, `headers` and the rest. `ikigai-mcp` projects `required` straight
@@ -1103,7 +1108,9 @@ ikigai-runbook = "0.2.1" # 0.2.1 = the 0.2 line names its `space()` `urn:iki:spa
 # 0.1.13 added `hide_tab`/`tab_ids`, which this workspace does not call yet.
 # 0.1.12 Lisp page: + generated aliases (named verbs, cap-scoped, transcluded)
 # Linked Data toolkit (separate ikigai-linkeddata repo): RDF transreption + SPARQL.
-ikigai-rdf = "0.2.1" # 0.2.1 = the linkeddata lockstep line (`ikigai-sparql` 0.2.1 depends on it): `urn:iki:space:rdf`
+ikigai-rdf = "0.2.6" # 0.2.6 = the linkeddata lockstep line that names the HTTP GET `urn:http:get`
+# (ledger #11) and makes every cacheable RDF face byte-stable across recomputation (ledger #1566).
+# Beneath it, still true: 0.2.1 = the linkeddata lockstep line (`ikigai-sparql` 0.2.1 depends on it): `urn:iki:space:rdf`
 # (ledger #987), and Turtle / JSON / RDF-XML nesting refused past 64 before a recursive parser
 # sees it.
 # Beneath it, still true: 0.1.8 = `urn:rdf:transrept` declares all seven faces it produces
@@ -1111,7 +1118,11 @@ ikigai-rdf = "0.2.1" # 0.2.1 = the linkeddata lockstep line (`ikigai-sparql` 0.2
 # one_of/default. 0.1.9 is a dev-dependency bump for this crate only, so 0.1.8 is the true
 # minimum rather than the newest. 0.1.3 = + urn:rdf:union / urn:rdf:diff (graph set ops,
 # with= carries ?k=v args)
-ikigai-sparql = "0.2.1" # 0.2.1 is a SECURITY floor (ledger #1083): `SERVICE` and `LOAD` are refused as a typed
+ikigai-sparql = "0.2.6" # 0.2.6 = the linkeddata lockstep line (ledger #11): a `graph=` source fetched over HTTP
+# goes through `urn:http:get`; between 0.2.1 and 0.2.6 the shared store's triple terms are bounded (ledger #1326),
+# GRAPH patterns count toward the join bound (ledger #1426, #1429), and a non-RDF `graph=` source is transrepted
+# to RDF (ledger #1442).
+# Beneath it, still true: 0.2.1 is a SECURITY floor (ledger #1083): `SERVICE` and `LOAD` are refused as a typed
 # `InvalidArgument` at every door, before evaluation, and every evaluator carries a refusing
 # service handler. This build has oxigraph's `http-client` ON (rudof, through `ikigai-shacl`,
 # turns it on by feature unification), so through 0.1.11 `SERVICE <http://…>` in a caller's query
@@ -1140,7 +1151,8 @@ ikigai-sparql = "0.2.1" # 0.2.1 is a SECURITY floor (ledger #1083): `SERVICE` an
 # `space_with_store` — which the browse composition uses — behind `urn:cap:sparql:update`.
 # 0.1.6 = space_with_store (shared-store seam for browse/annotations)
 # Content sniffing + sniff-and-dispatch (urn:sniff, urn:transrept:auto).
-ikigai-sniff = "0.2.1" # 0.2.1 = the linkeddata lockstep line: `urn:iki:space:sniff` (ledger #987).
+ikigai-sniff = "0.2.6" # 0.2.6 = the linkeddata lockstep line (ledger #11).
+# Beneath it, still true: 0.2.1 = the linkeddata lockstep line: `urn:iki:space:sniff` (ledger #987).
 # Beneath it, still true: 0.1.9 sniffs a leading `<urn:…>` subject as text/turtle. Below it
 # `angle_token_is_iri` tested for `://` — an AUTHORITY, not a scheme — so every Turtle
 # document whose first subject is a URN sniffed as application/rdf+xml and died in the XML
@@ -1210,7 +1222,11 @@ ikigai-encrypt = "0.2.0" # 0.2.0 = naming only: names its `space()` `urn:iki:spa
 # cacheable as its key, which is the correct claim. This host served the cached one.
 # Secrets custody: urn:secret:{name} (cap-gated read) + urn:secret:generate/unlock
 # (Ed25519 keygen + Touch ID), macOS Keychain backend. Owner-only, not served.
-ikigai-secret = "0.1.8" # 0.1.8 = a secret name beginning with `-` is refused as `InvalidArgument` on every face, before
+ikigai-secret = "0.2.0" # 0.2.0 = the naming wave (ledger #11): the `urn:secret:{name}` endpoint's id is `secret`
+# (was `urn:secret`), so its MCP tools are `secret__*`. IRIs unchanged. 0.2.0 also injects the presence gate
+# (`space_with_gate`; `space` keeps the platform gate) and adds Exists and Delete under a new
+# `urn:cap:secret:delete:<name>` (ledger #201, #202, #1525).
+# Beneath it, still true: 0.1.8 = a secret name beginning with `-` is refused as `InvalidArgument` on every face, before
 # any backend sees it. The space stays host-named.
 # Beneath it, still true: 0.1.7 is a SECURITY floor (ledger #854): the file store maps names
 # injectively, writes 0600 atomically, and generate needs write authority. 0.1.6 gives `urn:secret:{name}` per-verb ActionSpecs — Source under
@@ -1344,7 +1360,10 @@ ikigai-repo = "0.2.0" # 0.2.0 = naming only: names its `space()` `urn:iki:space:
 # Repository browsing (urn:repo:{root}:tree/file/state/hash/explain +
 # urn:iki:annotation:*) over configured roots — opt-in via `browse.root` config lines
 # (embedded host).
-ikigai-browse = "0.18.5" # 0.18.5 is a CORRECTNESS floor (ledger #1207, #1253): every archive record
+ikigai-browse = "0.18.10" # 0.18.10 = on ikigai-a11y 0.3.0, the naming wave (ledger #11), and the core floor it
+# imposes. Between 0.18.5 and 0.18.10: one writer per store handle narrowed to the mount graph (ledger #1324), and a
+# paged findings listing that refuses an unpaged answer past 32 MiB (ledger #1663).
+# Beneath it, still true: 0.18.5 is a CORRECTNESS floor (ledger #1207, #1253): every archive record
 # (an explanation, an annotation, a finding, a decision) commits as ONE transaction on ikigai-store's
 # SharedWriter (store 0.2.15, which it pulls in), so a rewrite is atomic and a crash cannot leave a
 # record half-written. A patch: no Rust API, resource name or capability this host uses moved.
@@ -1482,7 +1501,11 @@ ikigai-throttle = "0.1.11" # 0.1.11 = the overlays forward `topology()` and `id(
 # Timeout governor + Failover (the --prefer mount degrades through it)
 # LLM inference (urn:llm:ask + urn:llm:<provider>:ask + urn:llm:config): a facade grammar
 # over pluggable backends. OpenAI-compatible REST backend (Ollama/vLLM/llama.cpp/mlx_lm).
-ikigai-llm = "0.13.1" # 0.13.1 = an unstructured backend error body is DESCRIBED rather than forwarded into the error
+ikigai-llm = "0.15.0" # 0.15.0 = on ikigai-http 0.2.0 (ledger #11): `space(transport, registry)` takes the
+# 0.2 `HttpTransport`, the one this host hands ikigai-http and ikigai-meeting too, so the three move together.
+# 0.14.0 typed transport failures for the reliability overlays (ledger #88) and matches `as=` by media-type
+# essence (ledger #179).
+# Beneath it, still true: 0.13.1 = an unstructured backend error body is DESCRIBED rather than forwarded into the error
 # text this host relays. The space stays host-named.
 # Beneath it, still true: 0.13.0: the audit round 5 fixes (ledger #884), a SECURITY floor. 0.12.1 stops a backend's 4xx body reaching the error text verbatim —
 # only the OpenAI-shaped `error.message` is kept — so a PROMPT can no longer appear in an
@@ -1502,7 +1525,9 @@ ikigai-llm = "0.13.1" # 0.13.1 = an unstructured backend error body is DESCRIBED
 # urn:llm:{provider}:model, which browse's explain archive keys its version tags on.
 # Video-conference scheduling (urn:meeting:schedule + urn:meeting:<provider>:schedule): a facade
 # over provider backends, Zoom first. Now on crates.io — the git-rev bridge retired at first publish.
-ikigai-meeting = "0.1.2" # 0.1.2 = the Zoom `account_id` moves out of the token URL into the form body, and the Turtle face
+ikigai-meeting = "0.3.0" # 0.3.0 = on ikigai-http 0.2.0 (ledger #11), the shared `HttpTransport`. 0.2.0 renamed
+# the description id `urn:meeting:zoom:schedule` → `meeting` (IRIs unchanged) and added `attendees`.
+# Beneath it, still true: 0.1.2 = the Zoom `account_id` moves out of the token URL into the form body, and the Turtle face
 # escapes line breaks. API unchanged.
 # Beneath it, still true: 0.1.1 runs the module's OWN rules — both Zoom hosts, port-aware,
 # and each credential name — BEFORE any secret is read. The original read all three secrets

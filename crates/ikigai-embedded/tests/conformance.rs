@@ -175,12 +175,12 @@ const INHERITED: &[(&str, &str)] = &[
     ("contacts", "ikigai-personal"),
     ("eval", "ikigai-lisp"),
     ("file", "ikigai-fs"),
-    ("httpDelete", "ikigai-http"),
-    ("httpGet", "ikigai-http"),
-    ("httpHead", "ikigai-http"),
-    ("httpPatch", "ikigai-http"),
-    ("httpPost", "ikigai-http"),
-    ("httpPut", "ikigai-http"),
+    ("http-delete", "ikigai-http"),
+    ("http-get", "ikigai-http"),
+    ("http-head", "ikigai-http"),
+    ("http-patch", "ikigai-http"),
+    ("http-post", "ikigai-http"),
+    ("http-put", "ikigai-http"),
     ("ikigai-vocab", "ikigai-vocab"),
     ("jsonld-compact", "ikigai-jsonld"),
     ("jsonld-expand", "ikigai-jsonld"),
@@ -226,8 +226,8 @@ const INHERITED: &[(&str, &str)] = &[
     ("sparql-describe", "ikigai-sparql"),
     ("sparql-from-sexpr", "ikigai-sexpr"),
     ("sparql-select", "ikigai-sparql"),
-    ("urn:meeting:zoom:schedule", "ikigai-meeting"),
-    ("urn:secret", "ikigai-secret"),
+    ("meeting", "ikigai-meeting"),
+    ("secret", "ikigai-secret"),
     ("secret-generate", "ikigai-secret"),
     ("secret-unlock", "ikigai-secret"),
     ("grep", "ikigai-text"),
@@ -256,11 +256,11 @@ const OWNER_ONLY: &[&str] = &[
     "eval",
     "system-exec",
     "repo-status",
-    "urn:secret",
+    "secret",
     "secret-generate",
     "secret-unlock",
     "send",
-    "urn:meeting:zoom:schedule",
+    "meeting",
     "client-issue",
     "peer-list",
     // The picture of THIS host's arrangement: local root only (ikigai-diagram), like
@@ -729,12 +729,12 @@ fn door_suite() -> Suite {
              nothing and answers the bad-link page (pinned by \
              every_bad_label_link_records_nothing in src/contactblock.rs)",
         )
-        // Ours, and it fetches: every face of `urn:iki:foaf` starts with a `urn:httpGet` of
+        // Ours, and it fetches: every face of `urn:iki:foaf` starts with a `urn:http:get` of
         // `src=`. Its capability floor is pinned by hand instead, in
         // `foaf::tests::without_a_net_grant_the_door_refuses` — which is the check `opt_out`
         // drops (conformance PENDING #21) and the one that matters for a network-backed
         // action.
-        .opt_out("foaf", None, "issues urn:httpGet: reaches the network")
+        .opt_out("foaf", None, "issues urn:http:get: reaches the network")
         // ★ A FALSE POSITIVE with a real observation inside it, and the reason it is an
         // opt-out rather than a fix.
         //
@@ -911,7 +911,7 @@ fn conforms() {
 ///    clockless kernel is not a deadline — it is simply uncacheable. The door binds
 ///    `http_space()`, whose `Cache-Control: max-age` deadlines are exactly that expiry, so
 ///    the FOAF face re-fetched its source on every single hit. The symptom the suite printed
-///    was two lines about `clock-now` and `tz-now`; the cost was on `urn:httpGet`, which is
+///    was two lines about `clock-now` and `tz-now`; the cost was on `urn:http:get`, which is
 ///    inherited (not walked) and could not have reported it itself.
 #[test]
 fn a_clock_derived_result_expires_rather_than_threading() {
@@ -939,7 +939,7 @@ fn a_clock_derived_result_expires_rather_than_threading() {
                     &ikigai_core::Capability::root(),
                 ),
                 "{label}: `{target}` is not cached — this kernel has no clock, so every \
-                 `Expiry::At` result on it (including every `urn:httpGet` max-age) \
+                 `Expiry::At` result on it (including every `urn:http:get` max-age) \
                  recomputes on every request"
             );
         }
