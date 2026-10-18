@@ -2583,13 +2583,13 @@ mod tests {
         }
     }
 
-    /// A read through the KERNEL, not through `Resolver::issue_as`. ⚠ Since core 0.1.105
-    /// `Resolver::issue_as`'s cache-status probe (`Kernel::is_cached`) resolves a `Meta` to
-    /// read the declared defaults (ledger #19), and a mount answers a `Meta` resolution by
-    /// asking its peer NOW (ledger #1146), so every read through the resolver forwards one
-    /// `Meta` more, memo or not. These tests are about the MOUNT's memo, so they read past
-    /// the probe; what the probe costs is pinned on its own, in
-    /// `the_cache_probe_asks_a_mounts_peer_once_per_resolver_read`.
+    /// A read through the KERNEL, not through `Resolver::issue_as`. These tests are about the
+    /// MOUNT's memo, so they read without the resolver's cache-status probe
+    /// (`Kernel::is_cached`) in the way. Core 0.1.105 and 0.1.106 made that probe resolve a
+    /// `Meta` for the declared defaults, which a mount forwards to its peer at once (ledger
+    /// #1146); since core 0.1.107 the probe keys a served name without resolving it (ledger
+    /// #1884), so it asks the peer nothing. What the probe costs is pinned on its own, in
+    /// `the_cache_probe_asks_a_mounts_peer_nothing_on_a_resolver_read`.
     fn read_as(
         kernel: &Kernel,
         iri: &str,
@@ -2599,16 +2599,15 @@ mod tests {
         block_on(kernel.issue(request, capability))
     }
 
-    /// ⚠ The cost core 0.1.105 added, pinned so its fix is noticed (reported to the hub with
-    /// ledger #1547). `Resolver::issue_as` probes `Kernel::is_cached` before each read, and
-    /// that probe now resolves a `Meta` for the target's declared defaults; a mount's `Meta`
-    /// resolution forwards to the peer at once, by design (ledger #1146). So a hot mounted
-    /// read through the resolver (the engine's path) costs one peer `Meta` again, which is
-    /// what ledger #1577's memo had removed. The mount's own memo still holds (the reads
-    /// themselves ask nothing): the extra forward is the probe's alone. When this count
-    /// drops to one, the probe has stopped asking, and this test should say so.
+    /// ★ Ledger #1884. `Resolver::issue_as` probes `Kernel::is_cached` before each read (the
+    /// engine's path). In core 0.1.105 and 0.1.106 that probe resolved a `Meta` for the
+    /// target's declared defaults, and a mount's `Meta` resolution forwards to the peer at
+    /// once, by design (ledger #1146), so every hot mounted read through the resolver cost
+    /// one peer `Meta` and undid ledger #1577's memo: N reads, N `Meta`s. Since core 0.1.107
+    /// the probe keys a served name without resolving it, so N resolver reads ask the peer
+    /// for the contract once, the mount memo's one, the same as N reads through the kernel.
     #[test]
-    fn the_cache_probe_asks_a_mounts_peer_once_per_resolver_read() {
+    fn the_cache_probe_asks_a_mounts_peer_nothing_on_a_resolver_read() {
         const N: usize = 10;
         let (_space, peer) = swappable_peer(None);
         let wire = Counted::over(&peer);
@@ -2625,8 +2624,8 @@ mod tests {
         assert_eq!(wire.others(), N, "every read is forwarded");
         assert_eq!(
             wire.metas(),
-            N,
-            "the cache-status probe asks the peer for the contract on every resolver read"
+            1,
+            "{N} resolver reads asked the peer for the contract once: the probe asks nothing"
         );
     }
 

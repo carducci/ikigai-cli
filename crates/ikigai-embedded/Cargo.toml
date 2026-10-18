@@ -168,7 +168,9 @@ futures = { workspace = true }
 # ⚠ `^0.8.0` is also a ceiling below 0.9.0.
 # 0.9.0 (ledger #1547): REQUIRED probes input groups through `ActionSpec::check`, OUTPUTS honors `output_from`,
 # open argument sets and empty enumerations are understood. ⚠ `^0.9.0` is also a ceiling below 0.10.0.
-ikigai-conformance = "0.9.0"
+# 0.9.1 (ledger #1882): VALIDATE's hint allows an optional binding's default (core 0.1.106). Not an API floor.
+# ⚠ `^0.9.1` is also a ceiling below 0.10.0.
+ikigai-conformance = "0.9.1"
 # The conformance fixture SEEDS the two edge verifying keys and one signing key, so the
 # decision faces are walked over real state instead of reporting "did not resolve". Same
 # version and features as the library dependency above: the fixture must write exactly the
