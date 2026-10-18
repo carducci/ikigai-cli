@@ -184,7 +184,11 @@ pub struct IntakeConfig {
     /// for a plain form POST, so the visitor lands back on the site instead of on a bare word.
     ///
     /// The URL is a fixed part of the configuration, never a submitted value, so this is not
-    /// an open redirect. It is HTML-escaped into the page defensively all the same.
+    /// an open redirect. It is checked and escaped all the same, with the ecosystem's one rule
+    /// (`ikigai_fn::html::safe_href`, then `attr`; ledger #1868): an `http(s)://` URL or a
+    /// same-origin `/path`. Anything else (`javascript:`, `data:`, `//host`, a relative
+    /// `thanks.html`) is not a link target, and the answer is the plain `received` body, as if
+    /// no redirect were configured.
     pub redirect: Option<String>,
     /// Reject a submission whose `email_field` is on the `urn:decisions` blocklist, at the
     /// door — before the tuple is ever dropped, so a blocked sender's message never reaches a
@@ -222,47 +226,24 @@ pub fn submit(config: IntakeConfig) -> IntakeEndpoint {
     IntakeEndpoint { config }
 }
 
-/// Escape a string for an HTML text or double-quoted attribute context: `&`, `<`, `>`, `"` and
-/// `'` become entities and every other character passes through. Enough for a URL and a page;
-/// the public link pages in `ikigai-embedded` use it for every value they interpolate.
-///
-/// ⚠ A private copy of the ecosystem's escape, `ikigai_fn::html::html_text` (ledger #1813),
-/// kept only because no published `ikigai-fn` carries the `html` module yet (0.4.1, the newest
-/// on crates.io, does not). Once one does, this becomes a call to it (ledger #1866); the one
-/// difference is that `html_text` also replaces a C0 control other than tab, line feed and
-/// carriage return with U+FFFD.
-///
-/// ```
-/// assert_eq!(
-///     ikigai_intake::html_escape(r#"<a href="x">Tom & Jerry's</a>"#),
-///     "&lt;a href=&quot;x&quot;&gt;Tom &amp; Jerry&#39;s&lt;/a&gt;"
-/// );
-/// ```
-pub fn html_escape(s: &str) -> String {
-    s.chars()
-        .flat_map(|c| match c {
-            '&' => "&amp;".chars().collect::<Vec<_>>(),
-            '<' => "&lt;".chars().collect(),
-            '>' => "&gt;".chars().collect(),
-            '"' => "&quot;".chars().collect(),
-            '\'' => "&#39;".chars().collect(),
-            c => vec![c],
-        })
-        .collect()
-}
-
 /// The response to a submission the endpoint accepted (a real one, or a honeypot hit that must
 /// look identical). With no `redirect`, a plain `received` body; with one, a small unstyled
 /// HTML shim that bounces straight to the redirect URL (a styled confirmation page
-/// on the site, which carries the actual "message received" wording).
+/// on the site, which carries the actual "message received" wording). A redirect that
+/// `ikigai_fn::html::safe_href` refuses is treated as no redirect: never a link to a
+/// `javascript:` or another host's `//` target.
 fn accepted(config: &IntakeConfig) -> Representation {
-    match &config.redirect {
+    match config
+        .redirect
+        .as_deref()
+        .and_then(ikigai_fn::html::safe_href)
+    {
         None => Representation::new(
             ReprType::new("text/plain").with_param("charset", "utf-8"),
             b"received\n".to_vec(),
         ),
         Some(url) => {
-            let url = html_escape(url);
+            let url = ikigai_fn::html::attr(url);
             // A meta refresh drives the redirect — works with no JS, no external anything — and
             // a manual link covers the case where even that is blocked. This page is a bare
             // SHIM, not the confirmation: the redirect target is the site's own styled
@@ -1027,6 +1008,41 @@ mod tests {
             !page.contains(r#"b="2""#),
             "no raw quote in the page: {page}"
         );
+    }
+
+    #[test]
+    fn a_redirect_that_is_not_a_safe_link_target_is_no_redirect() {
+        // `ikigai_fn::html::safe_href` (ledger #1868): a script scheme, another host's `//`
+        // target, a data URL or a control character hidden in the scheme never becomes the
+        // shim's `href` or refresh target. The answer is the plain body, as with no redirect.
+        for hostile in [
+            "javascript:alert(1)",
+            " JavaScript:alert(1)",
+            "java\tscript:alert(1)",
+            "//evil.example/",
+            "/\\evil.example/",
+            "data:text/html,<script>alert(1)</script>",
+            "thanks.html",
+        ] {
+            let (k, _) = redirecting_kernel(hostile);
+            let rep =
+                block_on(k.issue(post("name=A&email=a%40x.example&message=hi"), &cap())).unwrap();
+            assert_eq!(rep.repr_type.media_type, "text/plain", "{hostile:?}");
+            assert_eq!(
+                String::from_utf8(rep.bytes).unwrap(),
+                "received\n",
+                "{hostile:?}"
+            );
+        }
+        // A same-origin path is a link target.
+        let (k, _) = redirecting_kernel("/thanks");
+        let page = String::from_utf8(
+            block_on(k.issue(post("name=A&email=a%40x.example&message=hi"), &cap()))
+                .unwrap()
+                .bytes,
+        )
+        .unwrap();
+        assert!(page.contains("<a href=\"/thanks\">"), "{page}");
     }
 
     /// A stand-in client registry: one known token, and a record of what was asked for.

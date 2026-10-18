@@ -3205,9 +3205,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-fn"
-version = "0.4.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e185b92413bb8f962698093e87c314ff5459b2c4a4b4c8dd83f5dd6407d6a5be"
+checksum = "b5a96cbbd7cbfd8df970ac61500759ff9ebb862e89ef476a80c1afee5651adbc"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3246,6 +3246,7 @@ dependencies = [
  "chrono-tz",
  "futures",
  "ikigai-core",
+ "ikigai-fn",
  "serde_json",
 ]
 
@@ -3697,6 +3698,7 @@ dependencies = [
  "chrono",
  "futures",
  "ikigai-core",
+ "ikigai-fn",
  "libc",
  "serde_json",
  "tokio",

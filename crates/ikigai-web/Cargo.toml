@@ -11,6 +11,9 @@ readme = "README.md"
 [dependencies]
 # The kernel it serves.
 ikigai-core = { workspace = true }
+# `ikigai_fn::html::html_text`: the error page escapes its status and message with the
+# ecosystem's one escaper (ledger #1868).
+ikigai-fn = { workspace = true }
 # Minimal async I/O for the accept loop + per-connection handler (hand-rolled HTTP/1.1,
 # mirroring ikigai-cms-web's serve_http — Apache fronts it, so parsing stays small).
 tokio = { version = "1", features = ["net", "io-util", "rt", "rt-multi-thread", "macros", "time", "sync"] }
