@@ -3023,6 +3023,7 @@ dependencies = [
  "ikigai-mcp",
  "ikigai-quic",
  "ikigai-resolve",
+ "ikigai-sparql",
  "ikigai-web",
  "ikigai-wire",
  "libc",

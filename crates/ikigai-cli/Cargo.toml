@@ -144,3 +144,7 @@ ikigai-layers = { workspace = true }
 # holding a VALID link is still refused by its own capability, not only by a door with no key
 # (ledger #1688). The same requirement and features as ikigai-embedded's, so no second copy.
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "pkcs8", "pem"] }
+# `route_load.rs`'s tests run the route query through the real `urn:sparql:select`, as the loader
+# does in the binary, because what an aggregate does with an IRI `ik:cap` is the query's behavior,
+# not the parser's (ledger #30). Already in the graph through ikigai-embedded; no new package.
+ikigai-sparql = { workspace = true }
