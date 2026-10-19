@@ -3959,20 +3959,30 @@ fn total_memory_bytes() -> Option<u64> {
     }
     #[cfg(target_os = "linux")]
     {
-        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let kb: u64 = meminfo
-            .lines()
-            .find(|line| line.starts_with("MemTotal:"))?
-            .split_whitespace()
-            .nth(1)?
-            .parse()
-            .ok()?;
-        Some(kb * 1024)
+        mem_total_bytes(&std::fs::read_to_string("/proc/meminfo").ok()?)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         None
     }
+}
+
+/// `MemTotal` from the text of `/proc/meminfo`, in bytes. The kernel writes every line of
+/// that file as a padded label, the value and ` kB` (`fs/proc/meminfo.c`, `show_val_kb`:
+/// `MemTotal:       16384000 kB`), so the second whitespace-separated token is the number.
+/// Anything else reads as `None`, which the jury takes as "no machine facts, no machine
+/// policy" ([`empanel`]) rather than as a size; and a value no machine has (past
+/// `u64::MAX / 1024` kB) is `None` too, never an overflow (ledger #1905).
+#[cfg(any(target_os = "linux", test))]
+fn mem_total_bytes(meminfo: &str) -> Option<u64> {
+    let kb: u64 = meminfo
+        .lines()
+        .find(|line| line.starts_with("MemTotal:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    kb.checked_mul(1024)
 }
 
 /// Pick the jurors under a co-load budget. `installed` is smallest-first with
@@ -6736,6 +6746,32 @@ mod tests {
             })
             .clone()
         })
+    }
+
+    /// Ledger #1905: a machine finding called the `/proc/meminfo` parse fragile. The kernel's
+    /// format is fixed (label, value, ` kB`), and the one way the parse can go wrong on a
+    /// line the kernel never writes is to answer `None`, which the jury reads as "no machine
+    /// facts": no panic, and no number that drives a decision. The value a machine cannot
+    /// have is the one arithmetic hazard, and it reads as `None` too, not as an overflow.
+    #[test]
+    fn mem_total_is_read_from_the_kernels_meminfo_format_and_nothing_else() {
+        let real = "MemTotal:       16384000 kB\nMemFree:         1234567 kB\nBuffers:            1000 kB\n";
+        assert_eq!(mem_total_bytes(real), Some(16_384_000 * 1024));
+        // The label alone, a word where the number should be, or no MemTotal line at all.
+        for malformed in [
+            "MemTotal:\n",
+            "MemTotal: lots kB\n",
+            "MemFree:         1234567 kB\n",
+            "",
+            "MemTotal:16384000kB\n",
+        ] {
+            assert_eq!(mem_total_bytes(malformed), None, "{malformed:?}");
+        }
+        // Past u64::MAX / 1024 kilobytes: no machine, and no overflow.
+        let absurd = format!("MemTotal: {} kB\n", u64::MAX / 1024 + 1);
+        assert_eq!(mem_total_bytes(&absurd), None);
+        let largest = format!("MemTotal: {} kB\n", u64::MAX / 1024);
+        assert_eq!(mem_total_bytes(&largest), Some((u64::MAX / 1024) * 1024));
     }
 
     /// The guard for the whole class of bug this file's `cfg(test)` branch exists to stop:
