@@ -20,9 +20,11 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use ikigai_core::{Capability, Error, Iri, Kernel, Representation, Request, SpaceEntry, Tracer};
-use ikigai_resolve::{scoped_entries, CacheStatus, Resolver, SpanCollector};
-use ikigai_wire::{decode, encode, Call, Reply, TraceContext};
+use ikigai_core::{
+    Capability, Clock, Error, Iri, Kernel, Representation, Request, SpaceEntry, SystemClock, Tracer,
+};
+use ikigai_resolve::{scoped_entries, CacheStatus, Resolver, RunContext, SpanCollector};
+use ikigai_wire::{decode, encode, Call, Reply, TraceContext, PROTOCOL_VERSION};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::WebPkiSupportedAlgorithms;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
@@ -30,11 +32,11 @@ use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use tokio::runtime::{Handle, Runtime};
 
-/// The ALPN protocol ids, newest first — since v8, `ikigai/8` then `ikigai/7`
+/// The ALPN protocol ids, newest first — since v9, `ikigai/9`, `ikigai/8` then `ikigai/7`
 /// ([`ikigai_wire::alpns`]). The TLS handshake IS the version gate on this transport,
 /// and there is no hello frame on it: the NEGOTIATED id is the connection's version.
-/// Both sides list 8 first, so a v8 pair speaks 8 and a v7 peer (which offers or
-/// accepts only `ikigai/7`) still finds 7. A peer outside the range fails the
+/// Both sides list 9 first, so a v9 pair speaks 9 and a v8 or v7 peer (which offers or
+/// accepts only its own ids) still finds its own. A peer outside the range fails the
 /// handshake at connect (mDNS TXT advertises the version pre-connect, which is where
 /// the human-readable hint lives).
 fn alpn_protocols() -> Vec<Vec<u8>> {
@@ -962,6 +964,42 @@ fn dispatch_call(kernel: &Kernel, call: Call, session: &Session) -> Reply {
                 Err(error) => Reply::ErrorTyped(ikigai_wire::WireError::from(&error)),
             }
         }
+        // Wire v9: the caller's run context, under the clamped authority like every
+        // other arm. The time left is added to THIS door's now (the system clock, which
+        // the kernel reads by default; core exposes no accessor for a pinned one), and the
+        // kernel narrows the retries to the clamped capability's entitlement, so a peer
+        // shortens its own budget and never lengthens it.
+        Call::IssueWith(mut request, carried, with) => {
+            admit(&mut request, session);
+            let capability = authority.clamp(&carried);
+            let context = with.issue_context(SystemClock.now());
+            match with.trace {
+                Some(_ctx) => {
+                    let collector = Arc::new(SpanCollector::default());
+                    match ikigai_resolve::issue_traced_as_with_context(
+                        kernel,
+                        request,
+                        &capability,
+                        collector.clone(),
+                        context,
+                    ) {
+                        Ok((representation, status)) => {
+                            Reply::ResolvedTraced(representation, status, collector.take())
+                        }
+                        Err(error) => Reply::ErrorTyped(ikigai_wire::WireError::from(&error)),
+                    }
+                }
+                None => match ikigai_resolve::issue_as_with_context(
+                    kernel,
+                    request,
+                    &capability,
+                    context,
+                ) {
+                    Ok((representation, status)) => Reply::Resolved(representation, status),
+                    Err(error) => Reply::ErrorTyped(ikigai_wire::WireError::from(&error)),
+                },
+            }
+        }
     }
 }
 
@@ -1197,6 +1235,13 @@ impl Wire {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    /// The wire version the CURRENT connection negotiated (its ALPN id), what a call is
+    /// shaped for ([`Call::as_sent_to`]). This build's own version when the connection
+    /// has none this build speaks, which [`dial`] never lets stand for long.
+    fn version(&self) -> u32 {
+        negotiated_version(&self.connection()).unwrap_or(PROTOCOL_VERSION)
+    }
 }
 
 /// How an [`attempt`](Wire::attempt) failed, as far as replaying it is concerned.
@@ -1258,7 +1303,10 @@ impl Drop for InFlight {
 fn replay_may_follow(call: &Call) -> bool {
     match call {
         Call::Entries | Call::IsCached(_) => true,
-        Call::Issue(request) | Call::IssueAs(request, _) | Call::IssueTraced(request, _, _) => {
+        Call::Issue(request)
+        | Call::IssueAs(request, _)
+        | Call::IssueTraced(request, _, _)
+        | Call::IssueWith(request, _, _) => {
             matches!(
                 request.verb,
                 ikigai_core::Verb::Source | ikigai_core::Verb::Exists | ikigai_core::Verb::Meta
@@ -1274,9 +1322,10 @@ fn replay_may_follow(call: &Call) -> bool {
 fn is_describe(call: &Call) -> bool {
     match call {
         Call::Entries => true,
-        Call::Issue(request) | Call::IssueAs(request, _) | Call::IssueTraced(request, _, _) => {
-            request.verb == ikigai_core::Verb::Meta
-        }
+        Call::Issue(request)
+        | Call::IssueAs(request, _)
+        | Call::IssueTraced(request, _, _)
+        | Call::IssueWith(request, _, _) => request.verb == ikigai_core::Verb::Meta,
         Call::IsCached(_) => false,
     }
 }
@@ -1342,7 +1391,7 @@ impl QuicResolver {
         capability: &Capability,
         deadline: std::time::Duration,
     ) -> Result<(Representation, CacheStatus), Error> {
-        self.issue_as_under(request, capability, Some(deadline))
+        self.issue_as_under(request, capability, Some(deadline), &RunContext::default())
     }
 
     /// The resolver's runtime. See [`runtime`](Self::runtime) for why it is an `Option`.
@@ -1422,20 +1471,20 @@ impl QuicResolver {
         request: Request,
         capability: &Capability,
         explicit: Option<std::time::Duration>,
+        run: &RunContext,
     ) -> Result<(Representation, CacheStatus), Error> {
         let tracer = self.tracer().clone();
-        let call = if tracer.is_some() {
-            Call::IssueTraced(
-                request,
-                capability.clone(),
-                TraceContext {
-                    trace_id: 1,
-                    parent_span: None,
-                },
-            )
-        } else {
-            Call::IssueAs(request, capability.clone())
-        };
+        let trace = tracer.as_ref().map(|_| TraceContext {
+            trace_id: 1,
+            parent_span: None,
+        });
+        // A run that carries a pool or a deadline goes as `IssueWith` (wire v9), shaped for
+        // the version the current connection negotiated: a v7 or v8 server is sent the
+        // `IssueAs`/`IssueTraced` it has always served. (A redial mid-call that lands on a
+        // server of another version is the one case this read-before-encode misses; the
+        // next call reads the new version.)
+        let call =
+            Call::issue_in_run(request, capability, trace, run).for_peer(self.wire.version());
         match self.round_trip_within(call, explicit).map_err(quic_error)? {
             Reply::Resolved(representation, status) => Ok((representation, status)),
             Reply::ResolvedTraced(representation, status, events) => {
@@ -1550,7 +1599,19 @@ impl Resolver for QuicResolver {
         request: Request,
         capability: &Capability,
     ) -> Result<(Representation, CacheStatus), Error> {
-        self.issue_as_under(request, capability, None)
+        self.issue_as_under(request, capability, None, &RunContext::default())
+    }
+
+    /// Resolve carrying the caller's run (wire v9): what is left of its retry pool and its
+    /// deadline cross as `Call::IssueWith` to a v9 server, which bounds the resolution by
+    /// them; a v7 or v8 server is sent the plain `IssueAs` it has always served.
+    fn issue_as_in_run(
+        &self,
+        request: Request,
+        capability: &Capability,
+        run: &RunContext,
+    ) -> Result<(Representation, CacheStatus), Error> {
+        self.issue_as_under(request, capability, None, run)
     }
 
     fn set_tracer(&self, tracer: Arc<dyn Tracer>) {
@@ -3039,6 +3100,16 @@ mod tests {
         client_id: &Identity,
         alpns: Vec<Vec<u8>>,
     ) -> (SocketAddr, thread::JoinHandle<Option<u32>>) {
+        serve_kernel_alpn(server_id, client_id, alpns, conflict_kernel())
+    }
+
+    /// [`serve_alpn`] over any kernel.
+    fn serve_kernel_alpn(
+        server_id: &Identity,
+        client_id: &Identity,
+        alpns: Vec<Vec<u8>>,
+        kernel: Kernel,
+    ) -> (SocketAddr, thread::JoinHandle<Option<u32>>) {
         let cfg = server_config_accepting(
             server_id,
             std::slice::from_ref(&client_id.cert_pem),
@@ -3061,12 +3132,87 @@ mod tests {
                     file_segment: String::new(),
                     principal: None,
                 };
-                serve_connection(&Arc::new(conflict_kernel()), connection, session).await;
+                serve_connection(&Arc::new(kernel), connection, session).await;
                 endpoint.wait_idle().await;
                 version
             })
         });
         (addr, server)
+    }
+
+    /// A kernel whose one endpoint reports the run it sees: `{retries},{time_left_ms}`, `-`
+    /// for a half the run does not carry; a retry budget (ceiling 3) so a pool exists.
+    fn run_kernel() -> Kernel {
+        let left = FnEndpoint::new("left", |inv: &Invocation<'_>| {
+            let retries = inv
+                .retry_budget()
+                .map(|pool| pool.remaining().to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let time_left = inv
+                .time_left()
+                .map(|left| left.as_millis().to_string())
+                .unwrap_or_else(|| "-".to_string());
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("{retries},{time_left}").into_bytes(),
+            ))
+        });
+        // A clock, so `time_left` can be measured against the deadline the door sets.
+        Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:left"), left),
+        ))
+        .with_retry_budget(0, 3)
+        .with_clock(Arc::new(SystemClock))
+    }
+
+    /// Wire v9 over QUIC (ledger #1546): a run context crosses to a v9 server under the
+    /// clamped authority, and the peer's endpoint sees the carried retries and a deadline
+    /// about the carried time left away on its own clock; the same client's plain
+    /// `issue_as` carries nothing and the peer runs under its own policy. A v8-only server
+    /// (accepting just `ikigai/8`) is sent the `IssueAs` it has always served.
+    #[test]
+    fn a_run_context_crosses_over_quic_and_is_dropped_for_a_v8_server() {
+        let left = Request::new(Verb::Source, Iri::parse("urn:test:left").unwrap());
+        let run = RunContext {
+            retries: Some(1),
+            time_left: Some(std::time::Duration::from_secs(30)),
+        };
+        let split = |bytes: &[u8]| -> (String, Option<u64>) {
+            let text = String::from_utf8_lossy(bytes);
+            let (retries, time_left) = text.split_once(',').expect("retries,time_left");
+            (retries.to_string(), time_left.parse().ok())
+        };
+        for (alpns, expect_version) in [
+            (alpn_protocols(), PROTOCOL_VERSION),
+            (vec![b"ikigai/8".to_vec()], 8),
+        ] {
+            let (server_id, client_id) = (generate(), generate());
+            let (addr, server) = serve_kernel_alpn(&server_id, &client_id, alpns, run_kernel());
+            let client = connect(addr, &client_id, &server_id.cert_pem).unwrap();
+            let (answer, _) = client
+                .issue_as_in_run(left.clone(), &Capability::root(), &run)
+                .unwrap();
+            let (retries, time_left) = split(&answer.bytes);
+            if expect_version == PROTOCOL_VERSION {
+                assert_eq!(retries, "1", "the carried count narrows the pool");
+                let time_left = time_left.expect("a deadline crossed");
+                assert!(
+                    (25_000..=30_000).contains(&time_left),
+                    "about 30 s left on the peer's clock: {time_left} ms"
+                );
+            } else {
+                // Dropped at the client: the v8 server runs it under its own policy.
+                assert_eq!((retries, time_left), ("3".to_string(), None));
+            }
+            let (plain, _) = client.issue_as(left.clone(), &Capability::root()).unwrap();
+            assert_eq!(
+                split(&plain.bytes),
+                ("3".to_string(), None),
+                "nothing carried"
+            );
+            drop(client);
+            assert_eq!(server.join().unwrap(), Some(expect_version));
+        }
     }
 
     /// A v8 server meeting a v7-ONLY client (offering just `ikigai/7`): the connection
@@ -3104,10 +3250,10 @@ mod tests {
         assert_eq!(server.join().unwrap(), Some(7));
     }
 
-    /// A v8 pair negotiates 8 — the server lists it first — and the Conflict crosses
-    /// TYPED and permanent.
+    /// A current pair negotiates the newest version — the server lists it first — and
+    /// the Conflict crosses TYPED and permanent.
     #[test]
-    fn a_v8_pair_negotiates_8_and_the_conflict_crosses_typed() {
+    fn a_current_pair_negotiates_the_newest_version_and_the_conflict_crosses_typed() {
         let (server_id, client_id) = (generate(), generate());
         let (addr, server) = serve_alpn(&server_id, &client_id, alpn_protocols());
         let client = connect(addr, &client_id, &server_id.cert_pem).unwrap();
@@ -3115,7 +3261,7 @@ mod tests {
         assert!(matches!(err, Error::Conflict(ref m) if m == "x"), "{err:?}");
         assert!(!err.is_transient());
         drop(client);
-        assert_eq!(server.join().unwrap(), Some(8));
+        assert_eq!(server.join().unwrap(), Some(PROTOCOL_VERSION));
     }
 
     /// This build's client against a v7-only SERVER (accepting just `ikigai/7`): the
@@ -3136,10 +3282,10 @@ mod tests {
     /// with `no_application_protocol` before any connection exists. (Measured: the
     /// no-version branch in `dial` is therefore defensive; this is the gate that fires.)
     #[test]
-    fn a_server_outside_7_to_8_is_refused_at_the_handshake() {
+    fn a_server_outside_7_to_9_is_refused_at_the_handshake() {
         for alpns in [
             vec![b"ikigai/6".to_vec()],
-            vec![b"ikigai/9".to_vec()],
+            vec![b"ikigai/10".to_vec()],
             Vec::new(),
         ] {
             let (server_id, client_id) = (generate(), generate());

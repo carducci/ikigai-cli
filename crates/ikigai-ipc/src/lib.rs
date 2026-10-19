@@ -25,8 +25,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ikigai_core::{Capability, Error, Kernel, Representation, Request, SpaceEntry, Tracer};
-use ikigai_resolve::{scoped_entries, CacheStatus, Resolver, SpanCollector};
+use ikigai_core::{
+    Capability, Clock, Error, Kernel, Representation, Request, SpaceEntry, SystemClock, Tracer,
+};
+use ikigai_resolve::{scoped_entries, CacheStatus, Resolver, RunContext, SpanCollector};
 use ikigai_wire::{
     answer_to, decode_hello, read_frame, read_message, speaks, write_hello, write_message, Call,
     Hello, Reply, TraceContext, WireError, PROTOCOL_VERSION,
@@ -486,14 +488,14 @@ pub fn connect_with(
     timeout: Option<Duration>,
     mode: HelloMode,
 ) -> io::Result<IpcResolver> {
-    let stream = handshake(path, timeout, mode)?;
+    let link = handshake(path, timeout, mode)?;
     Ok(IpcResolver {
         path: path.to_path_buf(),
         timeout,
         describe_timeout: Some(DEFAULT_DESCRIBE_TIMEOUT),
         call_timeout: timeout,
         mode,
-        stream: Mutex::new(Some(stream)),
+        stream: Mutex::new(Some(link)),
         tracer: Mutex::new(None),
     })
 }
@@ -510,12 +512,18 @@ pub fn connect_with(
 /// than the offer that this build still [speaks] is therefore a request to come back
 /// at that version: dial again, offer it, and serve at it. That is per-connection
 /// negotiation, not a flag day — nothing on the next connection remembers it.
-fn handshake(path: &Path, timeout: Option<Duration>, mode: HelloMode) -> io::Result<UnixStream> {
+fn handshake(path: &Path, timeout: Option<Duration>, mode: HelloMode) -> io::Result<Link> {
     match hello_at(path, timeout, mode, PROTOCOL_VERSION)? {
-        (stream, answer) if answer == PROTOCOL_VERSION => Ok(stream),
+        (stream, answer) if answer == PROTOCOL_VERSION => Ok(Link {
+            stream,
+            version: answer,
+        }),
         (_, answer) if answer < PROTOCOL_VERSION && speaks(answer) => {
             match hello_at(path, timeout, mode, answer)? {
-                (stream, again) if again == answer => Ok(stream),
+                (stream, again) if again == answer => Ok(Link {
+                    stream,
+                    version: again,
+                }),
                 (_, again) => Err(version_mismatch(again, answer)),
             }
         }
@@ -599,6 +607,15 @@ fn dial(path: &Path, timeout: Option<Duration>) -> io::Result<UnixStream> {
 /// positionally, so keeping the stream would answer the next call with the abandoned
 /// one's payload (ledger #479/#487). That drop carries no replay — see the private
 /// `missed_a_deadline`.
+/// One dialed connection and the wire version its hello negotiated. The version is kept
+/// because a call is shaped for the PEER: a [`Call::IssueWith`] (v9) goes to a v7 or v8
+/// peer as the `IssueAs`/`IssueTraced` it can decode ([`Call::for_peer`]), and before v9
+/// nothing on the client side needed to remember what the handshake agreed.
+struct Link {
+    stream: UnixStream,
+    version: u32,
+}
+
 pub struct IpcResolver {
     /// The server's socket path, kept so a broken connection can be redialed.
     path: PathBuf,
@@ -618,7 +635,7 @@ pub struct IpcResolver {
     /// ([`missed_a_deadline`]) — in which case the next call redials. The mutex also
     /// serializes whole round-trips: the protocol is strict request/reply on one stream,
     /// so two concurrent calls interleaving frames would desync it.
-    stream: Mutex<Option<UnixStream>>,
+    stream: Mutex<Option<Link>>,
     /// The tracer the `trace` command installs. When set, a resolution is sent as
     /// [`Call::IssueTraced`] and the server's returned spans are forwarded here —
     /// so a `--connect` trace shows the *remote* kernel's execution tree.
@@ -652,9 +669,10 @@ struct ExchangeFailed {
 fn is_describe(call: &Call) -> bool {
     match call {
         Call::Entries => true,
-        Call::Issue(request) | Call::IssueAs(request, _) | Call::IssueTraced(request, _, _) => {
-            request.verb == ikigai_core::Verb::Meta
-        }
+        Call::Issue(request)
+        | Call::IssueAs(request, _)
+        | Call::IssueTraced(request, _, _)
+        | Call::IssueWith(request, _, _) => request.verb == ikigai_core::Verb::Meta,
         Call::IsCached(_) => false,
     }
 }
@@ -917,7 +935,10 @@ fn replay_may_follow(phase: &Phase, call: &Call) -> bool {
     }
     match call {
         Call::IsCached(_) | Call::Entries => true,
-        Call::Issue(request) | Call::IssueAs(request, _) | Call::IssueTraced(request, _, _) => {
+        Call::Issue(request)
+        | Call::IssueAs(request, _)
+        | Call::IssueTraced(request, _, _)
+        | Call::IssueWith(request, _, _) => {
             matches!(
                 request.verb,
                 ikigai_core::Verb::Source | ikigai_core::Verb::Exists | ikigai_core::Verb::Meta
@@ -982,7 +1003,7 @@ impl IpcResolver {
         capability: &Capability,
         deadline: Duration,
     ) -> Result<(Representation, CacheStatus), Error> {
-        self.issue_as_under(request, capability, Some(deadline))
+        self.issue_as_under(request, capability, Some(deadline), &RunContext::default())
     }
 
     /// [`Resolver::issue_as`] under `explicit` if given, else the standing deadline.
@@ -991,24 +1012,20 @@ impl IpcResolver {
         request: Request,
         capability: &Capability,
         explicit: Option<Duration>,
+        run: &RunContext,
     ) -> Result<(Representation, CacheStatus), Error> {
         // When a tracer is installed (the `trace` command), ask the server to record
         // the resolution and ship its spans back, then forward them to the tracer —
         // so the tree shows the *remote* kernel's execution. `parent_span` is None:
         // the whole session runs remotely, so the remote root is the trace root.
         let tracer = self.tracer.lock().expect("tracer lock").clone();
-        let call = if tracer.is_some() {
-            Call::IssueTraced(
-                request,
-                capability.clone(),
-                TraceContext {
-                    trace_id: 1,
-                    parent_span: None,
-                },
-            )
-        } else {
-            Call::IssueAs(request, capability.clone())
-        };
+        let trace = tracer.as_ref().map(|_| TraceContext {
+            trace_id: 1,
+            parent_span: None,
+        });
+        // A run that carries a pool or a deadline goes as `IssueWith` (wire v9); the
+        // exchange downgrades it for a peer that negotiated an older version.
+        let call = Call::issue_in_run(request, capability, trace, run);
         match self.round_trip_within(call, explicit).map_err(wire_error)? {
             Reply::Resolved(representation, status) => Ok((representation, status)),
             Reply::ResolvedTraced(representation, status, events) => {
@@ -1036,16 +1053,16 @@ impl IpcResolver {
 
     /// Dial afresh (the full handshake) inside `deadline`, then put the connection's standing
     /// timeouts back: a hello cut short by the deadline must not shorten later calls.
-    fn redial(&self, deadline: Option<&Deadline>) -> io::Result<UnixStream> {
+    fn redial(&self, deadline: Option<&Deadline>) -> io::Result<Link> {
         let Some(deadline) = deadline else {
             return handshake(&self.path, self.timeout, self.mode);
         };
-        let stream = handshake(&self.path, Some(deadline.arm(self.timeout)?), self.mode)?;
+        let link = handshake(&self.path, Some(deadline.arm(self.timeout)?), self.mode)?;
         // Ignored for the reason in `Bounded::arm_read`: a peer that hung up right after the
         // hello makes these fail, and the exchange is about to say so properly.
-        let _ = stream.set_read_timeout(self.timeout);
-        let _ = stream.set_write_timeout(self.timeout);
-        Ok(stream)
+        let _ = link.stream.set_read_timeout(self.timeout);
+        let _ = link.stream.set_write_timeout(self.timeout);
+        Ok(link)
     }
 
     /// Send a call and read its reply, healing a dead connection on use.
@@ -1091,8 +1108,13 @@ impl IpcResolver {
         // timeouts come back however the exchange leaves (`Bounded`'s drop). Scoped so the
         // stream borrow ends before the dead-connection path clears it.
         let failed = {
-            let stream = guard.as_ref().expect("stream just ensured");
-            match exchange(stream, call, self.timeout, deadline) {
+            let link = guard.as_ref().expect("stream just ensured");
+            match exchange(
+                &link.stream,
+                &call.as_sent_to(link.version),
+                self.timeout,
+                deadline,
+            ) {
                 Ok(reply) => return Ok(reply),
                 Err(failed) => failed,
             }
@@ -1129,7 +1151,12 @@ impl IpcResolver {
         // One redial + one replay; a second failure surfaces as-is. Both run inside what is
         // LEFT of the same deadline: a redial must not quietly restore patience.
         let fresh = self.redial(deadline)?;
-        let second_attempt = exchange(&fresh, call, self.timeout, deadline);
+        let second_attempt = exchange(
+            &fresh.stream,
+            &call.as_sent_to(fresh.version),
+            self.timeout,
+            deadline,
+        );
         match second_attempt {
             Ok(reply) => {
                 *guard = Some(fresh);
@@ -1205,7 +1232,19 @@ impl Resolver for IpcResolver {
         request: Request,
         capability: &Capability,
     ) -> Result<(Representation, CacheStatus), Error> {
-        self.issue_as_under(request, capability, None)
+        self.issue_as_under(request, capability, None, &RunContext::default())
+    }
+
+    /// Resolve carrying the caller's run (wire v9): what is left of its retry pool and its
+    /// deadline cross as `Call::IssueWith` to a v9 server, which bounds the resolution by
+    /// them; a v7 or v8 server is sent the plain `IssueAs` it has always served.
+    fn issue_as_in_run(
+        &self,
+        request: Request,
+        capability: &Capability,
+        run: &RunContext,
+    ) -> Result<(Representation, CacheStatus), Error> {
+        self.issue_as_under(request, capability, None, run)
     }
 
     fn set_tracer(&self, tracer: Arc<dyn Tracer>) {
@@ -1358,6 +1397,40 @@ fn dispatch(kernel: &Kernel, call: Call) -> Reply {
                     Reply::ResolvedTraced(representation, status, collector.take())
                 }
                 Err(error) => Reply::ErrorTyped(WireError::from(&error)),
+            }
+        }
+        // Wire v9: the caller's run context. The time left is added to THIS door's now
+        // (the system clock the kernel reads by default; the deadline is on the kernel
+        // clock, and a kernel pinned to another clock would need that clock here, which
+        // core does not expose). The kernel narrows the retries to what the capability is
+        // entitled to and drops them on a kernel with no retry budget.
+        Call::IssueWith(request, capability, with) => {
+            let context = with.issue_context(SystemClock.now());
+            match with.trace {
+                Some(_ctx) => {
+                    let collector = Arc::new(SpanCollector::default());
+                    match ikigai_resolve::issue_traced_as_with_context(
+                        kernel,
+                        request,
+                        &capability,
+                        collector.clone(),
+                        context,
+                    ) {
+                        Ok((representation, status)) => {
+                            Reply::ResolvedTraced(representation, status, collector.take())
+                        }
+                        Err(error) => Reply::ErrorTyped(WireError::from(&error)),
+                    }
+                }
+                None => match ikigai_resolve::issue_as_with_context(
+                    kernel,
+                    request,
+                    &capability,
+                    context,
+                ) {
+                    Ok((representation, status)) => Reply::Resolved(representation, status),
+                    Err(error) => Reply::ErrorTyped(WireError::from(&error)),
+                },
             }
         }
     }
@@ -2225,7 +2298,7 @@ mod tests {
             write_hello(
                 &mut s,
                 &Hello {
-                    version: 9,
+                    version: 10,
                     mode: HelloMode::Verbatim,
                 },
             )
@@ -2236,7 +2309,7 @@ mod tests {
             Err(err) => err.to_string(),
             Ok(_) => panic!("a version mismatch must refuse the connection"),
         };
-        assert!(message.contains("v9"), "{message}");
+        assert!(message.contains("v10"), "{message}");
         assert!(
             message.contains(&format!("v{PROTOCOL_VERSION}")),
             "{message}"
@@ -2305,11 +2378,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A hello outside the spoken range (6 below, 9 above) gets OUR version, so the
+    /// A hello outside the spoken range (6 below, 10 above) gets OUR version, so the
     /// client can name both, and the connection closes without serving.
     #[test]
-    fn a_hello_outside_7_to_8_is_answered_8_and_refused() {
-        for (n, offered) in [6u32, 9].into_iter().enumerate() {
+    fn a_hello_outside_7_to_9_is_answered_9_and_refused() {
+        for (n, offered) in [6u32, 10].into_iter().enumerate() {
             let path = socket_path(&format!("v-out-{n}"));
             let server = serve_one(&path, kernel());
             let (stream, answer) = raw_hello(&path, offered);
@@ -2411,6 +2484,137 @@ mod tests {
         assert_eq!(representation.bytes, b"from v7");
         drop(client);
         assert_eq!(server.join().unwrap(), vec![PROTOCOL_VERSION, 7]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- wire v9: the run's context crosses (ledger #1546) ----
+
+    /// A kernel whose one endpoint reports the run it sees: `{retries},{time_left_ms}`,
+    /// `-` for a half the run does not carry. It has a retry budget (ceiling 3), so a pool
+    /// exists for the carried count to narrow.
+    fn run_kernel() -> Kernel {
+        let left = FnEndpoint::new("left", |inv: &ikigai_core::Invocation<'_>| {
+            let retries = inv
+                .retry_budget()
+                .map(|pool| pool.remaining().to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let time_left = inv
+                .time_left()
+                .map(|left| left.as_millis().to_string())
+                .unwrap_or_else(|| "-".to_string());
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("{retries},{time_left}").into_bytes(),
+            ))
+        });
+        // A clock, so `time_left` can be measured against the deadline the door sets.
+        Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:left"), left),
+        ))
+        .with_retry_budget(0, 3)
+        .with_clock(Arc::new(SystemClock))
+    }
+
+    fn left() -> Request {
+        Request::new(Verb::Source, Iri::parse("urn:test:left").unwrap())
+    }
+
+    /// The carried answer, split: the retries the peer saw and the ms it had left.
+    fn carried(bytes: &[u8]) -> (String, Option<u64>) {
+        let text = String::from_utf8_lossy(bytes);
+        let (retries, left) = text.split_once(',').expect("retries,time_left");
+        (retries.to_string(), left.parse().ok())
+    }
+
+    /// A v9 client's run context reaches a v9 server: the peer's endpoint sees the
+    /// carried retries (the pool minted at the limit, under root's ceiling of 3) and a
+    /// deadline about the carried time left away, on the PEER's clock. A plain `issue_as`
+    /// from the same client carries nothing, and the peer runs under its own policy:
+    /// root's ceiling and no deadline, today's behavior.
+    #[test]
+    fn a_run_context_crosses_to_a_v9_server_and_bounds_the_resolution() {
+        let path = socket_path("run-context");
+        let server = serve_one(&path, run_kernel());
+        let client = connect(&path).unwrap();
+        let run = RunContext {
+            retries: Some(1),
+            time_left: Some(Duration::from_secs(30)),
+        };
+        let (answer, _) = client
+            .issue_as_in_run(left(), &Capability::root(), &run)
+            .unwrap();
+        let (retries, time_left) = carried(&answer.bytes);
+        assert_eq!(retries, "1", "the carried count narrows the pool");
+        let time_left = time_left.expect("a deadline crossed");
+        assert!(
+            (25_000..=30_000).contains(&time_left),
+            "about the carried 30 s left, on the peer's clock: {time_left} ms"
+        );
+        drop(client);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let path = socket_path("run-context-none");
+        let server = serve_one(&path, run_kernel());
+        let client = connect(&path).unwrap();
+        let (answer, _) = client.issue_as(left(), &Capability::root()).unwrap();
+        assert_eq!(carried(&answer.bytes), ("3".to_string(), None));
+        drop(client);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The downgrade on the CLIENT's side: a v8 server (one answering 8 to the hello)
+    /// cannot decode `IssueWith`, so a run that carries a context is sent as the `IssueAs`
+    /// the server has always served, and the run is served under the server's own policy.
+    #[test]
+    fn a_run_context_is_dropped_for_a_v8_server() {
+        let path = socket_path("v8-server-run");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let mut offered = Vec::new();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let mut s = &stream;
+                let hello = decode_hello(&read_frame(&mut s).unwrap()).expect("a hello");
+                offered.push(hello.version);
+                write_hello(
+                    &mut s,
+                    &Hello {
+                        version: 8,
+                        mode: HelloMode::Verbatim,
+                    },
+                )
+                .unwrap();
+                if hello.version != 8 {
+                    continue; // a v8 server closes on a mismatch
+                }
+                let call: Call = read_message(&mut s).unwrap();
+                assert!(
+                    matches!(call, Call::IssueAs(..)),
+                    "a v8 server must see IssueAs, got {call:?}"
+                );
+                let reply = Reply::Resolved(
+                    Representation::new(ReprType::new("text/plain"), b"from v8".to_vec()),
+                    CacheStatus::Miss,
+                );
+                write_message(&mut s, &reply).unwrap();
+            }
+            offered
+        });
+
+        let client = connect(&path).unwrap();
+        let run = RunContext {
+            retries: Some(1),
+            time_left: Some(Duration::from_secs(30)),
+        };
+        let (representation, _) = client
+            .issue_as_in_run(left(), &Capability::root(), &run)
+            .unwrap();
+        assert_eq!(representation.bytes, b"from v8");
+        drop(client);
+        assert_eq!(server.join().unwrap(), vec![PROTOCOL_VERSION, 8]);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2534,7 +2738,8 @@ mod tests {
                 let real = match &call {
                     Call::Issue(request)
                     | Call::IssueAs(request, _)
-                    | Call::IssueTraced(request, _, _) => request.verb != Verb::Meta,
+                    | Call::IssueTraced(request, _, _)
+                    | Call::IssueWith(request, _, _) => request.verb != Verb::Meta,
                     Call::IsCached(_) | Call::Entries => false,
                 };
                 if write_message(&mut s, &dispatch(&kernel, call)).is_err() {
@@ -3623,7 +3828,7 @@ mod call_deadline {
             .expect("and per call");
         assert_eq!(answer.bytes, b"slow");
         let guard = client.stream.lock().unwrap();
-        let stream = guard.as_ref().expect("the connection is kept");
+        let stream = &guard.as_ref().expect("the connection is kept").stream;
         assert_eq!(stream.read_timeout().unwrap(), Some(STANDING));
         assert_eq!(stream.write_timeout().unwrap(), Some(STANDING));
         drop(guard);

@@ -19,8 +19,8 @@ use async_trait::async_trait;
 use futures::executor::block_on;
 use ikigai_core::{
     ArgRef, Bindings, Capability, Description, Endpoint, Error, Expiry, Grammar, Invocation, Iri,
-    Kernel, Limit, Provenance, Representation, Request, Resolution, Resolved, Scope, Space,
-    SpaceEntry, TraceEvent, Tracer, UriTemplate, Verb,
+    IssueContext, Kernel, Limit, Provenance, Representation, Request, Resolution, Resolved, Scope,
+    Space, SpaceEntry, TraceEvent, Tracer, UriTemplate, Verb,
 };
 use serde::{Deserialize, Serialize};
 
@@ -451,8 +451,13 @@ impl Endpoint for ForwardingEndpoint {
         // Off the trace path: a plain forward. The resolver already yields a typed
         // Error, so a hung/unreachable remote surfaces as transient — a Retry or
         // Failover above this mount can act on it, not a blanket permanent failure.
+        // The run's context rides along (wire v9): what is left of its retry pool and its
+        // deadline, so the peer bounds this sub-request by the run the door minted here.
+        let run = RunContext::of(inv);
         if inv.trace_span().is_none() {
-            let result = self.resolver.issue_as(self.request.clone(), inv.capability);
+            let result = self
+                .resolver
+                .issue_as_in_run(self.request.clone(), inv.capability, &run);
             self.distrust_on_refusal(&result);
             return result.map(|(representation, _status)| as_held_here(representation));
         }
@@ -463,7 +468,9 @@ impl Endpoint for ForwardingEndpoint {
         // into the tree instead of collapsed to one node.
         let collector = Arc::new(SpanCollector::default());
         self.resolver.set_tracer(collector.clone());
-        let result = self.resolver.issue_as(self.request.clone(), inv.capability);
+        let result = self
+            .resolver
+            .issue_as_in_run(self.request.clone(), inv.capability, &run);
         self.resolver.clear_tracer();
         self.distrust_on_refusal(&result);
         let (representation, _status) = result?;
@@ -1298,6 +1305,26 @@ pub trait Resolver: Send + Sync {
         self.issue_as(request, capability)
     }
 
+    /// [`issue_as`](Resolver::issue_as), carrying what is left of the caller's RUN
+    /// (ledger #1546, wire v9): its retry pool's remaining count and its deadline as time
+    /// left. A mount calls this with [`RunContext::of`] its invocation, so a peer bounds the
+    /// forwarded sub-request by the same run the door minted here. The default DROPS the
+    /// context and resolves as [`issue_as`](Resolver::issue_as): the resolver cannot carry
+    /// it, and the peer then runs under its own policy, which is what every peer did before
+    /// v9. The two wire resolvers override it, and send the context only to a peer that
+    /// negotiated v9 (the wire's `Call::for_peer` drops it for an older one). A
+    /// WRAPPER forwards it like [`issue_as`](Resolver::issue_as), or it silently drops the
+    /// context, the way the chain methods warn about below.
+    fn issue_as_in_run(
+        &self,
+        request: Request,
+        capability: &Capability,
+        run: &RunContext,
+    ) -> Result<(Representation, CacheStatus), Error> {
+        let _ = run;
+        self.issue_as(request, capability)
+    }
+
     /// Async resolution of a request whose input came from an upstream pipe stage,
     /// folding that upstream's [`Provenance`] into the result's cacheability — so
     /// `source <X> | transform` is no more cacheable than `X`. The default *ignores*
@@ -1509,6 +1536,94 @@ impl Resolver for Kernel {
     }
 }
 
+/// What a caller's run has LEFT, carried across a mount to the peer that serves the
+/// sub-request (ledger #1546, wire v9): the remaining count of its retry pool and the
+/// time to its deadline. Both are relative, so two peers whose clocks disagree still mean
+/// the same thing; the peer adds the time left to its own `now`. A `None` half says the
+/// run has none of that, and the peer's own policy decides.
+///
+/// ```
+/// use std::time::Duration;
+/// use ikigai_resolve::RunContext;
+///
+/// let run = RunContext { retries: Some(1), time_left: Some(Duration::from_millis(1_500)) };
+/// assert!(run.carries_context());
+/// assert_eq!(run.time_left_millis(), Some(1_500));
+/// // A sub-millisecond remainder rounds UP, so it is not read as expired.
+/// let edge = RunContext { retries: None, time_left: Some(Duration::from_micros(1_200)) };
+/// assert_eq!(edge.time_left_millis(), Some(2));
+/// assert!(!RunContext::default().carries_context());
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RunContext {
+    /// Re-issues the run has left anywhere below it, `None` under no pool.
+    pub retries: Option<u32>,
+    /// Time to the run's deadline, zero once it has passed, `None` under no deadline.
+    pub time_left: Option<std::time::Duration>,
+}
+
+impl RunContext {
+    /// The run `inv` is part of, as a mount reads it: the pool's
+    /// [`remaining`](ikigai_core::RetryBudget::remaining) count and
+    /// [`Invocation::time_left`].
+    pub fn of(inv: &Invocation<'_>) -> Self {
+        RunContext {
+            retries: inv.retry_budget().map(|pool| pool.remaining()),
+            time_left: inv.time_left(),
+        }
+    }
+
+    /// Whether there is anything to carry: with neither half, a plain `issue_as` says it all.
+    pub fn carries_context(&self) -> bool {
+        self.retries.is_some() || self.time_left.is_some()
+    }
+
+    /// The time left in whole milliseconds, rounded UP: the wire's form.
+    pub fn time_left_millis(&self) -> Option<u64> {
+        self.time_left.map(|left| {
+            let whole = u64::try_from(left.as_millis()).unwrap_or(u64::MAX);
+            if left.subsec_nanos() % 1_000_000 == 0 {
+                whole
+            } else {
+                whole.saturating_add(1)
+            }
+        })
+    }
+}
+
+/// Resolve `request` on `kernel` under a caller's `context` (the retry pool limit and the
+/// deadline a wire server rebuilt from a `Call::IssueWith`), with the same cache-status
+/// probe as [`Resolver::issue_as`]. The kernel narrows the pool to what `capability` is
+/// entitled to, and drops it on a kernel with no retry budget.
+pub fn issue_as_with_context(
+    kernel: &Kernel,
+    request: Request,
+    capability: &Capability,
+    context: IssueContext,
+) -> Result<(Representation, CacheStatus), Error> {
+    let was_cached = Kernel::is_cached(kernel, &request, capability);
+    let representation = block_on(kernel.issue_with_context(request, capability, context))?;
+    let status = cache_status(was_cached, &representation);
+    Ok((representation, status))
+}
+
+/// [`issue_as_with_context`] recording the resolution into `tracer`, as
+/// [`issue_traced_as`] does: the path a wire server takes for a `Call::IssueWith` whose
+/// caller is recording.
+pub fn issue_traced_as_with_context(
+    kernel: &Kernel,
+    request: Request,
+    capability: &Capability,
+    tracer: Arc<dyn Tracer>,
+    context: IssueContext,
+) -> Result<(Representation, CacheStatus), Error> {
+    let was_cached = Kernel::is_cached(kernel, &request, capability);
+    let representation =
+        block_on(kernel.issue_traced_with_context(request, capability, tracer, context))?;
+    let status = cache_status(was_cached, &representation);
+    Ok((representation, status))
+}
+
 /// Resolve `request` on `kernel` recording the resolution's spans into `tracer`,
 /// with the same cache-status probe as [`Resolver::issue_as`]. This is the
 /// **per-call** traced path a wire server dispatches `Call::IssueTraced` on:
@@ -1558,6 +1673,16 @@ impl<R: Resolver + ?Sized> Resolver for Arc<R> {
         capability: &Capability,
     ) -> Result<(Representation, CacheStatus), Error> {
         (**self).issue_as(request, capability)
+    }
+
+    fn issue_as_in_run(
+        &self,
+        request: Request,
+        capability: &Capability,
+        run: &RunContext,
+    ) -> Result<(Representation, CacheStatus), Error> {
+        // Forwarded for the same reason as the chain methods: the default drops the run.
+        (**self).issue_as_in_run(request, capability, run)
     }
 
     async fn issue_as_async(
@@ -1772,6 +1897,78 @@ mod tests {
             "the TEMPLATE remote entry is in the manifold: the probe resolves to a \
              forwarding endpoint named `file` (from the wire catalog), not `remote`; \
              got {entries:?}"
+        );
+    }
+
+    /// Wire v9 (ledger #1546): a mount forwards the RUN's context, what its invocation
+    /// says is left of the retry pool and of the deadline, through
+    /// `Resolver::issue_as_in_run`, so the peer bounds the sub-request by the run the
+    /// door minted here. Without a door context the run is the kernel's own: root's
+    /// ceiling and no deadline.
+    #[test]
+    fn a_mount_forwards_the_runs_context_to_its_resolver() {
+        struct Recording {
+            seen: Mutex<Vec<RunContext>>,
+        }
+        impl Resolver for Recording {
+            fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), Error> {
+                let bytes = if request.verb == Verb::Meta {
+                    let description = Description::new("thing").verb(Verb::Source);
+                    serde_json::to_vec(&description).expect("description serializes")
+                } else {
+                    b"ok".to_vec()
+                };
+                Ok((
+                    Representation::new(ReprType::new("application/json"), bytes),
+                    CacheStatus::Uncacheable,
+                ))
+            }
+            fn issue_as_in_run(
+                &self,
+                request: Request,
+                capability: &Capability,
+                run: &RunContext,
+            ) -> Result<(Representation, CacheStatus), Error> {
+                self.seen.lock().unwrap().push(*run);
+                self.issue_as(request, capability)
+            }
+            fn is_cached(&self, _request: &Request, _capability: &Capability) -> bool {
+                false
+            }
+            fn entries(&self) -> Option<Vec<SpaceEntry>> {
+                None
+            }
+        }
+        let recording = Arc::new(Recording {
+            seen: Mutex::new(Vec::new()),
+        });
+        let kernel = Kernel::new(Arc::new(MountedRemote::new(
+            recording.clone(),
+            "urn:remote:",
+            "test://peer",
+        )))
+        .with_retry_budget(0, 3)
+        .with_clock(Arc::new(ikigai_core::FixedClock::at(1_000)));
+        let read = Request::new(Verb::Source, Iri::parse("urn:remote:thing").unwrap());
+        block_on(kernel.issue(read.clone(), &Capability::root())).expect("forwarded");
+        let run = IssueContext::new()
+            .with_retry_limit(1)
+            .with_not_after(ikigai_core::Time::from_millis(1_250));
+        block_on(kernel.issue_with_context(read, &Capability::root(), run)).expect("forwarded");
+        let seen = recording.seen.lock().unwrap();
+        assert_eq!(
+            seen.as_slice(),
+            [
+                RunContext {
+                    retries: Some(3),
+                    time_left: None,
+                },
+                RunContext {
+                    retries: Some(1),
+                    time_left: Some(std::time::Duration::from_millis(250)),
+                },
+            ],
+            "the forward carries what the run has left"
         );
     }
 

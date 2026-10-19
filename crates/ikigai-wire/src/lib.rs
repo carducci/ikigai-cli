@@ -9,8 +9,10 @@
 
 use std::io::{self, Read, Write};
 
-use ikigai_core::{Capability, Representation, Request, SpaceEntry, TraceEvent};
-use ikigai_resolve::CacheStatus;
+use ikigai_core::{
+    Capability, IssueContext, Representation, Request, SpaceEntry, Time, TraceEvent,
+};
+use ikigai_resolve::{CacheStatus, RunContext};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -31,7 +33,17 @@ use serde::{Deserialize, Serialize};
 /// negotiated, and [downgrades](Reply::for_peer) a `Conflict` to the untyped
 /// `Endpoint("conflict: …")` a v7 peer has always received. Nothing else changed
 /// shape, so a v7 client, server or mount keeps working against a v8 one.
-pub const PROTOCOL_VERSION: u32 = 8;
+/// **v9 carries the failure classes** (core 0.1.108, ledger #1546), backward
+/// compatible like v8: five [`WireError`] variants appended, `DepthExceeded` (9),
+/// `RetryAfter` (10, the delay as whole milliseconds), `OverBudget` (11), `Refused`
+/// (12) and `Unsupported` (13, the verb as an optional field), each
+/// [downgraded](WireError::for_peer) for a v7 or v8 peer to the `Endpoint(display)` it
+/// receives today; and [`Call::IssueWith`] appended, the call that carries the run's
+/// context, its retry pool's remaining count and its deadline as TIME LEFT in whole
+/// milliseconds, never an instant, since peer clocks differ. A client sends it only to a
+/// v9 peer ([`Call::for_peer`]); a v7 or v8 peer that sends no context gets today's
+/// behavior.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// The oldest wire version this build still speaks. A hello (or ALPN id) in
 /// `MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION` is accepted and served AT THAT
@@ -41,12 +53,17 @@ pub const MIN_PROTOCOL_VERSION: u32 = 7;
 /// The first version whose peers can decode [`WireError::Conflict`].
 const CONFLICT_SINCE: u32 = 8;
 
+/// The first version whose peers can decode the failure-class variants
+/// ([`WireError::DepthExceeded`] through [`WireError::Unsupported`]) and
+/// [`Call::IssueWith`].
+const FAILURE_CLASSES_SINCE: u32 = 9;
+
 /// Whether this build speaks wire `version`.
 ///
 /// ```
 /// use ikigai_wire::{speaks, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
-/// assert!(speaks(7) && speaks(8));
-/// assert!(!speaks(6) && !speaks(9));
+/// assert!(speaks(7) && speaks(8) && speaks(9));
+/// assert!(!speaks(6) && !speaks(10));
 /// assert!(speaks(MIN_PROTOCOL_VERSION) && speaks(PROTOCOL_VERSION));
 /// ```
 pub fn speaks(version: u32) -> bool {
@@ -63,8 +80,9 @@ pub fn speaks(version: u32) -> bool {
 /// use ikigai_wire::answer_to;
 /// assert_eq!(answer_to(7), 7);
 /// assert_eq!(answer_to(8), 8);
-/// assert_eq!(answer_to(6), 8);
-/// assert_eq!(answer_to(9), 8);
+/// assert_eq!(answer_to(9), 9);
+/// assert_eq!(answer_to(6), 9);
+/// assert_eq!(answer_to(10), 9);
 /// ```
 pub fn answer_to(offered: u32) -> u32 {
     if speaks(offered) {
@@ -85,11 +103,14 @@ pub fn alpn() -> Vec<u8> {
 }
 
 /// Every ALPN id this build offers and accepts, NEWEST FIRST: the TLS handshake
-/// is the version gate on QUIC, and the preference order is what makes a v8
-/// pair choose 8 while a v7 peer still finds 7.
+/// is the version gate on QUIC, and the preference order is what makes a v9
+/// pair choose 9 while a v8 or v7 peer still finds its own.
 ///
 /// ```
-/// assert_eq!(ikigai_wire::alpns(), vec![b"ikigai/8".to_vec(), b"ikigai/7".to_vec()]);
+/// assert_eq!(
+///     ikigai_wire::alpns(),
+///     vec![b"ikigai/9".to_vec(), b"ikigai/8".to_vec(), b"ikigai/7".to_vec()]
+/// );
 /// ```
 pub fn alpns() -> Vec<Vec<u8>> {
     (MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION)
@@ -236,6 +257,174 @@ pub enum Call {
     /// lets a future mount stitch the remote subtree under a local span. Appended
     /// so existing discriminants are unchanged.
     IssueTraced(Request, Capability, TraceContext),
+    /// Resolve under `Capability` carrying the caller's RUN CONTEXT (wire v9, ledger
+    /// #1546): what is left of its retry pool and of its deadline, plus a trace context
+    /// when the caller is recording. Appended as variant **5**. A v7 or v8 peer never
+    /// receives it: see [`Call::for_peer`]. The server narrows what it carries to the
+    /// clamped capability's own entitlement, so a peer can shorten its budget and never
+    /// lengthen it.
+    IssueWith(Request, Capability, IssueWith),
+}
+
+/// The run context a [`Call::IssueWith`] carries (wire v9): three optional fields, in this
+/// order on the wire, each `None` when the caller has nothing to say about it.
+///
+/// ★ **The deadline travels as time LEFT, never as an instant.** Two peers' clocks differ,
+/// and a deadline in milliseconds since the epoch would be early on one and late on the
+/// other; a remaining duration is the same length on both. The server adds it to its own
+/// `now` when it builds the run's `IssueContext`.
+///
+/// The postcard layout, pinned by `issue_with_encodes_its_three_optional_fields_in_order`
+/// and mirrored by ikigai-python and ikigai-deno: `Option<TraceContext>` (`00`, or `01` +
+/// `trace_id` varint + `Option<u64>` parent span), `Option<u32>` retries (`00`, or `01` +
+/// varint), `Option<u64>` time left in ms (`00`, or `01` + varint).
+///
+/// ```
+/// use ikigai_wire::{encode, IssueWith};
+///
+/// let carried = IssueWith { trace: None, retries: Some(2), time_left_ms: Some(1_500) };
+/// assert_eq!(encode(&carried).unwrap(), [0x00, 0x01, 0x02, 0x01, 0xdc, 0x0b]);
+/// assert_eq!(encode(&IssueWith::default()).unwrap(), [0x00, 0x00, 0x00]);
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub struct IssueWith {
+    /// The caller's trace context when it is recording, so the server answers
+    /// [`Reply::ResolvedTraced`] with its spans, exactly as for [`Call::IssueTraced`].
+    pub trace: Option<TraceContext>,
+    /// How many re-issues the caller's run has left (`RetryBudget::remaining`), the limit
+    /// the server puts on the pool it mints for this call. `None`: the caller runs under no
+    /// pool, and the server's own policy decides.
+    pub retries: Option<u32>,
+    /// How long the caller's run has left, in whole milliseconds (`Invocation::time_left`,
+    /// rounded up so a sub-millisecond remainder is not read as expired). `None`: the
+    /// caller's run has no deadline.
+    pub time_left_ms: Option<u64>,
+}
+
+impl IssueWith {
+    /// Whether anything is carried at all: a context with no pool and no deadline is
+    /// nothing a [`Call::IssueAs`] does not already say.
+    pub fn carries_context(&self) -> bool {
+        self.retries.is_some() || self.time_left_ms.is_some()
+    }
+
+    /// The run context a SERVER rebuilds from what crossed, at its own `now`: the retries
+    /// as the pool's limit (the kernel narrows it again to the clamped capability's
+    /// entitlement, and drops it on a kernel with no retry budget), the time left added to
+    /// `now` as the deadline. Nothing carried is an empty context, today's behavior.
+    ///
+    /// ```
+    /// use ikigai_core::Time;
+    /// use ikigai_wire::IssueWith;
+    ///
+    /// let with = IssueWith { trace: None, retries: Some(1), time_left_ms: Some(250) };
+    /// let run = with.issue_context(Time::from_millis(1_000));
+    /// assert_eq!(run.not_after(), Some(Time::from_millis(1_250)));
+    /// assert_eq!(run.retry_budget().map(|pool| pool.remaining()), Some(1));
+    /// let none = IssueWith::default().issue_context(Time::from_millis(1_000));
+    /// assert_eq!(none.not_after(), None);
+    /// assert!(none.retry_budget().is_none());
+    /// ```
+    pub fn issue_context(&self, now: Time) -> IssueContext {
+        let mut context = IssueContext::new();
+        if let Some(retries) = self.retries {
+            context = context.with_retry_limit(retries);
+        }
+        if let Some(left) = self.time_left_ms {
+            context = context.with_not_after(now.plus_millis(left));
+        }
+        context
+    }
+}
+
+impl Call {
+    /// The call a CLIENT sends to resolve `request` under `capability` as part of `run`,
+    /// recording into `trace` when given: [`IssueWith`](Call::IssueWith) when the run
+    /// carries a pool or a deadline, else exactly the pre-v9 call
+    /// ([`IssueTraced`](Call::IssueTraced) or [`IssueAs`](Call::IssueAs)), so a peer is sent
+    /// nothing it does not need. The call still goes through [`for_peer`](Self::for_peer)
+    /// for a peer that negotiated an older version.
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use ikigai_core::{Capability, Iri, Request, Verb};
+    /// use ikigai_resolve::RunContext;
+    /// use ikigai_wire::{Call, IssueWith};
+    ///
+    /// let read = Request::new(Verb::Source, Iri::parse("urn:x").unwrap());
+    /// let plain = Call::issue_in_run(read.clone(), &Capability::root(), None, &RunContext::default());
+    /// assert_eq!(plain, Call::IssueAs(read.clone(), Capability::root()));
+    /// let run = RunContext { retries: Some(1), time_left: Some(Duration::from_millis(1_500)) };
+    /// let carried = Call::issue_in_run(read.clone(), &Capability::root(), None, &run);
+    /// let with = IssueWith { trace: None, retries: Some(1), time_left_ms: Some(1_500) };
+    /// assert_eq!(carried, Call::IssueWith(read, Capability::root(), with));
+    /// ```
+    pub fn issue_in_run(
+        request: Request,
+        capability: &Capability,
+        trace: Option<TraceContext>,
+        run: &RunContext,
+    ) -> Call {
+        if run.carries_context() {
+            return Call::IssueWith(
+                request,
+                capability.clone(),
+                IssueWith {
+                    trace,
+                    retries: run.retries,
+                    time_left_ms: run.time_left_millis(),
+                },
+            );
+        }
+        match trace {
+            Some(trace) => Call::IssueTraced(request, capability.clone(), trace),
+            None => Call::IssueAs(request, capability.clone()),
+        }
+    }
+
+    /// This call as a peer speaking wire `peer_version` must receive it — the client's
+    /// twin of [`Reply::for_peer`]. A peer older than v9 cannot decode
+    /// [`IssueWith`](Call::IssueWith), so the context is DROPPED and the call goes as the
+    /// [`IssueTraced`](Call::IssueTraced) or [`IssueAs`](Call::IssueAs) the peer has always
+    /// served: the peer then runs it under its own policy, which is what it did before.
+    /// Everything else passes through unchanged.
+    ///
+    /// ```
+    /// use ikigai_core::{Capability, Iri, Request, Verb};
+    /// use ikigai_wire::{Call, IssueWith, TraceContext};
+    ///
+    /// let read = Request::new(Verb::Source, Iri::parse("urn:x").unwrap());
+    /// let with = IssueWith { trace: None, retries: Some(1), time_left_ms: None };
+    /// let call = Call::IssueWith(read.clone(), Capability::root(), with);
+    /// assert_eq!(call.clone().for_peer(9), call);
+    /// assert_eq!(call.for_peer(8), Call::IssueAs(read.clone(), Capability::root()));
+    ///
+    /// let ctx = TraceContext { trace_id: 1, parent_span: None };
+    /// let traced = Call::IssueWith(read.clone(), Capability::root(), IssueWith { trace: Some(ctx), ..with });
+    /// assert_eq!(traced.for_peer(7), Call::IssueTraced(read, Capability::root(), ctx));
+    /// ```
+    pub fn for_peer(self, peer_version: u32) -> Call {
+        match self {
+            Call::IssueWith(request, capability, with) if peer_version < FAILURE_CLASSES_SINCE => {
+                match with.trace {
+                    Some(trace) => Call::IssueTraced(request, capability, trace),
+                    None => Call::IssueAs(request, capability),
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// [`for_peer`](Self::for_peer) by reference: borrowed when the peer receives this call
+    /// as it is (every call but an `IssueWith` to a pre-v9 peer), cloned and downgraded
+    /// otherwise. What a transport that holds the call by reference at send time uses.
+    pub fn as_sent_to(&self, peer_version: u32) -> std::borrow::Cow<'_, Call> {
+        if matches!(self, Call::IssueWith(..)) && peer_version < FAILURE_CLASSES_SINCE {
+            std::borrow::Cow::Owned(self.clone().for_peer(peer_version))
+        } else {
+            std::borrow::Cow::Borrowed(self)
+        }
+    }
 }
 
 /// A server → client reply. [`ErrorTyped`](Reply::ErrorTyped) is how a v7+
@@ -299,6 +488,37 @@ pub enum WireError {
     /// variant **8**, appended. A v7 peer never receives it: see
     /// [`WireError::for_peer`].
     Conflict(String),
+    /// Permanent: a sub-request would nest past the kernel's depth budget (core's
+    /// `Error::DepthExceeded`). Since v9 — variant **9**: `depth` as a varint, then the
+    /// canonical target as text. A v7 or v8 peer gets `Endpoint(display)`.
+    DepthExceeded {
+        depth: u32,
+        target: String,
+    },
+    /// Retry-after: the same request may succeed, not before the delay (core's
+    /// `Error::RetryAfter`). Since v9 — variant **10**: the delay as WHOLE MILLISECONDS,
+    /// rounded up (`Error::retry_after_millis`), `None` when none is known; then the
+    /// detail. Not transient: an overlay built before v9 treats it as permanent, which is
+    /// today's behavior for a rate limit and the safe one.
+    RetryAfter {
+        delay_ms: Option<u64>,
+        detail: String,
+    },
+    /// Over-budget: the input exceeds a bound someone holds (core's `Error::OverBudget`).
+    /// Since v9 — variant **11**. Nobody in the chain retries it.
+    OverBudget(String),
+    /// Refused: a REMOTE authority refused the credential the endpoint presented (core's
+    /// `Error::Refused`; an origin's 401/403). Since v9 — variant **12**. Distinct from
+    /// [`Denied`](WireError::Denied), the capability floor's word.
+    Refused(String),
+    /// Unsupported: the endpoint does not answer this verb, or the host lacks a facility
+    /// (core's `Error::Unsupported`). Since v9 — variant **13**: the verb as an optional
+    /// field (the postcard variant index of `Verb`, `Source` 0 … `Meta` 4, as a `Request`
+    /// carries it), then the detail.
+    Unsupported {
+        verb: Option<ikigai_core::Verb>,
+        detail: String,
+    },
 }
 
 impl WireError {
@@ -306,7 +526,10 @@ impl WireError {
     /// peer older than v8 cannot decode [`Conflict`](WireError::Conflict), so it
     /// gets `Endpoint("conflict: {msg}")` — byte-identical to what a v7 server
     /// sent for the same core error, because that is core's `Display` and v7 fell
-    /// back to it. Everything else passes through unchanged.
+    /// back to it. A peer older than v9 cannot decode the five failure-class variants,
+    /// so each goes as `Endpoint(display)`, byte-identical to what a v8 server sends for
+    /// the same core error (its `From<&Error>` fell back to `Endpoint(other.to_string())`).
+    /// Everything else passes through unchanged.
     ///
     /// ```
     /// use ikigai_wire::WireError;
@@ -316,11 +539,29 @@ impl WireError {
     ///     conflict.for_peer(7),
     ///     WireError::Endpoint("conflict: 1,1 is taken".into())
     /// );
+    /// let refused = WireError::Refused("api.example.com answered 401".into());
+    /// assert_eq!(refused.clone().for_peer(9), refused);
+    /// assert_eq!(
+    ///     refused.for_peer(8),
+    ///     WireError::Endpoint("refused: api.example.com answered 401".into())
+    /// );
     /// ```
     pub fn for_peer(self, peer_version: u32) -> WireError {
         match self {
             WireError::Conflict(message) if peer_version < CONFLICT_SINCE => {
                 WireError::Endpoint(format!("conflict: {message}"))
+            }
+            WireError::DepthExceeded { .. }
+            | WireError::RetryAfter { .. }
+            | WireError::OverBudget(_)
+            | WireError::Refused(_)
+            | WireError::Unsupported { .. }
+                if peer_version < FAILURE_CLASSES_SINCE =>
+            {
+                // The display a v8 server sends is core's, so it is read from core: the
+                // wire error becomes the core error again and renders itself.
+                let core: ikigai_core::Error = self.into();
+                WireError::Endpoint(core.to_string())
             }
             other => other,
         }
@@ -343,6 +584,20 @@ impl From<&ikigai_core::Error> for WireError {
             E::Timeout(message) => WireError::Timeout(message.clone()),
             E::Unavailable(message) => WireError::Unavailable(message.clone()),
             E::Conflict(message) => WireError::Conflict(message.clone()),
+            E::DepthExceeded { depth, target } => WireError::DepthExceeded {
+                depth: *depth,
+                target: target.as_str().to_string(),
+            },
+            E::RetryAfter { detail, .. } => WireError::RetryAfter {
+                delay_ms: error.retry_after_millis(),
+                detail: detail.clone(),
+            },
+            E::OverBudget { detail } => WireError::OverBudget(detail.clone()),
+            E::Refused(message) => WireError::Refused(message.clone()),
+            E::Unsupported { verb, detail } => WireError::Unsupported {
+                verb: *verb,
+                detail: detail.clone(),
+            },
             // Core's Error is non_exhaustive: a variant newer than this wire
             // revision degrades to Endpoint (message preserved) until the wire
             // catches up — a taxonomy addition is a wire-version event, and an
@@ -370,6 +625,22 @@ impl From<WireError> for ikigai_core::Error {
             WireError::Timeout(message) => E::Timeout(message),
             WireError::Unavailable(message) => E::Unavailable(message),
             WireError::Conflict(message) => E::Conflict(message),
+            // Same rule as `Unresolved`: the target came FROM an Iri, so a parse failure
+            // is corruption, and the error degrades to Endpoint carrying core's own
+            // display of it rather than panicking.
+            WireError::DepthExceeded { depth, target } => match ikigai_core::Iri::parse(&target) {
+                Ok(target) => E::DepthExceeded { depth, target },
+                Err(_) => E::Endpoint(format!(
+                    "nesting budget exceeded: sub-request for {target} would run at depth {depth}"
+                )),
+            },
+            WireError::RetryAfter { delay_ms, detail } => E::RetryAfter {
+                delay: delay_ms.map(std::time::Duration::from_millis),
+                detail,
+            },
+            WireError::OverBudget(detail) => E::OverBudget { detail },
+            WireError::Refused(message) => E::Refused(message),
+            WireError::Unsupported { verb, detail } => E::Unsupported { verb, detail },
         }
     }
 }
@@ -570,7 +841,7 @@ mod tests {
         }
         assert_eq!(alpns().first(), Some(&alpn()), "newest first");
         assert_eq!(version_of_alpn(b"ikigai/6"), None);
-        assert_eq!(version_of_alpn(b"ikigai/9"), None);
+        assert_eq!(version_of_alpn(b"ikigai/10"), None);
         assert_eq!(version_of_alpn(b"ikigai/0"), None);
         assert_eq!(version_of_alpn(b"ikigai/+8"), None);
         assert_eq!(version_of_alpn(b"h3"), None);
@@ -605,13 +876,245 @@ mod tests {
             Reply::ErrorTyped(WireError::from(&error)).for_peer(8),
             Reply::ErrorTyped(WireError::Conflict("x".into()))
         );
-        for version in [7, 8] {
+        for version in [7, 8, 9] {
             assert_eq!(Reply::Cached(true).for_peer(version), Reply::Cached(true));
             assert_eq!(
                 Reply::ErrorTyped(WireError::Denied("x".into())).for_peer(version),
                 Reply::ErrorTyped(WireError::Denied("x".into()))
             );
         }
+    }
+
+    /// The five v9 core errors, as ikigai-vocab's `failure_class_vectors.json` states them:
+    /// the error, its wire tag, and the display a v8 peer receives inside `Endpoint`.
+    fn failure_class_cases() -> Vec<(ikigai_core::Error, u8, &'static str)> {
+        use ikigai_core::Error as E;
+        use std::time::Duration;
+        vec![
+            (
+                E::DepthExceeded {
+                    depth: 65,
+                    target: Iri::parse("urn:x:self").unwrap(),
+                },
+                9,
+                "nesting budget exceeded: sub-request for urn:x:self would run at depth 65",
+            ),
+            (
+                E::RetryAfter {
+                    delay: Some(Duration::from_secs(30)),
+                    detail: "rate-limited: 5 requests per minute".into(),
+                },
+                10,
+                "retry after 30000 ms: rate-limited: 5 requests per minute",
+            ),
+            (
+                E::RetryAfter {
+                    delay: None,
+                    detail: "not now".into(),
+                },
+                10,
+                "retry later: not now",
+            ),
+            (
+                E::OverBudget {
+                    detail: "the query ran past its 5000 ms budget".into(),
+                },
+                11,
+                "over budget: the query ran past its 5000 ms budget",
+            ),
+            (
+                E::Refused("api.example.com answered 401".into()),
+                12,
+                "refused: api.example.com answered 401",
+            ),
+            (
+                E::Unsupported {
+                    verb: Some(Verb::Sink),
+                    detail: "the log is append-only".into(),
+                },
+                13,
+                "unsupported: the log is append-only",
+            ),
+            (
+                E::Unsupported {
+                    verb: None,
+                    detail: "the host configured no clock".into(),
+                },
+                13,
+                "unsupported: the host configured no clock",
+            ),
+        ]
+    }
+
+    /// The v9 reference vectors, byte-exact, the same bytes ikigai-python and ikigai-deno
+    /// pin: `Reply::ErrorTyped` is `05`, then the variant, then its fields in order.
+    #[test]
+    fn the_failure_classes_are_wire_variants_9_to_13_with_pinned_bytes() {
+        let vectors: Vec<(WireError, Vec<u8>)> = vec![
+            (
+                WireError::DepthExceeded {
+                    depth: 65,
+                    target: "urn:x".into(),
+                },
+                vec![0x05, 0x09, 0x41, 0x05, b'u', b'r', b'n', b':', b'x'],
+            ),
+            (
+                WireError::RetryAfter {
+                    delay_ms: Some(30_000),
+                    detail: "x".into(),
+                },
+                // 30000 as a varint is b0 ea 01.
+                vec![0x05, 0x0a, 0x01, 0xb0, 0xea, 0x01, 0x01, 0x78],
+            ),
+            (
+                WireError::RetryAfter {
+                    delay_ms: None,
+                    detail: "x".into(),
+                },
+                vec![0x05, 0x0a, 0x00, 0x01, 0x78],
+            ),
+            (
+                WireError::OverBudget("x".into()),
+                vec![0x05, 0x0b, 0x01, 0x78],
+            ),
+            (WireError::Refused("x".into()), vec![0x05, 0x0c, 0x01, 0x78]),
+            (
+                WireError::Unsupported {
+                    verb: Some(Verb::Sink),
+                    detail: "x".into(),
+                },
+                // The verb is its postcard variant index: Sink is 1.
+                vec![0x05, 0x0d, 0x01, 0x01, 0x01, 0x78],
+            ),
+            (
+                WireError::Unsupported {
+                    verb: None,
+                    detail: "x".into(),
+                },
+                vec![0x05, 0x0d, 0x00, 0x01, 0x78],
+            ),
+        ];
+        for (error, bytes) in vectors {
+            let reply = Reply::ErrorTyped(error.clone());
+            assert_eq!(encode(&reply).unwrap(), bytes, "{error:?}");
+            assert_eq!(decode::<Reply>(&bytes).unwrap(), reply, "{error:?}");
+        }
+        for (error, tag, _) in failure_class_cases() {
+            let bytes = encode(&Reply::ErrorTyped(WireError::from(&error))).unwrap();
+            assert_eq!(bytes[1], tag, "{error:?} is wire variant {tag}");
+        }
+    }
+
+    /// What a v7 or v8 peer receives for a v9 error is EXACTLY what a v8 server sends for
+    /// the same core error: `Endpoint(Display)`, the fallback its `From<&Error>` took.
+    #[test]
+    fn a_failure_class_is_downgraded_byte_identically_for_a_v8_peer() {
+        for (error, _, display) in failure_class_cases() {
+            let v8_would_send = Reply::ErrorTyped(WireError::Endpoint(display.to_string()));
+            let expected = encode(&v8_would_send).unwrap();
+            for peer in [7, 8] {
+                let for_peer = Reply::ErrorTyped(WireError::from(&error)).for_peer(peer);
+                assert_eq!(for_peer, v8_would_send, "{error:?} for a v{peer} peer");
+                assert_eq!(
+                    encode(&for_peer).unwrap(),
+                    expected,
+                    "{error:?} for v{peer}"
+                );
+            }
+            // A v9 peer gets it typed.
+            let typed = Reply::ErrorTyped(WireError::from(&error)).for_peer(9);
+            assert_eq!(
+                typed,
+                Reply::ErrorTyped(WireError::from(&error)),
+                "{error:?}"
+            );
+            // And the display a v8 peer sees is the one the shared vectors state.
+            assert_eq!(error.to_string(), display);
+        }
+    }
+
+    /// A v9 client never RECONSTRUCTS a typed error from a v8 server's text.
+    #[test]
+    fn a_v8_failure_class_message_stays_an_untyped_endpoint_error() {
+        for (_, _, display) in failure_class_cases() {
+            let rebuilt: ikigai_core::Error = WireError::Endpoint(display.to_string()).into();
+            assert!(
+                matches!(rebuilt, ikigai_core::Error::Endpoint(_)),
+                "{rebuilt:?}"
+            );
+        }
+    }
+
+    /// The class survives the wire, and so does the delay in whole milliseconds.
+    #[test]
+    fn a_failure_class_and_its_delay_survive_the_wire() {
+        for (error, _, _) in failure_class_cases() {
+            let rebuilt: ikigai_core::Error = WireError::from(&error).into();
+            assert_eq!(rebuilt.class(), error.class(), "{error:?}");
+            assert_eq!(rebuilt.kind(), error.kind(), "{error:?}");
+            assert_eq!(
+                rebuilt.retry_after_millis(),
+                error.retry_after_millis(),
+                "{error:?}"
+            );
+            assert_eq!(rebuilt.to_string(), error.to_string(), "{error:?}");
+        }
+        // A sub-millisecond delay rounds UP on the wire, so it is not read as expired.
+        let short = ikigai_core::Error::RetryAfter {
+            delay: Some(std::time::Duration::from_micros(1_200)),
+            detail: "held off".into(),
+        };
+        assert_eq!(
+            WireError::from(&short),
+            WireError::RetryAfter {
+                delay_ms: Some(2),
+                detail: "held off".into()
+            }
+        );
+    }
+
+    /// `IssueWith` is `Call` variant 5, and its three optional fields encode in order:
+    /// the trace context, the retries left, the time left in ms.
+    #[test]
+    fn issue_with_encodes_its_three_optional_fields_in_order() {
+        let none = IssueWith::default();
+        assert_eq!(encode(&none).unwrap(), [0x00, 0x00, 0x00]);
+        assert!(!none.carries_context());
+        let plain = IssueWith {
+            trace: None,
+            retries: Some(2),
+            time_left_ms: Some(1_500),
+        };
+        assert_eq!(
+            encode(&plain).unwrap(),
+            [0x00, 0x01, 0x02, 0x01, 0xdc, 0x0b]
+        );
+        assert!(plain.carries_context());
+        let traced = IssueWith {
+            trace: Some(TraceContext {
+                trace_id: 7,
+                parent_span: None,
+            }),
+            retries: Some(2),
+            time_left_ms: Some(1_500),
+        };
+        assert_eq!(
+            encode(&traced).unwrap(),
+            [0x01, 0x07, 0x00, 0x01, 0x02, 0x01, 0xdc, 0x0b]
+        );
+        // On the call it sits after the request and the capability, where IssueTraced's
+        // TraceContext sits; the call's own discriminant is 5.
+        let call = Call::IssueWith(request(), Capability::root(), plain);
+        let bytes = encode(&call).unwrap();
+        assert_eq!(bytes[0], 5, "Call::IssueWith is variant 5");
+        assert!(
+            bytes.ends_with(&[0x00, 0x01, 0x02, 0x01, 0xdc, 0x0b]),
+            "{bytes:?}"
+        );
+        assert_eq!(decode::<Call>(&bytes).unwrap(), call);
+        // The prefix is exactly an IssueAs's payload with the discriminant changed.
+        let as_bytes = encode(&Call::IssueAs(request(), Capability::root())).unwrap();
+        assert_eq!(&bytes[1..bytes.len() - 6], &as_bytes[1..]);
     }
 
     /// A v8 client's decoder never RECONSTRUCTS a typed Conflict from a v7
@@ -652,6 +1155,10 @@ mod tests {
             E::Unavailable("connection refused".into()),
             E::Conflict("1,1 is taken".into()),
         ];
+        let cases: Vec<ikigai_core::Error> = cases
+            .into_iter()
+            .chain(failure_class_cases().into_iter().map(|(error, _, _)| error))
+            .collect();
         for original in cases {
             let mut buf = Vec::new();
             write_message(&mut buf, &Reply::ErrorTyped(WireError::from(&original))).unwrap();
@@ -669,6 +1176,11 @@ mod tests {
                 std::mem::discriminant(&rebuilt),
                 std::mem::discriminant(&original),
                 "variant must survive the wire: {original:?}"
+            );
+            assert_eq!(
+                rebuilt.class(),
+                original.class(),
+                "the class must survive the wire: {original:?}"
             );
         }
     }
