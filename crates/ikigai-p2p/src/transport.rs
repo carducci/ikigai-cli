@@ -20,13 +20,14 @@ pub use libp2p::{Multiaddr, PeerId};
 /// [`PROTOCOL_VERSION`](ikigai_wire::PROTOCOL_VERSION) — a mismatched peer fails protocol
 /// negotiation, just as a mismatched ALPN fails the QUIC handshake. (A `&'static str`
 /// because `StreamProtocol::new` wants one; a test pins it to the wire constant.)
-pub const WIRE_PROTOCOL: &str = "/ikigai/wire/8";
+pub const WIRE_PROTOCOL: &str = "/ikigai/wire/9";
 
 /// Every protocol id this node offers and accepts, NEWEST FIRST — the libp2p twin of
-/// QUIC's two-entry ALPN list. Since wire v8 a node also speaks v7, so a v7 peer still
-/// negotiates `/ikigai/wire/7`, and every reply on such a stream is encoded at 7 (see
-/// [`WireCodec`]). A test pins this list to the wire's spoken range.
-pub const WIRE_PROTOCOLS: [&str; 2] = [WIRE_PROTOCOL, "/ikigai/wire/7"];
+/// QUIC's ALPN list. Since wire v8 a node also speaks the older versions it still serves
+/// (7 and 8 as of v9), so such a peer still negotiates its own id, and every reply on such
+/// a stream is encoded at that version (see [`WireCodec`]). A test pins this list to the
+/// wire's spoken range.
+pub const WIRE_PROTOCOLS: [&str; 3] = [WIRE_PROTOCOL, "/ikigai/wire/8", "/ikigai/wire/7"];
 
 /// The wire version a negotiated protocol id names. Only ids from [`WIRE_PROTOCOLS`] are
 /// ever negotiated; anything else reads as the OLDEST spoken version, so a surprise can
@@ -411,7 +412,9 @@ enum Command {
     Call {
         peer: PeerId,
         addresses: Vec<Multiaddr>,
-        call: Call,
+        /// Boxed: a `Call` carries a request and a capability (and, since wire v9, a run
+        /// context), which dwarfs `Dial`'s address, and the command queue holds many.
+        call: Box<Call>,
         reply: AnswerTo,
     },
 }
@@ -446,7 +449,7 @@ impl PeerHandle {
             .send(Command::Call {
                 peer,
                 addresses,
-                call,
+                call: Box::new(call),
                 reply,
             })
             .map_err(|_| "the peer task has stopped".to_string())?;
@@ -543,7 +546,7 @@ async fn run_peer(
                     let id = swarm
                         .behaviour_mut()
                         .wire
-                        .send_request_with_addresses(&peer, call, addresses);
+                        .send_request_with_addresses(&peer, *call, addresses);
                     pending.insert(id, reply);
                 }
                 // Every handle is gone: nobody can call out any more. A SERVING peer keeps
@@ -729,19 +732,20 @@ mod tests {
             .map(|v| format!("/ikigai/wire/{v}"))
             .collect();
         assert_eq!(WIRE_PROTOCOLS.to_vec(), spoken);
-        for (id, version) in WIRE_PROTOCOLS.iter().zip([8, 7]) {
+        for (id, version) in WIRE_PROTOCOLS.iter().zip([9, 8, 7]) {
             assert_eq!(version_of_protocol(&StreamProtocol::new(id)), version);
         }
     }
 
     /// The codec encodes each reply at its stream's version: a Conflict on a v7 stream is
-    /// the untyped Endpoint a v7 peer has always received, typed on a v8 one.
+    /// the untyped Endpoint a v7 peer has always received, typed on a v8 or v9 one.
     #[test]
     fn a_reply_is_encoded_at_the_version_its_stream_negotiated() {
         use request_response::Codec;
         let conflict = || Reply::ErrorTyped(WireError::Conflict("x".into()));
         for (id, expected) in [
-            (WIRE_PROTOCOLS[1], WireError::Endpoint("conflict: x".into())),
+            (WIRE_PROTOCOLS[2], WireError::Endpoint("conflict: x".into())),
+            (WIRE_PROTOCOLS[1], WireError::Conflict("x".into())),
             (WIRE_PROTOCOLS[0], WireError::Conflict("x".into())),
         ] {
             let mut out = futures::io::Cursor::new(Vec::new());
