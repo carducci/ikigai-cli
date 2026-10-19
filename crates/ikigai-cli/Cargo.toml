@@ -90,10 +90,10 @@ mime_guess = "2.0"
 # `bearer()` reads its header through `ikigai_http::auth::scheme`, the clipboard's OSC-52 payload
 # is `ikigai_http::base64::encode`, and a layer file entry's content is encoded and decoded by the
 # same module (ledger #1866), so none carries a private copy. 0.2.1 is
-# the first release with the `auth` and `base64` modules, so it is this crate's floor, above
-# the workspace's 0.2.0 (which is ikigai-embedded's, and does not need them). Read the caret
-# as a RANGE: `^0.2.1` is `<0.3.0`.
-ikigai-http = "0.2.1"
+# the first release with the `auth` and `base64` modules, so 0.2.1 was this crate's floor; 0.3.0 is
+# the workspace's now (ledger #1546, the failure classes), and the two modules are unchanged in it.
+# Read the caret as a RANGE: `^0.3.0` is `<0.4.0`.
+ikigai-http = "0.3.0"
 oxttl = { workspace = true }
 oxrdf = { workspace = true }
 # `layers save` refuses a file name that would arm something on the reader's machine, by the

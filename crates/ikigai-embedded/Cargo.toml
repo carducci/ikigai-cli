@@ -64,6 +64,11 @@ ikigai-discovery = { path = "../ikigai-discovery", version = "0.1.65" }
 ikigai-engine = { path = "../ikigai-engine", version = "0.1.65", features = ["plan-reader"] }
 ikigai-fs = { workspace = true }
 ikigai-http = { workspace = true }
+# ⚠ TRANSITIONAL: the SAME crate on its previous line, under another name. ikigai-meeting 0.3.1 still pins
+# ikigai-http `0.2.1`, so its `space()` takes the 0.2 `HttpTransport`, a different trait from the 0.3 one the
+# workspace moved to (ledger #1546). `UreqTransport` implements both over one send body, and this alias is what
+# names the 0.2 trait. Delete it, and the impl beside it in `lib.rs`, when ikigai-meeting ships on 0.3.
+ikigai-http-02 = { package = "ikigai-http", version = "0.2.1" }
 ikigai-runbook = { workspace = true }
 ikigai-rdf = { workspace = true }
 ikigai-sparql = { workspace = true }
@@ -170,7 +175,10 @@ futures = { workspace = true }
 # open argument sets and empty enumerations are understood. ⚠ `^0.9.0` is also a ceiling below 0.10.0.
 # 0.9.1 (ledger #1882): VALIDATE's hint allows an optional binding's default (core 0.1.106). Not an API floor.
 # ⚠ `^0.9.1` is also a ceiling below 0.10.0.
-ikigai-conformance = "0.9.1"
+# 0.10.0 (ledger #1546): the FAILURES check (declared failure classes = produced, core 0.1.108's
+# `ActionSpec::fails` over `Error::class()`), opt-in through `Suite::check_failures()` in 0.10 and the
+# default from 0.11.0; `Suite::fails_under` probes. ⚠ `^0.10.0` is also a ceiling below 0.11.0.
+ikigai-conformance = "0.10.0"
 # The conformance fixture SEEDS the two edge verifying keys and one signing key, so the
 # decision faces are walked over real state instead of reporting "did not resolve". Same
 # version and features as the library dependency above: the fixture must write exactly the

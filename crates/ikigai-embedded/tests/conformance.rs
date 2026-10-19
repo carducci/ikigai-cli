@@ -181,7 +181,10 @@ const INHERITED: &[(&str, &str)] = &[
     ("http-head", "ikigai-http"),
     ("http-patch", "ikigai-http"),
     ("http-post", "ikigai-http"),
+    // WebDAV `PROPFIND` and `REPORT`, bound by ikigai-http since 0.3.0.
+    ("http-propfind", "ikigai-http"),
     ("http-put", "ikigai-http"),
+    ("http-report", "ikigai-http"),
     ("ikigai-vocab", "ikigai-vocab"),
     ("jsonld-compact", "ikigai-jsonld"),
     ("jsonld-expand", "ikigai-jsonld"),
@@ -456,6 +459,10 @@ const PLAN: &str = "\
 /// The opt-outs that remain below are for endpoints this workspace OWNS.
 fn base() -> Suite {
     Suite::new()
+        // FAILURES (conformance 0.10.0, ledger #1546): declared failure classes = produced. Opted
+        // into here because this walk asserts that NO check is skipped, and the default from
+        // 0.11.0 anyway. An action that declares nothing is listed, never a finding.
+        .check_failures()
         // ---- fired, with inputs that work ----------------------------------------
         // Take reads `content` as the id to take since ledger #877 (the engine puts the value
         // of `delete urn:space:q <id>` there), so the walk's sample `x` now names a tuple that

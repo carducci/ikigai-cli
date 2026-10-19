@@ -934,7 +934,13 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 [workspace.dependencies]
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
-ikigai-core = "0.1.107" # 0.1.107 = the cache-status probe (`Kernel::is_cached`) keys a served name without
+ikigai-core = "0.1.108" # 0.1.108 = the failure classes (ledger #1546): `FailureClass` and `Error::class()`, the
+# `RetryAfter` / `OverBudget` / `Refused` / `Unsupported` variants and `Error::retry_after_millis()`,
+# `Verb::is_idempotent()`, `ActionSpec::fails`, and the run context (`IssueContext`, `RetryLimits`,
+# `Kernel::issue_with_context` / `issue_traced_with_context`, `Invocation::retry_budget` / `not_after` /
+# `time_left` / `issue_context`). An API floor for wire v9 (`ikigai-wire`, `ikigai-ipc`, `ikigai-quic`,
+# `ikigai-resolve`) and for the edge's statuses (`ikigai-web`). ⚠ `^0.1.108` is also a ceiling below 0.2.0.
+# Beneath it: 0.1.107 = the cache-status probe (`Kernel::is_cached`) keys a served name without
 # resolving it, so it no longer forwards a mount's `Meta` to the peer on every resolver read (ledger #1884): a hot
 # mounted read through the engine asks the peer for the contract once per TTL again, as ledger #1577's memo meant.
 # A behavior floor, not an API floor: no source here calls anything new in it; `ikigai-resolve`'s
@@ -1074,7 +1080,9 @@ ikigai-core = "0.1.107" # 0.1.107 = the cache-status probe (`Kernel::is_cached`)
 # holds beneath it: below that a MOUNTED template row whose local name-guess collides with a
 # shorter sibling is dropped from the manifold, so `ikigai mcp` silently stops projecting
 # browse-pr-explain and browse-pr-review.
-ikigai-vocab = "0.1.107" # 0.1.107 = core 0.1.107's lockstep release. Not an API floor; raised with core.
+ikigai-vocab = "0.1.108" # 0.1.108 = core 0.1.108's lockstep release (`ik:mayFail`, `ik:FailureClass` and its seven
+# individuals, `tests/vectors/failure_class_vectors.json`). Not an API floor; raised with core.
+# Beneath it: 0.1.107 = core 0.1.107's lockstep release. Not an API floor; raised with core.
 # Beneath it: 0.1.106 = core 0.1.106's lockstep release (the ArgSpec-shape vocabulary: ik:InputGroup,
 # ik:listSeparator, ik:Stage, ik:cap as an IRI). Not an API floor; raised with core.
 # Beneath it: 0.1.98 = core 0.1.98's lockstep release, past the YANKED 0.1.97 (a draft vocabulary).
@@ -1221,7 +1229,14 @@ ikigai-fs = "0.1.8" # 0.1.8 is a SECURITY floor (audit round 3, ledger #856): th
 # live mount is unchanged, so nothing else here moves.
 # 0.1.5 = path declared as Binding input (urn:file/orgfile rows in urn:kernel:actions)
 # Outbound HTTP-client module (urn:http:get…), linked as a published module crate.
-ikigai-http = "0.2.0" # 0.2.0 = the naming wave (ledger #11): the six ids are `http-get` … `http-delete` and the
+ikigai-http = "0.3.0" # 0.3.0 = the one status table on core 0.1.108's failure classes (ledger #1546,
+# `ikigai_http::status`): an origin's 401/403 is `Refused` (was `Denied`), 429 and a 503 with `Retry-After`
+# are `RetryAfter`, 500 and other 5xx are `Endpoint` (was `Unavailable`, so a backend's 500 is no longer
+# retried), 501 `Unsupported`, 409/412 `Conflict`, 413/414/431 `OverBudget`; each action declares
+# `.fails(...)`. `HttpTransport` is shared with ikigai-llm 0.16 (and ikigai-meeting, below), so the pins
+# move together. ⚠ `^0.3.0` is also a ceiling below 0.4.0. The deprecated `urn:httpGet` … aliases are KEPT
+# through 0.3.x (ikigai-runbook still calls them).
+# Beneath it: 0.2.0 = the naming wave (ledger #11): the six ids are `http-get` … `http-delete` and the
 # IRIs `urn:http:get` … `urn:http:delete`; the old `urn:httpGet` … IRIs resolve as deprecated aliases through 0.2.x
 # (0.3.0 removes them), so this host's own wiring and text use the new names. `space()` returns core's `Alias`
 # overlay, held here as `Arc<dyn Space>`. `HttpTransport` is shared with ikigai-llm 0.15 and ikigai-meeting 0.3,
@@ -1611,7 +1626,12 @@ ikigai-lisp = "0.3.1" # 0.3.1 = the 0.3 line names its `space()` `urn:iki:space:
 # client reads `Endpoint` as RETRYABLE — so a permanent authority refusal came back over IPC
 # and QUIC as something worth trying again, and the HTTP face mapped it to 500 rather than
 # 403. 0.1.12 = scope_sync migration (core-owned bridge; channels deleted)
-ikigai-throttle = "0.1.11" # 0.1.11 = the overlays forward `topology()` and `id()`, so a governed space shows (and keeps its
+ikigai-throttle = "0.2.0" # 0.2.0 = the overlays decide from core 0.1.108's `Error::class()` and spend the run's shared
+# retry pool (ledger #1546): `RateLimit` answers `RetryAfter` with the delay (was `Endpoint("rate-limited …")`),
+# Retry re-issues only a transient failure of an idempotent verb, Failover advances on transient and
+# retry-after, CircuitBreaker's open state is `RetryAfter` with the cooldown left. `Timeout` (`lisp::govern`)
+# is unchanged. ⚠ `^0.2.0` is also a ceiling below 0.3.0.
+# Beneath it: 0.1.11 = the overlays forward `topology()` and `id()`, so a governed space shows (and keeps its
 # name) in `urn:kernel:topology`; `Failover` stays opaque. One wrapper per endpoint.
 # Beneath it, still true: 0.1.10 = the over-budget `RateLimit` stand-in FORWARDS the
 # wrapped endpoint's `describe()`. Below it the stand-in described itself ("rate-limited",
@@ -1644,7 +1664,11 @@ ikigai-throttle = "0.1.11" # 0.1.11 = the overlays forward `topology()` and `id(
 # Timeout governor + Failover (the --prefer mount degrades through it)
 # LLM inference (urn:llm:ask + urn:llm:<provider>:ask + urn:llm:config): a facade grammar
 # over pluggable backends. OpenAI-compatible REST backend (Ollama/vLLM/llama.cpp/mlx_lm).
-ikigai-llm = "0.15.0" # 0.15.0 = on ikigai-http 0.2.0 (ledger #11): `space(transport, registry)` takes the
+ikigai-llm = "0.16.0" # 0.16.0 = on ikigai-http 0.3.0 (ledger #1546): `space(transport, registry)` takes the 0.3
+# `HttpTransport`, and a backend's status is read through `ikigai_http::status` (its own copy deleted), so an
+# inference origin's 401/403 is `Refused`, 429 `RetryAfter`, 500 `Endpoint`; each action declares `.fails`.
+# ⚠ `^0.16.0` is also a ceiling below 0.17.0.
+# Beneath it: 0.15.0 = on ikigai-http 0.2.0 (ledger #11): `space(transport, registry)` takes the
 # 0.2 `HttpTransport`, the one this host hands ikigai-http and ikigai-meeting too, so the three move together.
 # 0.14.0 typed transport failures for the reliability overlays (ledger #88) and matches `as=` by media-type
 # essence (ledger #179).
@@ -1668,7 +1692,11 @@ ikigai-llm = "0.15.0" # 0.15.0 = on ikigai-http 0.2.0 (ledger #11): `space(trans
 # urn:llm:{provider}:model, which browse's explain archive keys its version tags on.
 # Video-conference scheduling (urn:meeting:schedule + urn:meeting:<provider>:schedule): a facade
 # over provider backends, Zoom first. Now on crates.io — the git-rev bridge retired at first publish.
-ikigai-meeting = "0.3.0" # 0.3.0 = on ikigai-http 0.2.0 (ledger #11), the shared `HttpTransport`. 0.2.0 renamed
+ikigai-meeting = "0.3.0" # ⚠ Still on ikigai-http 0.2 (0.3.1 pins `0.2.1`), while this workspace moved to 0.3.0 with
+# ikigai-llm 0.16 (ledger #1546). Its `space()` therefore takes the 0.2 `HttpTransport`, which ikigai-embedded
+# implements for the same `UreqTransport` through a second, aliased copy of ikigai-http (`ikigai-http-02` in its
+# manifest). When ikigai-meeting ships on ikigai-http 0.3, raise this pin and DELETE that alias and its impl.
+# 0.3.0 = on ikigai-http 0.2.0 (ledger #11), the shared `HttpTransport`. 0.2.0 renamed
 # the description id `urn:meeting:zoom:schedule` → `meeting` (IRIs unchanged) and added `attendees`.
 # Beneath it, still true: 0.1.2 = the Zoom `account_id` moves out of the token URL into the form body, and the Turtle face
 # escapes line breaks. API unchanged.
