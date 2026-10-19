@@ -2230,12 +2230,19 @@ fn served_spaces(nature: &'static str, surface: ServedSurface) -> Vec<Arc<dyn Sp
 /// pulling in Tokio — the executor stays chosen at the edge.
 struct UreqTransport;
 
-#[async_trait::async_trait]
-impl ikigai_http::HttpTransport for UreqTransport {
-    async fn send(
-        &self,
-        request: ikigai_http::HttpRequest,
-    ) -> std::result::Result<ikigai_http::HttpResponse, String> {
+/// What one HTTP exchange brings back: the status, the headers and the body.
+type Exchanged = (u16, Vec<(String, String)>, Vec<u8>);
+
+impl UreqTransport {
+    /// One blocking exchange: the method as its token, the URL, the headers and the body
+    /// out; the status, headers and body back. Shared by the two `HttpTransport` impls
+    /// below, which differ only in the crate version of the structs they carry.
+    fn exchange(
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> std::result::Result<Exchanged, String> {
         use std::io::Read;
         // The HttpTransport contract (ikigai-http ≥ 0.1.7) forbids following
         // redirects here: the ENDPOINT follows them, re-running the net-capability
@@ -2243,14 +2250,14 @@ impl ikigai_http::HttpTransport for UreqTransport {
         // host 302 the request to an ungranted one. `redirects(0)` returns the
         // 3xx as-is.
         let agent = ureq::builder().redirects(0).build();
-        let mut req = agent.request(request.method.as_str(), &request.url);
-        for (name, value) in &request.headers {
+        let mut req = agent.request(method, url);
+        for (name, value) in headers {
             req = req.set(name, value);
         }
-        let outcome = if request.body.is_empty() {
+        let outcome = if body.is_empty() {
             req.call()
         } else {
-            req.send_bytes(&request.body)
+            req.send_bytes(body)
         };
         // A 4xx/5xx is still a response (with a body), not a transport failure.
         let resp = match outcome {
@@ -2259,19 +2266,59 @@ impl ikigai_http::HttpTransport for UreqTransport {
             Err(e) => return Err(e.to_string()),
         };
         let status = resp.status();
-        let headers = resp
+        let response_headers = resp
             .headers_names()
             .into_iter()
             .filter_map(|name| resp.header(&name).map(|v| (name.clone(), v.to_string())))
             .collect();
         // A HEAD response carries headers only — no body to read.
-        let mut body = Vec::new();
-        if request.method != ikigai_http::Method::Head {
+        let mut response_body = Vec::new();
+        if method != "HEAD" {
             resp.into_reader()
-                .read_to_end(&mut body)
+                .read_to_end(&mut response_body)
                 .map_err(|e| format!("reading response body: {e}"))?;
         }
+        Ok((status, response_headers, response_body))
+    }
+}
+
+#[async_trait::async_trait]
+impl ikigai_http::HttpTransport for UreqTransport {
+    async fn send(
+        &self,
+        request: ikigai_http::HttpRequest,
+    ) -> std::result::Result<ikigai_http::HttpResponse, String> {
+        let (status, headers, body) = Self::exchange(
+            request.method.as_str(),
+            &request.url,
+            &request.headers,
+            &request.body,
+        )?;
         Ok(ikigai_http::HttpResponse {
+            status,
+            headers,
+            body,
+        })
+    }
+}
+
+/// ⚠ TRANSITIONAL (ledger #1546): the same transport as the 0.2 `HttpTransport`, for
+/// ikigai-meeting, which still pins ikigai-http 0.2.1 while the workspace is on 0.3. The
+/// trait and both structs have the same shape in the two releases; only the crate differs.
+/// Delete this impl and the `ikigai-http-02` alias when ikigai-meeting ships on 0.3.
+#[async_trait::async_trait]
+impl ikigai_http_02::HttpTransport for UreqTransport {
+    async fn send(
+        &self,
+        request: ikigai_http_02::HttpRequest,
+    ) -> std::result::Result<ikigai_http_02::HttpResponse, String> {
+        let (status, headers, body) = Self::exchange(
+            request.method.as_str(),
+            &request.url,
+            &request.headers,
+            &request.body,
+        )?;
+        Ok(ikigai_http_02::HttpResponse {
             status,
             headers,
             body,

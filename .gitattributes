@@ -1,0 +1,6 @@
+# Every tracked file is LF (checked 2026-10-19: `git ls-files --eol` lists no CRLF), and the
+# shared vectors this repo holds verbatim from core are compared BYTE-identical by
+# devtools' `vector-drift` (ledger #1886), so a Windows checkout with `core.autocrlf` must not
+# rewrite them. `text=auto` keeps the rest normalized to LF in the index.
+* text=auto
+crates/ikigai-mcp/tests/vectors/*.json text eol=lf

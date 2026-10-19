@@ -24,4 +24,7 @@ futures = { workspace = true }
 # open argument sets and empty enumerations are understood. ⚠ `^0.9.0` is also a ceiling below 0.10.0.
 # 0.9.1 (ledger #1882): VALIDATE's hint allows an optional binding's default (core 0.1.106). Not an API floor.
 # ⚠ `^0.9.1` is also a ceiling below 0.10.0.
-ikigai-conformance = "0.9.1"
+# 0.10.0 (ledger #1546): the FAILURES check (declared failure classes = produced, core 0.1.108's
+# `ActionSpec::fails` over `Error::class()`), opt-in through `Suite::check_failures()` in 0.10 and the
+# default from 0.11.0; `Suite::fails_under` probes. ⚠ `^0.10.0` is also a ceiling below 0.11.0.
+ikigai-conformance = "0.10.0"
