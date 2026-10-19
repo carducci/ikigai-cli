@@ -5438,6 +5438,68 @@ mod tests {
         );
     }
 
+    /// Ledger #1905: a machine finding read the early return on a request with no `Origin`
+    /// (`apply_edge_policy`) as a gap. It is the rule. CORS headers answer a browser's
+    /// cross-origin READ, and a browser names the origin on every such request; a request
+    /// with no `Origin` is same-origin or not from a browser, so there is nothing to allow,
+    /// and the answer is otherwise the same one. A cross-site WRITE is the other layer's
+    /// question ([`OriginCheck`], an admission rule, which runs before any of this and
+    /// refuses a credentialed write that carries no `Origin`): the CORS layer never gates
+    /// whether a request is served, only what a browser may read of the answer.
+    #[tokio::test]
+    async fn a_request_with_no_origin_is_the_same_answer_without_cors_headers() {
+        let addr = start_with(EdgeConfig {
+            cors: CorsPolicy {
+                allowed_origins: vec!["https://app.example".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await;
+        let plain = roundtrip(addr, "GET /test/id/hello HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        let cross = roundtrip(
+            addr,
+            "GET /test/id/hello HTTP/1.1\r\nHost: x\r\nOrigin: https://app.example\r\n\r\n",
+        )
+        .await;
+        // Served, and no CORS header of any kind without an Origin.
+        assert!(plain.starts_with("HTTP/1.1 200"), "{plain}");
+        assert!(!plain.contains("Access-Control-"), "{plain}");
+        // The cross-origin answer is the SAME answer plus exactly the allow-origin header.
+        assert!(
+            cross.contains("Access-Control-Allow-Origin: https://app.example"),
+            "{cross}"
+        );
+        let without_cors: Vec<&str> = cross
+            .lines()
+            .filter(|l| !l.starts_with("Access-Control-"))
+            .collect();
+        assert_eq!(without_cors, plain.lines().collect::<Vec<_>>(), "{cross}");
+
+        // The write question belongs to admission: an HTML door refuses a cookie-carrying
+        // POST with no Origin before routing, CORS policy or not.
+        let door = start_with(EdgeConfig {
+            cors: CorsPolicy {
+                allowed_origins: vec!["https://app.example".to_string()],
+                ..Default::default()
+            },
+            ..EdgeConfig::html_door(["https://x"]).unwrap()
+        })
+        .await;
+        let forged = roundtrip(
+            door,
+            "POST /test/writable HTTP/1.1\r\nHost: x\r\nCookie: s=1\r\nContent-Length: 2\r\n\r\nhi",
+        )
+        .await;
+        assert!(forged.starts_with("HTTP/1.1 403"), "{forged}");
+        let anonymous = roundtrip(
+            door,
+            "POST /test/writable HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi",
+        )
+        .await;
+        assert!(anonymous.starts_with("HTTP/1.1 200"), "{anonymous}");
+    }
+
     #[tokio::test]
     async fn cors_echoes_an_allowed_origin() {
         let addr = start_with(EdgeConfig {
