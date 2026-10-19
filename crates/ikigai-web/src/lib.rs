@@ -26,8 +26,10 @@
 //! - **`cap_of(request)` is the multi-tenant door** — every request resolves under a
 //!   capability derived from its identity. A public default (or a fixed `--cap` ceiling that
 //!   narrows the edge); a per-user capability (magic-link / passkey) fills the same seam later.
-//! - **typed error → status**: `Denied`→403, `NotFound`/`Unresolved`→404, invalid/missing
-//!   arg→400, `Conflict`→409, transient→503, else 500. The body is the message as
+//! - **typed error → status** (ledger #1546's table, see [`error_status`]): `Denied`→403,
+//!   `NotFound`/`Unresolved`→404, invalid/missing arg→400, `Conflict`→409, `Timeout`→504,
+//!   `Unavailable`→503, `RetryAfter`→429 with `Retry-After`, `OverBudget`→422, `Refused`→502,
+//!   `Unsupported`→405 with `Allow` (a verb) or 501 (a facility), else 500. The body is the message as
 //!   `text/plain`, or a typed JSON object (see [`error_json`]) when [`EdgeConfig::error_body`]
 //!   asks for [`ErrorBody::Json`]. A plain-text error is a minimal HTML page for a client that
 //!   asks for `text/html` over `text/plain` (a browser), with `Vary: Accept` either way.
@@ -419,33 +421,48 @@ pub enum ErrorBody {
 /// `message` (the error's display text, the same string the `text/plain` body carries), plus
 /// the fields the variant itself carries, under these names:
 ///
-/// | `kind`             | extra fields       |
-/// |--------------------|--------------------|
-/// | `invalid-argument` | `name`, `detail`   |
-/// | `missing-argument` | `name`             |
-/// | `unresolved`       | `target`           |
-/// | `depth-exceeded`   | `depth`, `target`  |
+/// | `kind`             | extra fields                                   |
+/// |--------------------|------------------------------------------------|
+/// | `invalid-argument` | `name`, `detail`                               |
+/// | `missing-argument` | `name`                                         |
+/// | `unresolved`       | `target`                                       |
+/// | `depth-exceeded`   | `depth`, `target`                              |
+/// | `retry-after`      | `retry_after` (the header's seconds, when known) |
+/// | `unsupported`      | `verb` (its serde name, when one is named)     |
 ///
-/// Every other kind carries only its message. A variant core adds later renders with its
-/// own `kind` and `message` and no extra fields until this table names them.
+/// Every body also carries `class`, the failure class (`Error::class`, ledger #1546), so a
+/// client decides who may repeat the request without a table of kinds. Every other kind
+/// carries only its message. A variant core adds later renders with its own `kind`,
+/// `class` and `message` and no extra fields until this table names them.
 ///
 /// ```
-/// use ikigai_core::{Error, Iri};
+/// use std::time::Duration;
+/// use ikigai_core::{Error, Iri, Verb};
 /// use ikigai_web::error_json;
 ///
+/// let limited = Error::RetryAfter { delay: Some(Duration::from_millis(1_500)), detail: "5 per minute".into() };
+/// assert_eq!(
+///     error_json(&limited),
+///     r#"{"kind":"retry-after","class":"retry-after","message":"retry after 1500 ms: 5 per minute","retry_after":2}"#
+/// );
+/// let read_only = Error::Unsupported { verb: Some(Verb::Sink), detail: "append-only".into() };
+/// assert_eq!(
+///     error_json(&read_only),
+///     r#"{"kind":"unsupported","class":"permanent","message":"unsupported: append-only","verb":"Sink"}"#
+/// );
 /// let invalid = Error::InvalidArgument { name: "tuple".into(), detail: "not a name".into() };
 /// assert_eq!(
 ///     error_json(&invalid),
-///     r#"{"kind":"invalid-argument","message":"invalid argument `tuple`: not a name","name":"tuple","detail":"not a name"}"#
+///     r#"{"kind":"invalid-argument","class":"permanent","message":"invalid argument `tuple`: not a name","name":"tuple","detail":"not a name"}"#
 /// );
 /// assert_eq!(
 ///     error_json(&Error::NotFound("no tuple z yet".into())),
-///     r#"{"kind":"not-found","message":"not found: no tuple z yet"}"#
+///     r#"{"kind":"not-found","class":"permanent","message":"not found: no tuple z yet"}"#
 /// );
 /// let deep = Error::DepthExceeded { depth: 65, target: Iri::parse("urn:x").unwrap() };
 /// assert_eq!(
 ///     error_json(&deep),
-///     r#"{"kind":"depth-exceeded","message":"nesting budget exceeded: sub-request for urn:x would run at depth 65","depth":65,"target":"urn:x"}"#
+///     r#"{"kind":"depth-exceeded","class":"permanent","message":"nesting budget exceeded: sub-request for urn:x would run at depth 65","depth":65,"target":"urn:x"}"#
 /// );
 /// ```
 pub fn error_json(e: &ikigai_core::Error) -> String {
@@ -453,6 +470,7 @@ pub fn error_json(e: &ikigai_core::Error) -> String {
     use serde_json::{Map, Value};
     let mut body = Map::new();
     body.insert("kind".into(), Value::from(e.kind()));
+    body.insert("class".into(), Value::from(e.class().word()));
     body.insert("message".into(), Value::from(e.to_string()));
     match e {
         Error::InvalidArgument { name, detail } => {
@@ -468,6 +486,16 @@ pub fn error_json(e: &ikigai_core::Error) -> String {
         Error::DepthExceeded { depth, target } => {
             body.insert("depth".into(), Value::from(*depth));
             body.insert("target".into(), Value::from(target.as_str()));
+        }
+        Error::RetryAfter { .. } => {
+            if let Some(seconds) = retry_after_seconds(e) {
+                body.insert("retry_after".into(), Value::from(seconds));
+            }
+        }
+        Error::Unsupported {
+            verb: Some(verb), ..
+        } => {
+            body.insert("verb".into(), Value::from(format!("{verb:?}")));
         }
         _ => {}
     }
@@ -1687,10 +1715,12 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
             if tombstoned(shared, &tombstone_key(&iri_str, req)) {
                 Resp::status(204, "No Content")
             } else {
-                error_resp(config, &e)
+                error_resp_allowing(config, &e, Some(&allow))
             }
         }
-        Err(e) => error_resp(config, &e),
+        // The resource's declared methods are at hand here, so a 405 from an endpoint
+        // that refuses a verb it declares (`Unsupported`) carries `Allow`.
+        Err(e) => error_resp_allowing(config, &e, Some(&allow)),
     }
 }
 
@@ -2500,31 +2530,89 @@ fn verb_for_method(method: &str) -> Option<Verb> {
 ///
 /// The body follows [`EdgeConfig::error_body`]: the message as `text/plain` by default, the
 /// typed object of [`error_json`] when the door asked for JSON.
+///
+/// The headers the status calls for ride along (ledger #1546): a `RetryAfter` answers `429`
+/// with `Retry-After` in seconds, rounded up and never 0 ([`retry_after_seconds`]); an
+/// `Unsupported` that names a verb answers `405`, with `Allow` when the caller knows the
+/// resource's declared methods ([`error_resp_allowing`]).
 fn error_resp(config: &EdgeConfig, e: &ikigai_core::Error) -> Resp {
+    error_resp_allowing(config, e, None)
+}
+
+/// [`error_resp`] with the resource's `Allow` list at hand, for a `405`.
+fn error_resp_allowing(config: &EdgeConfig, e: &ikigai_core::Error, allow: Option<&str>) -> Resp {
     let status = error_status(e);
     let reason = reason_phrase(status);
-    match config.error_body {
+    let mut resp = match config.error_body {
         ErrorBody::Json => Resp {
             content_type: "application/json".to_string(),
             body: error_json(e).into_bytes(),
             ..Resp::status(status, reason)
         },
         ErrorBody::Text => Resp::text(status, reason, &format!("{e}")),
+    };
+    if let Some(seconds) = retry_after_seconds(e) {
+        resp.headers
+            .push(("Retry-After".to_string(), seconds.to_string()));
     }
+    if status == 405 {
+        resp.allow = allow.map(str::to_string);
+    }
+    resp
 }
 
-/// The HTTP status a typed kernel error is answered with, in every door this crate serves:
-/// `Denied` 403, `NotFound`/`Unresolved` 404, a missing or invalid argument 400, `Conflict`
-/// 409, a transient error 503, anything else 500.
+/// The `Retry-After` an error is answered with, in delay-seconds: a `RetryAfter`
+/// (`ikigai_core::Error::RetryAfter`) with a known delay, rounded UP and never 0 (a `0` would tell the
+/// client to retry at once, which is not what a stated delay means; RFC 9110 §10.2.3).
+/// `None` for every other error, and for a `RetryAfter` with no delay: no header is sent.
+/// The rule is core's shared `failure_class_vectors.json`, which the faces pin too.
 ///
 /// ```
+/// use std::time::Duration;
 /// use ikigai_core::Error;
+/// use ikigai_web::retry_after_seconds;
+///
+/// let after = |delay| Error::RetryAfter { delay: Some(delay), detail: "limited".into() };
+/// assert_eq!(retry_after_seconds(&after(Duration::from_secs(30))), Some(30));
+/// assert_eq!(retry_after_seconds(&after(Duration::from_millis(1_500))), Some(2));
+/// assert_eq!(retry_after_seconds(&after(Duration::from_micros(1_200))), Some(1));
+/// assert_eq!(retry_after_seconds(&after(Duration::ZERO)), Some(1));
+/// assert_eq!(retry_after_seconds(&Error::RetryAfter { delay: None, detail: "x".into() }), None);
+/// assert_eq!(retry_after_seconds(&Error::Timeout("slow".into())), None);
+/// ```
+pub fn retry_after_seconds(e: &ikigai_core::Error) -> Option<u64> {
+    e.retry_after_millis()
+        .map(|millis| millis.div_ceil(1000).max(1))
+}
+
+/// The HTTP status a typed kernel error is answered with, in every door this crate serves,
+/// the DECIDED table of ledger #1546 (core's shared `failure_class_vectors.json`, which the
+/// Python and Deno faces pin to the same numbers): `Denied` 403, `NotFound`/`Unresolved`
+/// 404, a missing or invalid argument 400, `Conflict` 409, `Timeout` 504 (was 503 before
+/// 0.1.66: the edge waited on something that did not answer, which is a gateway's timeout),
+/// `Unavailable` 503, `RetryAfter` 429 (with `Retry-After`, see [`retry_after_seconds`]),
+/// `OverBudget` 422, `Refused` 502 (a remote authority refused the credential this side
+/// presented), `Unsupported` 405 when it names a verb (with `Allow`) and 501 when it names a
+/// missing host facility, `DepthExceeded` and `Endpoint` 500, and any variant core adds later
+/// 500 until this table names it.
+///
+/// ```
+/// use std::time::Duration;
+/// use ikigai_core::{Error, Iri, Verb};
 /// use ikigai_web::error_status;
 ///
 /// assert_eq!(error_status(&Error::Denied("no".into())), 403);
 /// assert_eq!(error_status(&Error::Conflict("taken by bob".into())), 409);
 /// assert_eq!(error_status(&Error::MissingArgument("tuple".into())), 400);
-/// assert_eq!(error_status(&Error::Timeout("slow".into())), 503);
+/// assert_eq!(error_status(&Error::Timeout("slow".into())), 504);
+/// assert_eq!(error_status(&Error::Unavailable("down".into())), 503);
+/// assert_eq!(error_status(&Error::RetryAfter { delay: Some(Duration::from_secs(30)), detail: "limited".into() }), 429);
+/// assert_eq!(error_status(&Error::OverBudget { detail: "past 5000 ms".into() }), 422);
+/// assert_eq!(error_status(&Error::Refused("401".into())), 502);
+/// assert_eq!(error_status(&Error::Unsupported { verb: Some(Verb::Sink), detail: "read-only".into() }), 405);
+/// assert_eq!(error_status(&Error::Unsupported { verb: None, detail: "no clock".into() }), 501);
+/// assert_eq!(error_status(&Error::DepthExceeded { depth: 65, target: Iri::parse("urn:x").unwrap() }), 500);
+/// assert_eq!(error_status(&Error::Endpoint("boom".into())), 500);
 /// ```
 pub fn error_status(e: &ikigai_core::Error) -> u16 {
     use ikigai_core::Error;
@@ -2533,7 +2621,13 @@ pub fn error_status(e: &ikigai_core::Error) -> u16 {
         Error::NotFound(_) | Error::Unresolved(_) => 404,
         Error::MissingArgument(_) | Error::InvalidArgument { .. } => 400,
         Error::Conflict(_) => 409,
-        _ if e.is_transient() => 503,
+        Error::Timeout(_) => 504,
+        Error::Unavailable(_) => 503,
+        Error::RetryAfter { .. } => 429,
+        Error::OverBudget { .. } => 422,
+        Error::Refused(_) => 502,
+        Error::Unsupported { verb: Some(_), .. } => 405,
+        Error::Unsupported { verb: None, .. } => 501,
         _ => 500,
     }
 }
@@ -2558,11 +2652,14 @@ fn reason_phrase(status: u16) -> &'static str {
         413 => "Payload Too Large",
         415 => "Unsupported Media Type",
         421 => "Misdirected Request",
+        422 => "Unprocessable Content",
         429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         501 => "Not Implemented",
+        502 => "Bad Gateway",
         503 => "Service Unavailable",
+        504 => "Gateway Timeout",
         _ => "",
     }
 }
@@ -3737,6 +3834,55 @@ mod tests {
             Err(Error::NotFound("no such thing".into()))
         })
         .with_description(Description::new("missing").verb(Verb::Source));
+        // The failure classes of core 0.1.108 (ledger #1546), one endpoint each, so the
+        // status table is pinned over the socket and not only in `error_status`'s doctest.
+        let limited = FnEndpoint::new("limited", |_inv: &Invocation<'_>| {
+            Err(Error::RetryAfter {
+                delay: Some(std::time::Duration::from_millis(1_500)),
+                detail: "5 per minute".into(),
+            })
+        })
+        .with_description(Description::new("limited").verb(Verb::Source));
+        let budget = FnEndpoint::new("budget", |_inv: &Invocation<'_>| {
+            Err(Error::OverBudget {
+                detail: "the query ran past its 5000 ms budget".into(),
+            })
+        })
+        .with_description(Description::new("budget").verb(Verb::Source));
+        let refused = FnEndpoint::new("refused", |_inv: &Invocation<'_>| {
+            Err(Error::Refused("api.example.com answered 401".into()))
+        })
+        .with_description(Description::new("refused").verb(Verb::Source));
+        let slow = FnEndpoint::new("slow", |_inv: &Invocation<'_>| {
+            Err(Error::Timeout("the origin did not answer in 30 s".into()))
+        })
+        .with_description(Description::new("slow").verb(Verb::Source));
+        // Declares Sink and refuses it: the 405 comes from the ENDPOINT, not the method gate.
+        let readonly = FnEndpoint::new("readonly", |inv: &Invocation<'_>| {
+            if inv.request.verb == Verb::Source {
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    b"ro".to_vec(),
+                ))
+            } else {
+                Err(Error::Unsupported {
+                    verb: Some(Verb::Sink),
+                    detail: "the log is append-only".into(),
+                })
+            }
+        })
+        .with_description(
+            Description::new("readonly")
+                .verb(Verb::Source)
+                .verb(Verb::Sink),
+        );
+        let noclock = FnEndpoint::new("noclock", |_inv: &Invocation<'_>| {
+            Err(Error::Unsupported {
+                verb: None,
+                detail: "the host configured no clock".into(),
+            })
+        })
+        .with_description(Description::new("noclock").verb(Verb::Source));
         // A read-write doc: Source returns a fixed "v1"; Sink echoes the body. Declares
         // Source+Sink, so conditional writes can read its current ETag.
         let doc = FnEndpoint::new("doc", |inv: &Invocation<'_>| {
@@ -4127,6 +4273,12 @@ mod tests {
             .bind(Exact::new("urn:test:deletable"), deletable)
             .bind(Exact::new("urn:test:cacheable"), cacheable)
             .bind(Exact::new("urn:test:missing"), missing)
+            .bind(Exact::new("urn:test:limited"), limited)
+            .bind(Exact::new("urn:test:budget"), budget)
+            .bind(Exact::new("urn:test:refused"), refused)
+            .bind(Exact::new("urn:test:slow"), slow)
+            .bind(Exact::new("urn:test:readonly"), readonly)
+            .bind(Exact::new("urn:test:noclock"), noclock)
             .bind(Exact::new("urn:test:doc"), doc)
             .bind(Exact::new("urn:test:newdoc"), newdoc)
             .bind(Exact::new("urn:test:flaky"), flaky)
@@ -5032,6 +5184,86 @@ mod tests {
         assert!(resp.ends_with("conflict: 1,1 is taken"), "got: {resp}");
     }
 
+    /// Ledger #1546: the failure classes' statuses, over the socket, as the shared vectors
+    /// decide them: RetryAfter 429 with `Retry-After` in seconds rounded up, OverBudget 422,
+    /// Refused 502, Timeout 504 (was 503), Unsupported 405 with `Allow` when it names a verb
+    /// and 501 when it names a facility.
+    #[tokio::test]
+    async fn the_failure_classes_answer_the_decided_statuses() {
+        let addr = start().await;
+        let get = |path: &str| format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n");
+        let limited = roundtrip(addr, &get("/test/limited")).await;
+        assert!(
+            limited.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
+            "{limited}"
+        );
+        assert!(limited.contains("\r\nRetry-After: 2\r\n"), "{limited}");
+        assert!(
+            limited.ends_with("retry after 1500 ms: 5 per minute"),
+            "{limited}"
+        );
+        let budget = roundtrip(addr, &get("/test/budget")).await;
+        assert!(
+            budget.starts_with("HTTP/1.1 422 Unprocessable Content\r\n"),
+            "{budget}"
+        );
+        let refused = roundtrip(addr, &get("/test/refused")).await;
+        assert!(
+            refused.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+            "{refused}"
+        );
+        let slow = roundtrip(addr, &get("/test/slow")).await;
+        assert!(
+            slow.starts_with("HTTP/1.1 504 Gateway Timeout\r\n"),
+            "{slow}"
+        );
+        assert!(!slow.contains("Retry-After"), "{slow}");
+        let readonly = roundtrip(
+            addr,
+            "PUT /test/readonly HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi",
+        )
+        .await;
+        assert!(
+            readonly.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
+            "{readonly}"
+        );
+        assert!(
+            readonly.contains("\r\nAllow: GET, HEAD, POST, PUT, PATCH, OPTIONS\r\n"),
+            "the declared methods, from the resource: {readonly}"
+        );
+        assert!(
+            readonly.ends_with("unsupported: the log is append-only"),
+            "{readonly}"
+        );
+        let noclock = roundtrip(addr, &get("/test/noclock")).await;
+        assert!(
+            noclock.starts_with("HTTP/1.1 501 Not Implemented\r\n"),
+            "{noclock}"
+        );
+        assert!(!noclock.contains("\r\nAllow:"), "{noclock}");
+    }
+
+    /// The JSON face of the same: `class` on every body, `retry_after` beside the header.
+    #[tokio::test]
+    async fn the_json_error_body_carries_the_class_and_the_retry_after() {
+        let addr = start_with(EdgeConfig {
+            error_body: ErrorBody::Json,
+            ..EdgeConfig::default()
+        })
+        .await;
+        let resp = roundtrip(addr, "GET /test/limited HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(resp.starts_with("HTTP/1.1 429 "), "{resp}");
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let json: serde_json::Value = serde_json::from_str(body).expect("a JSON body");
+        assert_eq!(json["kind"], "retry-after", "{body}");
+        assert_eq!(json["class"], "retry-after", "{body}");
+        assert_eq!(json["retry_after"], 2, "{body}");
+        let resp = roundtrip(addr, "GET /test/missing HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let json: serde_json::Value = serde_json::from_str(body).expect("a JSON body");
+        assert_eq!(json["class"], "permanent", "{body}");
+    }
+
     /// …and a precondition the CALLER stated still answers 412 on the same resource: it is
     /// checked before the write, so the endpoint never gets the chance to conflict.
     #[tokio::test]
@@ -5281,6 +5513,7 @@ mod tests {
             json_body(&resp),
             serde_json::json!({
                 "kind": "invalid-argument",
+                "class": "permanent",
                 "message": "invalid argument `tuple`: not a tuple name",
                 "name": "tuple",
                 "detail": "not a tuple name",
@@ -5291,7 +5524,7 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 404 Not Found"), "got: {resp}");
         assert_eq!(
             json_body(&resp),
-            serde_json::json!({"kind": "not-found", "message": "not found: no tuple z yet"})
+            serde_json::json!({"kind": "not-found", "class": "permanent", "message": "not found: no tuple z yet"})
         );
         // A path no endpoint is bound to names the target it could not resolve.
         let resp = get(addr, "/test/nothing-here", None).await;

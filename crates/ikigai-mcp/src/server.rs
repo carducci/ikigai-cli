@@ -840,8 +840,37 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
     }
     match block_on(kernel.issue(request, capability)) {
         Ok(repr) => tool_text(String::from_utf8_lossy(&repr.bytes).into_owned()),
-        Err(e) => tool_error(format!("{e}")),
+        Err(e) => tool_error(kernel_failure(&e)),
     }
+}
+
+/// The text a tool result carries for a kernel error (ledger #1546): core's own display,
+/// then one line naming the `kind` and the failure `class`, and the delay in whole
+/// milliseconds for a `RetryAfter`, so an agent reads "retry-after, 30000 ms" rather than
+/// parsing prose. It rides in the text because the protocol version this server declares
+/// (2024-11-05) gives a tool result no structured slot (`structuredContent` arrives with
+/// 2025-06-18; adopting it is a protocol move, not this change).
+///
+/// ```
+/// use std::time::Duration;
+/// use ikigai_core::Error;
+///
+/// let limited = Error::RetryAfter { delay: Some(Duration::from_secs(30)), detail: "5 per minute".into() };
+/// assert_eq!(
+///     ikigai_mcp::server::kernel_failure(&limited),
+///     "retry after 30000 ms: 5 per minute\nkind: retry-after; class: retry-after; retry-after-ms: 30000"
+/// );
+/// assert_eq!(
+///     ikigai_mcp::server::kernel_failure(&Error::Denied("needs urn:cap:x".into())),
+///     "denied: needs urn:cap:x\nkind: denied; class: denied"
+/// );
+/// ```
+pub fn kernel_failure(e: &ikigai_core::Error) -> String {
+    let mut text = format!("{e}\nkind: {}; class: {}", e.kind(), e.class().word());
+    if let Some(millis) = e.retry_after_millis() {
+        text.push_str(&format!("; retry-after-ms: {millis}"));
+    }
+    text
 }
 
 fn tool_text(text: String) -> Value {
@@ -2244,6 +2273,29 @@ mod manifold_identity_948 {
 
     fn text(result: &Value) -> &str {
         result["content"][0]["text"].as_str().unwrap()
+    }
+
+    /// Ledger #1546: a kernel error's tool result names the kind and the failure class (and
+    /// a RetryAfter's delay) on a line of its own, since the 2024-11-05 result has no
+    /// structured slot. The display stays the first line.
+    #[test]
+    fn a_kernel_failure_names_its_kind_and_class_in_the_tool_result() {
+        let limited = FnEndpoint::new("limited", |_| {
+            Err(ikigai_core::Error::RetryAfter {
+                delay: Some(std::time::Duration::from_millis(1_500)),
+                detail: "5 per minute".into(),
+            })
+        })
+        .with_description(Description::new("limited").verb(Verb::Source));
+        let k = Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:limited"), limited),
+        ));
+        let resp = call(&k, "limited__source", json!({}));
+        assert_eq!(resp["isError"], true, "{resp}");
+        assert_eq!(
+            text(&resp),
+            "retry after 1500 ms: 5 per minute\nkind: retry-after; class: retry-after; retry-after-ms: 1500"
+        );
     }
 
     #[test]

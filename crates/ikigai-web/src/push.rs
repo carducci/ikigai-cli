@@ -821,6 +821,7 @@ mod tests {
             body,
             serde_json::json!({
                 "kind": "denied",
+                "class": "denied",
                 "message": format!("denied: an event stream needs `{CAP_LISTEN}`"),
             })
         );
