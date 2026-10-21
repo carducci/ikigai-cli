@@ -1,4 +1,4 @@
-//! The Windows owner channel (carducci#119, windows-hub 1.1).
+//! The Windows owner channel.
 //!
 //! The same shape as the Unix door: a blocking AF_UNIX socket (Windows 10+, via `uds_windows`),
 //! one thread per connection. The two Unix checks have Windows equivalents:
@@ -7,8 +7,11 @@
 //!   by a protected one with a single entry, full access for the owning account. No SYSTEM
 //!   entry: nothing the owner channel does needs it, and an administrator can still take
 //!   ownership of the file, which is the same reach root has over a `0600` file.
-//!   [`default_socket_path`] also makes its directory owner-only before the socket is created,
-//!   so the file never exists with a wider inherited ACL.
+//!   For [`default_socket_path`] the file is also born owner-only: its directory carries a
+//!   protected, inheritable owner-only DACL, so the socket never exists with a wider ACL. For a
+//!   custom path given to [`bind`] only the narrowing after the bind holds: between the bind and
+//!   the `SetNamedSecurityInfo` the file has whatever ACL its directory hands down, so put a
+//!   custom socket in a directory only the owner can write to and traverse.
 //! - **The owner proof is the peer's process token** ([`OwnerSid::admit`]): the peer pid
 //!   (`SIO_AF_UNIX_GETPEERPID`), `OpenProcess` + `OpenProcessToken`, `TokenUser`, and the SID
 //!   compared with the server's own. A mismatch (or a token that cannot be read: fail closed)
@@ -39,6 +42,10 @@ use windows_sys::Win32::Security::{
     CopySid, EqualSid, GetLengthSid, GetSecurityDescriptorDacl, GetTokenInformation,
     LookupAccountSidW, TokenUser, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
     PSID, TOKEN_QUERY, TOKEN_USER,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    FileAttributeTagInfo, GetFileInformationByHandleEx, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -264,13 +271,51 @@ fn peer_pid(stream: &UnixStream) -> io::Result<u32> {
     Ok(pid)
 }
 
+/// `IO_REPARSE_TAG_AF_UNIX`: the tag of an AF_UNIX socket file.
+const IO_REPARSE_TAG_AF_UNIX: u32 = 0x8000_0023;
+
+/// Whether the existing file at `path` is an AF_UNIX socket (opened as the reparse point itself,
+/// never followed).
+fn is_af_unix_socket(path: &Path) -> io::Result<bool> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let mut info = FILE_ATTRIBUTE_TAG_INFO {
+        FileAttributes: 0,
+        ReparseTag: 0,
+    };
+    // SAFETY: a valid handle and a correctly-sized out-param.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as HANDLE,
+            FileAttributeTagInfo,
+            (&mut info as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+            std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        && info.ReparseTag == IO_REPARSE_TAG_AF_UNIX)
+}
+
 fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain([0]).collect()
 }
 
 /// Replace `path`'s DACL with a protected one holding a single entry: full access for `owner`.
-pub(crate) fn restrict_to_owner(path: &Path, owner: &OwnerSid) -> io::Result<()> {
-    let sddl: Vec<u16> = format!("D:P(A;;FA;;;{})", owner.to_sid_string())
+/// With `inheritable` (a directory), the entry is passed down to new files and subdirectories.
+pub(crate) fn restrict_to_owner(
+    path: &Path,
+    owner: &OwnerSid,
+    inheritable: bool,
+) -> io::Result<()> {
+    let flags = if inheritable { "OICI" } else { "" };
+    let sddl: Vec<u16> = format!("D:P(A;{flags};FA;;;{})", owner.to_sid_string())
         .encode_utf16()
         .chain([0])
         .collect();
@@ -317,13 +362,23 @@ pub(crate) fn restrict_to_owner(path: &Path, owner: &OwnerSid) -> io::Result<()>
 /// Bind the server socket at `path` for the owning account only: a stale socket file is
 /// removed, a live server's is refused ([`AddrInUse`](io::ErrorKind::AddrInUse)), a directory
 /// is refused, and after the bind the file's DACL is narrowed to the owner (see the module
-/// docs). The listener is listening when this returns.
+/// docs). A file that is not a socket is refused and left in place. The listener is listening
+/// when this returns.
 ///
 /// ⚠ Unlike Unix, no `<path>.lock` orders two binders starting at once.
 pub fn bind(path: &Path) -> io::Result<UnixListener> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) => {
             if meta.file_type().is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "{} exists and is not a socket; refusing to replace it",
+                        path.display()
+                    ),
+                ));
+            }
+            if !is_af_unix_socket(path)? {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     format!(
@@ -353,18 +408,25 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
+    let owner = OwnerSid::current()?;
     let listener = UnixListener::bind(path)?;
-    restrict_to_owner(path, &OwnerSid::current()?)?;
+    if let Err(e) = restrict_to_owner(path, &owner, false) {
+        // Never leave a socket file with a wider ACL than the owner's.
+        drop(listener);
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
     Ok(listener)
 }
 
-/// The default per-user socket path: `%LOCALAPPDATA%\ikigai\kernel.sock`, the `ikigai`
-/// directory made owner-only before any socket is created in it. `None` if it can't be.
+/// The default per-user socket path: `%LOCALAPPDATA%\ikigai\kernel.sock`. The `ikigai`
+/// directory gets a protected, inheritable owner-only DACL before any socket is created in it,
+/// so the socket file is owner-only from birth. `None` if that can't be done.
 pub fn default_socket_path() -> Option<PathBuf> {
     let base = PathBuf::from(std::env::var_os("LOCALAPPDATA")?);
     let dir = base.join("ikigai");
     std::fs::create_dir_all(&dir).ok()?;
-    restrict_to_owner(&dir, &OwnerSid::current().ok()?).ok()?;
+    restrict_to_owner(&dir, &OwnerSid::current().ok()?, true).ok()?;
     Some(dir.join("kernel.sock"))
 }
 
@@ -373,9 +435,10 @@ mod tests {
     use super::*;
     use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
     use windows_sys::Win32::Security::{
-        AclSizeInformation, GetAce, GetAclInformation, ACL_SIZE_INFORMATION,
-        OWNER_SECURITY_INFORMATION,
+        AclSizeInformation, GetAce, GetAclInformation, GetSecurityDescriptorControl,
+        ACL_SIZE_INFORMATION, OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED,
     };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 
     fn temp_socket(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("ikigai-ipc-win-{}-{tag}", std::process::id()));
@@ -383,8 +446,8 @@ mod tests {
         dir.join("t.sock")
     }
 
-    /// The SID strings of the ACEs in `path`'s DACL.
-    fn dacl_sids(path: &Path) -> Vec<String> {
+    /// `path`'s DACL: whether it is protected, and each ACE as (type, flags, mask, SID).
+    fn dacl_entries(path: &Path) -> (bool, Vec<(u8, u8, u32, String)>) {
         let name = wide(path);
         let mut dacl = null_mut();
         let mut sd: *mut c_void = null_mut();
@@ -401,6 +464,11 @@ mod tests {
                 &mut sd,
             );
             assert_eq!(rc, 0, "GetNamedSecurityInfo failed: {rc}");
+            let (mut control, mut revision) = (0u16, 0u32);
+            assert_ne!(
+                GetSecurityDescriptorControl(sd, &mut control, &mut revision),
+                0
+            );
             let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
             assert_ne!(
                 GetAclInformation(
@@ -411,16 +479,18 @@ mod tests {
                 ),
                 0
             );
-            let mut sids = Vec::new();
+            let mut aces = Vec::new();
             for i in 0..info.AceCount {
                 let mut ace: *mut c_void = null_mut();
                 assert_ne!(GetAce(dacl, i, &mut ace), 0);
-                // ACCESS_ALLOWED_ACE: header (4 bytes), mask (4 bytes), then the SID.
-                let sid = copy_sid(ace.cast::<u8>().add(8).cast());
-                sids.push(sid.to_sid_string());
+                // ACCESS_ALLOWED_ACE: header (type, flags, size: 4 bytes), mask (4), then the SID.
+                let header = ace.cast::<u8>();
+                let mask = header.add(4).cast::<u32>().read_unaligned();
+                let sid = copy_sid(header.add(8).cast());
+                aces.push((*header, *header.add(1), mask, sid.to_sid_string()));
             }
             LocalFree(sd);
-            sids
+            (control & SE_DACL_PROTECTED != 0, aces)
         }
     }
 
@@ -429,7 +499,34 @@ mod tests {
         let path = temp_socket("dacl");
         let _listener = bind(&path).expect("bind");
         let me = OwnerSid::current().unwrap().to_sid_string();
-        assert_eq!(dacl_sids(&path), vec![me]);
+        let (protected, aces) = dacl_entries(&path);
+        assert!(protected, "the DACL must not inherit from the directory");
+        // ACCESS_ALLOWED_ACE_TYPE, no inheritance flags, FILE_ALL_ACCESS.
+        assert_eq!(aces, vec![(0u8, 0u8, FILE_ALL_ACCESS, me)]);
+    }
+
+    #[test]
+    fn a_file_born_in_an_owner_only_directory_is_owner_only() {
+        let dir = temp_socket("born").parent().unwrap().join("owned");
+        std::fs::create_dir_all(&dir).unwrap();
+        let me = OwnerSid::current().unwrap();
+        restrict_to_owner(&dir, &me, true).expect("restrict the directory");
+        let file = dir.join("child");
+        std::fs::write(&file, b"x").unwrap();
+        let (protected, aces) = dacl_entries(&file);
+        assert!(!protected, "inherited, not set on the file");
+        let sids: Vec<_> = aces.iter().map(|a| a.3.clone()).collect();
+        assert_eq!(sids, vec![me.to_sid_string()]);
+        assert_eq!((aces[0].0, aces[0].2), (0, FILE_ALL_ACCESS));
+    }
+
+    #[test]
+    fn a_plain_file_is_refused_and_left_in_place() {
+        let path = temp_socket("plain");
+        std::fs::write(&path, b"precious").unwrap();
+        let err = bind(&path).expect_err("a plain file must not be replaced");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), b"precious");
     }
 
     #[test]
