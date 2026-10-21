@@ -1,4 +1,4 @@
-//! The Windows owner channel, end to end (carducci#119, windows-hub 1.1).
+//! The Windows owner channel, end to end.
 //!
 //! `the_owner_reaches_the_door` is the same-account round trip. The refusal of a DIFFERENT
 //! account cannot be shown by one account alone, so `another_account_is_refused_live` is an
@@ -57,7 +57,9 @@ fn the_owner_reaches_the_door() {
 ///    hub. A serves for 120 s (`IKIGAI_IPC_LIVE_SECS`).
 /// 2. As B, with `IKIGAI_IPC_LIVE_ROLE=connect`, the same command.
 ///
-/// Expected: B's test passes (its connection is hung up on, so `connect` errors), and A's
+/// Expected: B's test passes (the socket-level connect SUCCEEDS, which rules out a missing
+/// socket and an ACL denial, and the hub then closes the connection without a byte, which is the
+/// token-check refusal), and A's
 /// console shows `ikigai-ipc: refused a connection from <MACHINE>\<B> (S-1-5-21-...): not the
 /// owner of this socket, <MACHINE>\<A>`. Without `IKIGAI_IPC_LIVE_ROLE` the test does nothing,
 /// so `--ignored` on one account cannot pass by accident.
@@ -89,12 +91,29 @@ fn another_account_is_refused_live() {
             std::thread::sleep(Duration::from_secs(secs));
         }
         Ok("connect") => {
-            let refused = ikigai_ipc::connect(&path);
+            use std::io::{Read, Write};
+            // Socket level first: NotFound (no hub) or PermissionDenied (the ACL) must fail
+            // this test, so only the token check can be what turns B away.
+            let mut raw = uds_windows::UnixStream::connect(&path).expect(
+                "the socket-level connect must succeed (is A serving? is the ACL widened?)",
+            );
+            raw.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let _ = raw.write_all(b"\0");
+            let mut byte = [0u8; 1];
+            match raw.read(&mut byte) {
+                Ok(0) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                    ) => {}
+                other => panic!("the hub must hang up on a different account, got {other:?}"),
+            }
             assert!(
-                refused.is_err(),
+                ikigai_ipc::connect(&path).is_err(),
                 "a different account must not be served by the owner's hub"
             );
-            eprintln!("refused as expected: {}", refused.err().unwrap());
+            eprintln!("refused as expected: the server closed the connection");
         }
         _ => eprintln!("set IKIGAI_IPC_LIVE_ROLE=serve (account A) or connect (account B)"),
     }
