@@ -27,12 +27,19 @@
 //! fallback reads a byte ahead (the client's hello, in this protocol) with
 //! `PipeStream::prime_for_impersonation`, which keeps the byte and hands it back to the first
 //! real read, so an admitted client loses nothing, and tries once more.
+//!
+//! The thread token is opened with `OpenAsSelf = TRUE` first (the access check runs as the
+//! server). That check is against the impersonation token's DACL, which may deny a standard
+//! account `TOKEN_QUERY` on another user's token, so on `ERROR_ACCESS_DENIED` it is tried again
+//! with `OpenAsSelf = FALSE` (the check runs as the impersonated client, whose own token it is).
+//! If both are denied the client is refused. A refusal line says which path identified the
+//! client, or the Win32 errors when none did, so a live run shows which path worked.
 
 use std::io;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, ERROR_INSUFFICIENT_BUFFER, HANDLE,
+    CloseHandle, GetLastError, LocalFree, ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, HANDLE,
 };
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::{
@@ -49,6 +56,32 @@ use crate::winpipe::PipeStream;
 
 /// `ERROR_CANNOT_IMPERSONATE`: the server has not yet read from the instance.
 const ERROR_CANNOT_IMPERSONATE: i32 = 1368;
+
+/// Which path named a client, for the log line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Via {
+    /// The client's process token.
+    ProcessToken,
+    /// Impersonation, the thread token opened with `OpenAsSelf = TRUE`.
+    ImpersonationAsSelf,
+    /// Impersonation, the thread token opened with `OpenAsSelf = FALSE` (the `TRUE` open was
+    /// denied).
+    ImpersonationAsClient,
+}
+
+impl std::fmt::Display for Via {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Via::ProcessToken => "identified by its process token",
+            Via::ImpersonationAsSelf => {
+                "identified by impersonation, thread token opened as the server"
+            }
+            Via::ImpersonationAsClient => {
+                "identified by impersonation, thread token opened as the client"
+            }
+        })
+    }
+}
 
 /// A user SID, owned (a copy of the bytes, so it outlives the token it was read from).
 #[derive(Clone)]
@@ -104,15 +137,32 @@ impl OwnerSid {
     ///
     /// # Safety
     /// `pipe` must be a connected server-side pipe instance handle that has been read from.
-    unsafe fn of_pipe_client(pipe: HANDLE) -> io::Result<OwnerSid> {
+    unsafe fn of_pipe_client(pipe: HANDLE) -> io::Result<(OwnerSid, Via)> {
         let _impersonating = Impersonating::begin(pipe)?;
         let mut token: HANDLE = null_mut();
         // OpenAsSelf = TRUE: the access check for opening the token runs as the SERVER, not as
-        // the (possibly less privileged) client being read.
+        // the (possibly less privileged) client being read. It is made against the token's
+        // DACL, which may deny a standard account TOKEN_QUERY on another user's token.
+        let mut via = Via::ImpersonationAsSelf;
         if OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) == 0 {
-            return Err(io::Error::last_os_error());
+            let as_self = io::Error::last_os_error();
+            if as_self.raw_os_error() != Some(ERROR_ACCESS_DENIED as i32) {
+                return Err(as_self);
+            }
+            // OpenAsSelf = FALSE: the check runs as the impersonated client, on its own token.
+            via = Via::ImpersonationAsClient;
+            if OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 0, &mut token) == 0 {
+                let as_client = io::Error::last_os_error();
+                return Err(io::Error::new(
+                    as_client.kind(),
+                    format!(
+                        "opening the thread token as the server: {as_self}; \
+                         as the client: {as_client}"
+                    ),
+                ));
+            }
         }
-        token_sid(token)
+        token_sid(token).map(|sid| (sid, via))
         // `_impersonating` drops here, after the token is read: RevertToSelf.
     }
 
@@ -210,13 +260,13 @@ impl OwnerSid {
     }
 
     /// The decision, apart from the pipe: admit `peer` only if it is this account, else a
-    /// [`Refusal`] naming the peer's account and SID.
-    pub(crate) fn admit_sid(&self, peer: &OwnerSid) -> Result<(), Refusal> {
+    /// [`Refusal`] naming the peer's account and SID and the path (`via`) that identified it.
+    pub(crate) fn admit_sid(&self, peer: &OwnerSid, via: Via) -> Result<(), Refusal> {
         if self.same_as(peer) {
             Ok(())
         } else {
             Err(Refusal(format!(
-                "refused a connection from {}: not the owner of this pipe, {}",
+                "refused a connection from {} ({via}): not the owner of this pipe, {}",
                 peer.describe(),
                 self.describe()
             )))
@@ -237,19 +287,19 @@ impl OwnerSid {
         } else {
             OwnerSid::of_process(pid).map_err(|e| format!("its process {pid}'s token: {e}"))
         };
-        let peer = match by_process {
-            Ok(peer) => peer,
+        let (peer, via) = match by_process {
+            Ok(peer) => (peer, Via::ProcessToken),
             Err(first) => self.identify_by_impersonation(stream, &first)?,
         };
-        self.admit_sid(&peer)
+        self.admit_sid(&peer, via)
     }
 
     /// Admit by the impersonation path only (the fallback of [`OwnerSid::admit`]); the
     /// tests run it against a same-account client, where the direct path would have sufficed.
     #[cfg(test)]
     pub(crate) fn admit_by_impersonation(&self, stream: &PipeStream) -> Result<(), Refusal> {
-        let peer = self.identify_by_impersonation(stream, "(forced)")?;
-        self.admit_sid(&peer)
+        let (peer, via) = self.identify_by_impersonation(stream, "(forced)")?;
+        self.admit_sid(&peer, via)
     }
 
     /// The fallback: name the client by impersonating it (see the module docs).
@@ -257,11 +307,11 @@ impl OwnerSid {
         &self,
         stream: &PipeStream,
         first: &str,
-    ) -> Result<OwnerSid, Refusal> {
+    ) -> Result<(OwnerSid, Via), Refusal> {
         let unidentified = |why: String| {
             Refusal(format!(
                 "refused a connection: could not identify the client account \
-                 (could not read {first}; impersonation: {why})"
+                 (could not read {first}; impersonation: {why}); neither path identified it"
             ))
         };
         // SAFETY (both calls): `stream` is a connected server instance.
@@ -344,7 +394,8 @@ mod tests {
     #[test]
     fn the_same_account_is_admitted() {
         let me = OwnerSid::current().unwrap();
-        me.admit_sid(&me.clone()).expect("own SID admitted");
+        me.admit_sid(&me.clone(), Via::ProcessToken)
+            .expect("own SID admitted");
     }
 
     #[test]
@@ -353,25 +404,30 @@ mod tests {
         // Well-known SYSTEM: resolves to an account name.
         let system = OwnerSid::from_string("S-1-5-18").unwrap();
         let msg = me
-            .admit_sid(&system)
+            .admit_sid(&system, Via::ProcessToken)
             .expect_err("SYSTEM is not the owner")
             .to_string();
         assert!(msg.contains("SYSTEM"), "names the account: {msg}");
         assert!(msg.contains("S-1-5-18"), "and the SID: {msg}");
+        assert!(msg.contains("process token"), "and the path: {msg}");
         // Everyone (world) as well.
         let world = OwnerSid::from_string("S-1-1-0").unwrap();
         let msg = me
-            .admit_sid(&world)
+            .admit_sid(&world, Via::ImpersonationAsClient)
             .expect_err("Everyone is not the owner")
             .to_string();
         assert!(msg.contains("Everyone"), "names the account: {msg}");
+        assert!(msg.contains("impersonation"), "and the path: {msg}");
     }
 
     #[test]
     fn an_unknown_sid_is_named_by_its_sid_string() {
         let me = OwnerSid::current().unwrap();
         let nobody = OwnerSid::from_string("S-1-5-21-1-2-3-424242").unwrap();
-        let msg = me.admit_sid(&nobody).unwrap_err().to_string();
+        let msg = me
+            .admit_sid(&nobody, Via::ProcessToken)
+            .unwrap_err()
+            .to_string();
         assert!(msg.contains("S-1-5-21-1-2-3-424242"), "{msg}");
     }
 
