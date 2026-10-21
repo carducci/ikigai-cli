@@ -474,9 +474,17 @@ mod tests {
         SE_DACL_PROTECTED,
     };
 
+    /// The access mask the kernel stores for the owner's `GA` (GENERIC_ALL) entry on a pipe:
+    /// generic rights are mapped at creation, and for a pipe GENERIC_ALL is FILE_ALL_ACCESS.
+    const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+    /// One ACE as (type, flags, mask, SID).
+    type Ace = (u8, u8, u32, String);
+    /// `ACCESS_ALLOWED_ACE_TYPE`.
+    const ACCESS_ALLOWED: u8 = 0;
+
     /// The DACL of the pipe instance `handle`: whether it is protected, its owner, and each ACE
-    /// as (type, flags, SID).
-    fn dacl_of(handle: HANDLE) -> (bool, String, Vec<(u8, u8, String)>) {
+    /// as (type, flags, mask, SID).
+    fn dacl_of(handle: HANDLE) -> (bool, String, Vec<Ace>) {
         let mut dacl = null_mut();
         let mut owner = null_mut();
         let mut sd: *mut c_void = null_mut();
@@ -515,8 +523,9 @@ mod tests {
                 assert_ne!(GetAce(dacl, i, &mut ace), 0);
                 // ACCESS_ALLOWED_ACE: header (type, flags, size: 4 bytes), mask (4), then the SID.
                 let header = ace.cast::<u8>();
+                let mask = header.add(4).cast::<u32>().read_unaligned();
                 let sid = crate::winowner::copy_sid(header.add(8).cast());
-                aces.push((*header, *header.add(1), sid.to_sid_string()));
+                aces.push((*header, *header.add(1), mask, sid.to_sid_string()));
             }
             LocalFree(sd);
             (control & SE_DACL_PROTECTED != 0, owner, aces)
@@ -531,8 +540,8 @@ mod tests {
         let (protected, owner, aces) = dacl_of(listener.waiting_handle());
         assert!(protected, "the DACL must be protected: nothing inherited");
         assert_eq!(owner, me, "owned by the user, not the Administrators group");
-        // ACCESS_ALLOWED_ACE_TYPE, no inheritance flags, one entry for the user's SID.
-        assert_eq!(aces, vec![(0u8, 0u8, me)]);
+        // One ACCESS_ALLOWED entry, no inheritance flags, full access, for the user's SID.
+        assert_eq!(aces, vec![(ACCESS_ALLOWED, 0u8, FILE_ALL_ACCESS, me)]);
     }
 
     #[test]
@@ -545,7 +554,7 @@ mod tests {
         let me = OwnerSid::current().unwrap().to_sid_string();
         let (protected, _, aces) = dacl_of(listener.waiting_handle());
         assert!(protected);
-        assert_eq!(aces, vec![(0u8, 0u8, me)]);
+        assert_eq!(aces, vec![(ACCESS_ALLOWED, 0u8, FILE_ALL_ACCESS, me)]);
     }
 
     #[test]
