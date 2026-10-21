@@ -33,6 +33,24 @@ No CA, no TLS — the operating system already authenticates a local peer:
   on Linux, `getpeereid` on macOS/BSD) and refuses any connection that isn't the
   server's own user — defense in depth over the directory mode.
 
+### On Windows
+
+The same API runs over a **named pipe** (tokio's native `named_pipe` support). The pipe name
+is derived from the path you pass to `bind` and `connect` (hashed into `\.\pipe\ikigai-<hash>`;
+a path that already starts with `\.\pipe\` is used as given), and `default_socket_path()`
+is `\.\pipe\ikigai-<the user's SID>`. Two layers keep other accounts out:
+
+- **The pipe's DACL.** Every instance is created with a protected DACL holding one entry, full
+  access for the server's own user SID (no Everyone, Administrators or SYSTEM, nothing
+  inherited), owned by that SID, with remote clients rejected. The first instance is created
+  exclusively, so no other process can squat the name and a second server on a live name is
+  refused with `AddrInUse`.
+- **A per-connection owner check**, the counterpart of the UID check: the client's user SID
+  (its process token) must equal the server's. A standard account may not open another
+  account's process token, so when that fails the server impersonates the pipe client at
+  identification level just long enough to read its SID. A client that cannot be identified is
+  refused. A refusal is logged with the refused account's name and SID.
+
 Because the peer is the owner, a `cap`-attenuated `--connect` session carries its
 capability over `Call::IssueAs`; the server resolves under it (already ≤ root), so
 attenuation behaves over IPC exactly as it does for the embedded kernel.
