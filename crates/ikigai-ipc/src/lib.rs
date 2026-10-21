@@ -11,19 +11,31 @@
 //! peer's kernel-verified UID and refuses anyone but the server's own user.
 //! Capability-based authorization (finer than per-user) layers on later.
 //!
-//! Unix only — the module is empty elsewhere.
-#![cfg(unix)]
+//! On Windows the same API runs over AF_UNIX (Windows 10+, through `uds_windows`) with the
+//! owner channel described on the private `windows` module: the socket file's ACL admits the
+//! owning account only, and each peer's process-token SID is compared with the server's own.
+//! Elsewhere the module is empty.
+#![cfg(any(unix, windows))]
 
 mod accept;
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::{bind, default_socket_path};
 
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+#[cfg(windows)]
+use uds_windows::{UnixListener, UnixStream};
 
 use ikigai_core::{
     Capability, Clock, Error, Kernel, Representation, Request, SpaceEntry, SystemClock, Tracer,
@@ -95,6 +107,7 @@ pub fn serve_shared(kernel: Arc<Kernel>, path: &Path) -> io::Result<()> {
 /// ikigai_ipc::serve_on(kernel, listener)?;
 /// # Ok::<(), std::io::Error>(())
 /// ```
+#[cfg(unix)]
 pub fn bind(path: &Path) -> io::Result<UnixListener> {
     let _held = bind_lock(path)?;
     clear_stale(path)?;
@@ -105,6 +118,7 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
 
 /// Take the exclusive lock that orders binders of `path` (see [`bind`]): `<path>.lock`, created
 /// `0600` if absent. The lock is released when the returned file drops.
+#[cfg(unix)]
 fn bind_lock(path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut name = path.as_os_str().to_owned();
@@ -135,6 +149,7 @@ fn bind_lock(path: &Path) -> io::Result<std::fs::File> {
 /// Make `path` free for a bind without taking it from anyone: nothing there is fine; a socket
 /// (or a link) nobody answers on is removed; a live server, or a file that is not a socket, is
 /// an error. Called under [`bind_lock`].
+#[cfg(unix)]
 fn clear_stale(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::FileTypeExt;
     let kind = match std::fs::symlink_metadata(path) {
@@ -342,7 +357,10 @@ pub fn serve_shared_on_with(
     listener: UnixListener,
     limits: Limits,
 ) -> io::Result<()> {
+    #[cfg(unix)]
     let me = own_uid();
+    #[cfg(windows)]
+    let me = windows::OwnerSid::current()?;
     let mut backoff = accept::Backoff::default();
     // The connections being served. Only this loop adds to it, so reading it and then adding
     // cannot overshoot; a finishing connection subtracts (its `Slot` drops).
@@ -359,8 +377,14 @@ pub fn serve_shared_on_with(
                 accept::Fault::Fatal => return Err(e),
             },
         };
+        #[cfg(unix)]
         if peer_uid(&stream) != Some(me) {
             continue; // not our user — drop it
+        }
+        #[cfg(windows)]
+        if let Err(refusal) = me.admit(&stream) {
+            accept::diagnose(format_args!("ikigai-ipc: {refusal}"));
+            continue; // not our account — drop it
         }
         if live.load(Ordering::SeqCst) >= limits.max_connections {
             refuse_over_capacity(stream, limits.max_connections);
@@ -1287,12 +1311,15 @@ impl Resolver for IpcResolver {
     }
 
     fn transport(&self) -> String {
+        #[cfg(windows)]
+        return "ipc · AF_UNIX socket (process-token-verified, same account)".to_string();
+        #[cfg(unix)]
         "ipc · unix domain socket (peercred-verified, same user)".to_string()
     }
 }
 
 /// Serve one connection under the default [`Limits`] (the tests' entry point).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn handle_connection(kernel: &Kernel, stream: UnixStream) {
     serve_connection(kernel, stream, &Limits::default())
 }
@@ -1440,6 +1467,7 @@ fn dispatch(kernel: &Kernel, call: Call) -> Reply {
 /// `ikigai` directory created `0700` so only this user can reach the socket.
 /// `<runtime-dir>` is `$XDG_RUNTIME_DIR` when set, else `$TMPDIR`/`/tmp` plus the
 /// uid. `None` if the directory can't be created.
+#[cfg(unix)]
 pub fn default_socket_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -1455,13 +1483,14 @@ pub fn default_socket_path() -> Option<PathBuf> {
 }
 
 /// This process's real user id.
+#[cfg(unix)]
 fn own_uid() -> u32 {
     // SAFETY: `getuid` reads a process attribute and cannot fail.
     unsafe { libc::getuid() }
 }
 
 /// The connected peer's user id, kernel-verified — `None` if it can't be read.
-#[cfg(target_os = "linux")]
+#[cfg(all(unix, target_os = "linux"))]
 fn peer_uid(stream: &UnixStream) -> Option<u32> {
     let mut cred = libc::ucred {
         pid: 0,
@@ -1483,7 +1512,7 @@ fn peer_uid(stream: &UnixStream) -> Option<u32> {
 }
 
 /// The connected peer's user id (macOS/BSD use `getpeereid`).
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn peer_uid(stream: &UnixStream) -> Option<u32> {
     let mut uid: libc::uid_t = 0;
     let mut gid: libc::gid_t = 0;
@@ -1494,7 +1523,7 @@ fn peer_uid(stream: &UnixStream) -> Option<u32> {
 
 /// The connected peer's process id, for naming a live server [`bind`] will not replace —
 /// `None` where it cannot be read.
-#[cfg(target_os = "linux")]
+#[cfg(all(unix, target_os = "linux"))]
 fn peer_pid(stream: &UnixStream) -> Option<i32> {
     let mut cred = libc::ucred {
         pid: 0,
@@ -1516,7 +1545,7 @@ fn peer_pid(stream: &UnixStream) -> Option<i32> {
 }
 
 /// The connected peer's process id (macOS: `LOCAL_PEERPID`).
-#[cfg(target_vendor = "apple")]
+#[cfg(all(unix, target_vendor = "apple"))]
 fn peer_pid(stream: &UnixStream) -> Option<i32> {
     let mut pid: libc::pid_t = 0;
     let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
@@ -1534,12 +1563,12 @@ fn peer_pid(stream: &UnixStream) -> Option<i32> {
 }
 
 /// Elsewhere the peer's process id is not read; the refusal says so.
-#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_vendor = "apple"))))]
 fn peer_pid(_stream: &UnixStream) -> Option<i32> {
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3629,7 +3658,7 @@ mod tests {
 
 /// ledger #1335: a peer that ACCEPTS a call and never answers it (or answers a byte at a
 /// time) must cost the caller its deadline and no more, and the call must be canceled.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod call_deadline {
     use super::*;
     use ikigai_core::{Iri, Verb};

@@ -22,7 +22,7 @@ use std::time::Duration;
 /// write returns the error). These lines are written by the accept loop itself, so the panic
 /// would end [`serve`](crate::serve) and with it the whole door, for a log line nobody was
 /// reading. A diagnostic that cannot be written is lost; the door is not.
-fn diagnose(line: std::fmt::Arguments<'_>) {
+pub(crate) fn diagnose(line: std::fmt::Arguments<'_>) {
     use std::io::Write;
     let _ = writeln!(io::stderr().lock(), "{line}");
 }
@@ -44,6 +44,7 @@ pub(crate) enum Fault {
 }
 
 /// Classify one accept error.
+#[cfg(unix)]
 pub(crate) fn classify(e: &io::Error) -> Fault {
     if let Some(code) = e.raw_os_error() {
         return match code {
@@ -64,6 +65,36 @@ pub(crate) fn classify(e: &io::Error) -> Fault {
             | libc::ENOPROTOOPT
             | libc::EOPNOTSUPP => Fault::Skip,
             _ => Fault::BackOff,
+        };
+    }
+    match e.kind() {
+        io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::Interrupted
+        | io::ErrorKind::WouldBlock => Fault::Skip,
+        _ => Fault::BackOff,
+    }
+}
+
+/// Classify one accept error on Windows: the same table as Unix, by Winsock code.
+#[cfg(windows)]
+pub(crate) fn classify(e: &io::Error) -> Fault {
+    // WSAEBADF, WSAEFAULT, WSAEINVAL, WSAENOTSOCK
+    const FATAL: [i32; 4] = [10009, 10014, 10022, 10038];
+    // WSAEINTR, WSAEWOULDBLOCK, WSAECONNABORTED, WSAECONNRESET, WSAETIMEDOUT, WSAECONNREFUSED,
+    // WSAENETDOWN, WSAENETUNREACH, WSAEHOSTDOWN, WSAEHOSTUNREACH, WSAEOPNOTSUPP, WSAENOPROTOOPT
+    const SKIPPED: [i32; 12] = [
+        10004, 10035, 10053, 10054, 10060, 10061, 10050, 10051, 10064, 10065, 10045, 10042,
+    ];
+    if let Some(code) = e.raw_os_error() {
+        return if FATAL.contains(&code) {
+            Fault::Fatal
+        } else if SKIPPED.contains(&code) {
+            Fault::Skip
+        } else {
+            // WSAEMFILE, WSAENOBUFS and anything unrecognized: back off.
+            Fault::BackOff
         };
     }
     match e.kind() {
@@ -121,7 +152,7 @@ impl Backoff {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -217,5 +248,19 @@ mod tests {
             status.success() && out.contains(SURVIVED),
             "the accept loop's log lines must not panic on a closed stderr: {status}\n{out}"
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn winsock_codes_classify_like_their_unix_twins() {
+        let os = io::Error::from_raw_os_error;
+        assert_eq!(classify(&os(10038)), Fault::Fatal); // WSAENOTSOCK
+        assert_eq!(classify(&os(10024)), Fault::BackOff); // WSAEMFILE
+        assert_eq!(classify(&os(10053)), Fault::Skip); // WSAECONNABORTED
+        assert_eq!(classify(&os(99999)), Fault::BackOff); // unrecognized
     }
 }

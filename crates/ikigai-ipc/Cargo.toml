@@ -11,4 +11,20 @@ repository.workspace = true
 ikigai-core = { workspace = true }
 ikigai-resolve = { workspace = true }
 ikigai-wire = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+
+# The Windows owner channel (docs on `windows` in lib.rs): AF_UNIX through `uds_windows`
+# (Windows 10+), the owner proof read from the peer's process token through `windows-sys`
+# (0.61 is the version the lock already holds for other crates).
+[target.'cfg(windows)'.dependencies]
+uds_windows = "1.2.1"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
