@@ -373,6 +373,23 @@ pub fn serve_shared_on_with(
     let me = own_uid();
     #[cfg(windows)]
     let me = winowner::OwnerSid::current()?;
+    serve_loop(kernel, listener, limits, me)
+}
+
+/// The owner of the door: the uid on Unix, the user SID on Windows.
+#[cfg(unix)]
+type Owner = u32;
+#[cfg(windows)]
+type Owner = winowner::OwnerSid;
+
+/// The accept loop of [`serve_shared_on_with`], with the owner it admits given, so a test can
+/// make the server believe its owner is somebody else.
+fn serve_loop(
+    kernel: Arc<Kernel>,
+    listener: UnixListener,
+    limits: Limits,
+    me: Owner,
+) -> io::Result<()> {
     let mut backoff = accept::Backoff::default();
     // The connections being served. Only this loop adds to it, so reading it and then adding
     // cannot overshoot; a finishing connection subtracts (its `Slot` drops).
