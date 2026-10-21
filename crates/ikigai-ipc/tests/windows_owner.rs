@@ -100,13 +100,16 @@ fn the_default_door_is_a_per_user_pipe_name() {
 ///
 /// 1. As A, in one console:
 ///    `set IKIGAI_IPC_LIVE_ROLE=serve` and
-///    `cargo test -p ikigai-ipc --test windows_owner -- --ignored --nocapture another_account`.
+///    `cargo test -p ikigai-ipc --test windows_owner -- --ignored --nocapture another_account`
+///    (to show the owner check, add `--features refusal-demo` and see below).
 ///    A serves `\\.\pipe\ikigai-live-test` (override: `IKIGAI_IPC_LIVE_PIPE`) for 120 s
-///    (`IKIGAI_IPC_LIVE_SECS`). With `set IKIGAI_IPC_LIVE_OPEN=1` A DELIBERATELY lets Everyone
+///    (`IKIGAI_IPC_LIVE_SECS`). With `set IKIGAI_IPC_LIVE_OPEN=1`, which needs the
+///    `refusal-demo` feature (`cargo test -p ikigai-ipc --features refusal-demo --test
+///    windows_owner -- --ignored --nocapture another_account`), A DELIBERATELY lets Everyone
 ///    open the pipe (`bind_open_to_everyone_for_the_refusal_demo`), so B gets past the DACL and
 ///    only the per-connection owner check stands between B and the hub.
 /// 2. As B, with `IKIGAI_IPC_LIVE_ROLE=connect` (and the same `IKIGAI_IPC_LIVE_PIPE` if set),
-///    the same command. Optionally `IKIGAI_IPC_LIVE_EXPECT=dacl` or `=owner-check` to demand
+///    the same command (B does not need the feature). Optionally `IKIGAI_IPC_LIVE_EXPECT=dacl` or `=owner-check` to demand
 ///    one of the two layers (it must match how A was started: `owner-check` needs
 ///    `IKIGAI_IPC_LIVE_OPEN=1` on A; `dacl` needs it unset).
 ///
@@ -136,12 +139,22 @@ fn another_account_is_refused_live() {
     match std::env::var("IKIGAI_IPC_LIVE_ROLE").as_deref() {
         Ok("serve") => {
             let open = std::env::var("IKIGAI_IPC_LIVE_OPEN").is_ok_and(|v| v == "1");
+            #[cfg(feature = "refusal-demo")]
             let listener = if open {
                 ikigai_ipc::bind_open_to_everyone_for_the_refusal_demo(&path)
             } else {
                 ikigai_ipc::bind(&path)
             }
             .expect("bind");
+            #[cfg(not(feature = "refusal-demo"))]
+            let listener = {
+                assert!(
+                    !open,
+                    "IKIGAI_IPC_LIVE_OPEN=1 needs the refusal-demo feature: \
+                     run with `--features refusal-demo`"
+                );
+                ikigai_ipc::bind(&path).expect("bind")
+            };
             let secs = std::env::var("IKIGAI_IPC_LIVE_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())

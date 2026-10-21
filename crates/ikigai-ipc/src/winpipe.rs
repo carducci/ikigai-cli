@@ -183,7 +183,9 @@ pub fn bind(path: &Path) -> io::Result<PipeListener> {
 /// [`bind`] with the DACL deliberately widened so Everyone may OPEN the pipe, leaving the
 /// per-connection owner check as the only layer. This exists for ONE purpose: the live test
 /// `another_account_is_refused_live`, which needs a second account to get past the DACL so the
-/// hub can log the owner check's refusal naming that account. Never use it to serve.
+/// hub can log the owner check's refusal naming that account. Never use it to serve. Behind
+/// the non-default `refusal-demo` feature, so it is not in the public API otherwise.
+#[cfg(feature = "refusal-demo")]
 #[doc(hidden)]
 pub fn bind_open_to_everyone_for_the_refusal_demo(path: &Path) -> io::Result<PipeListener> {
     let owner = OwnerSid::current()?;
