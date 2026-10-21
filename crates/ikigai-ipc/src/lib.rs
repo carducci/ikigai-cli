@@ -19,6 +19,11 @@
 //! refused account's SID and name. The pipe name is derived from the path passed to [`bind`]
 //! and [`connect`]; [`default_socket_path`] is `\\.\pipe\ikigai-<the user's SID>`.
 //!
+//! Two known limits of the Windows channel: the client does not verify the server's SID (an
+//! account that squats the pipe name before the hub starts would be dialled), and admission runs
+//! inline in the accept loop (the impersonation fallback's read-ahead can wait up to 2 s, which
+//! stalls accepts for that long).
+//!
 //! Elsewhere the module is empty.
 #![cfg(any(unix, windows))]
 

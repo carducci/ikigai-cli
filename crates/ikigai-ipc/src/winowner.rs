@@ -34,6 +34,17 @@
 //! with `OpenAsSelf = FALSE` (the check runs as the impersonated client, whose own token it is).
 //! If both are denied the client is refused. A refusal line says which path identified the
 //! client, or the Win32 errors when none did, so a live run shows which path worked.
+//!
+//! # Known limits
+//!
+//! - **The client does not verify the server.** The owner check is server-side only. An
+//!   account that creates the pipe name before the hub starts (the hub then fails with
+//!   `AddrInUse`, but a client that dials first meets the squatter) would be spoken to by a
+//!   client that never checks the server's SID. The per-user default name makes this a
+//!   deliberate act by another local account, not an accident.
+//! - **Admission runs inline in the accept loop.** The impersonation fallback may wait up to
+//!   2 s (`PRIME_WAIT` in `winpipe`) for the client's first byte, so a client that connects and
+//!   says nothing can stall accepts for that long.
 
 use std::io;
 use std::ptr::{null, null_mut};
