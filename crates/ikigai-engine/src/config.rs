@@ -107,7 +107,7 @@ pub fn path() -> Option<PathBuf> {
 
 /// The config home from the environment values passed in, so the rule is testable without
 /// `set_var` (the environment is process-global and races the test harness's threads).
-/// `$XDG_CONFIG_HOME`, else `$HOME/.config`, else `%USERPROFILE%\.config` — the last only when
+/// `$XDG_CONFIG_HOME` (when non-empty), else `$HOME/.config`, else `%USERPROFILE%\.config` — the last only when
 /// `HOME` is unset or empty, which is plain PowerShell and cmd on Windows. A twin of
 /// `ikigai_embedded::config::config_home_from`; keep the two in step.
 fn config_home_from(
@@ -116,7 +116,8 @@ fn config_home_from(
     userprofile: Option<OsString>,
 ) -> Option<PathBuf> {
     let non_empty = |value: Option<OsString>| value.filter(|value| !value.is_empty());
-    xdg.map(PathBuf::from)
+    non_empty(xdg)
+        .map(PathBuf::from)
         .or_else(|| {
             non_empty(home.clone())
                 .or_else(|| non_empty(userprofile))
@@ -220,6 +221,15 @@ mod tests {
         );
         assert_eq!(
             home(None, os(""), os("C:/u")),
+            Some(PathBuf::from("C:/u/.config/ikigai"))
+        );
+        // An empty `XDG_CONFIG_HOME` is unset, as in the embedded twin.
+        assert_eq!(
+            home(os(""), os("/h"), os("C:/u")),
+            Some(PathBuf::from("/h/.config/ikigai"))
+        );
+        assert_eq!(
+            home(os(""), None, os("C:/u")),
             Some(PathBuf::from("C:/u/.config/ikigai"))
         );
         assert_eq!(home(None, None, None), None);
