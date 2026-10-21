@@ -11,10 +11,27 @@
 //! peer's kernel-verified UID and refuses anyone but the server's own user.
 //! Capability-based authorization (finer than per-user) layers on later.
 //!
-//! Unix only — the module is empty elsewhere.
-#![cfg(unix)]
+//! On Windows the same API runs over a NAMED PIPE (tokio's native support) with the owner
+//! channel described on the private `winpipe` and `winowner` modules: every pipe instance
+//! carries a DACL that admits only the server's own user SID, and each client's user SID (read
+//! from its process token, or by impersonating it when a standard account may not open
+//! another account's token) is compared with the server's own. A refusal is logged with the
+//! refused account's SID and name. The pipe name is derived from the path passed to [`bind`]
+//! and [`connect`]; [`default_socket_path`] is `\\.\pipe\ikigai-<the user's SID>`.
+//!
+//! Elsewhere the module is empty.
+#![cfg(any(unix, windows))]
 
 mod accept;
+#[cfg(windows)]
+mod winowner;
+#[cfg(windows)]
+mod winpipe;
+#[cfg(windows)]
+#[doc(hidden)]
+pub use winpipe::bind_open_to_everyone_for_the_refusal_demo;
+#[cfg(windows)]
+pub use winpipe::{bind, default_socket_path, PipeListener, PipeStream};
 
 use std::io;
 #[cfg(unix)]
@@ -23,10 +40,14 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
+// On Windows the local-stream types are the named pipe's; the names stay so the one serve and
+// connect implementation below reads the same on both platforms.
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+#[cfg(windows)]
+use winpipe::{PipeListener as UnixListener, PipeStream as UnixStream};
 
 use ikigai_core::{
     Capability, Clock, Error, Kernel, Representation, Request, SpaceEntry, SystemClock, Tracer,
@@ -348,7 +369,10 @@ pub fn serve_shared_on_with(
     listener: UnixListener,
     limits: Limits,
 ) -> io::Result<()> {
+    #[cfg(unix)]
     let me = own_uid();
+    #[cfg(windows)]
+    let me = winowner::OwnerSid::current()?;
     let mut backoff = accept::Backoff::default();
     // The connections being served. Only this loop adds to it, so reading it and then adding
     // cannot overshoot; a finishing connection subtracts (its `Slot` drops).
@@ -365,8 +389,15 @@ pub fn serve_shared_on_with(
                 accept::Fault::Fatal => return Err(e),
             },
         };
+        #[cfg(unix)]
         if peer_uid(&stream) != Some(me) {
             continue; // not our user — drop it
+        }
+        #[cfg(windows)]
+        if let Err(refusal) = me.admit(&stream) {
+            // The log names the refused account (its SID, and its name if it has one).
+            accept::diagnose(format_args!("ikigai-ipc: {refusal}"));
+            continue; // not our account — drop it
         }
         if live.load(Ordering::SeqCst) >= limits.max_connections {
             refuse_over_capacity(stream, limits.max_connections);
@@ -703,7 +734,7 @@ struct Deadline {
     capped: std::cell::Cell<bool>,
 }
 
-/// Elapsed time, for the deadline. Native-only: this crate is `#![cfg(unix)]`, so it is
+/// Elapsed time, for the deadline. Native-only: this crate is `#![cfg(any(unix, windows))]`, so it is
 /// never built for `wasm32-unknown-unknown`, where `Instant::now` panics.
 #[allow(clippy::disallowed_methods)]
 fn now() -> std::time::Instant {
@@ -1293,6 +1324,9 @@ impl Resolver for IpcResolver {
     }
 
     fn transport(&self) -> String {
+        #[cfg(windows)]
+        return "ipc · named pipe (owner-only DACL, token-verified, same account)".to_string();
+        #[cfg(unix)]
         "ipc · unix domain socket (peercred-verified, same user)".to_string()
     }
 }

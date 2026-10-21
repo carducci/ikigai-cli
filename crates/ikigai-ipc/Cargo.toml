@@ -11,4 +11,19 @@ repository.workspace = true
 ikigai-core = { workspace = true }
 ikigai-resolve = { workspace = true }
 ikigai-wire = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+
+# The Windows owner channel (docs on the private `winpipe` and `winowner` modules): a named
+# pipe served through tokio's native support, the owner proof read through `windows-sys`
+# (0.61 is the version the lock already holds for other crates).
+[target.'cfg(windows)'.dependencies]
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time", "io-util"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
