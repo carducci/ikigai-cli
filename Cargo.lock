@@ -3279,6 +3279,8 @@ dependencies = [
  "ikigai-resolve",
  "ikigai-wire",
  "libc",
+ "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
