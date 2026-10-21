@@ -122,13 +122,17 @@ fn the_default_door_is_a_per_user_pipe_name() {
 ///   and then the hub hangs up without serving B: the protocol handshake fails with a
 ///   hang-up error (`BrokenPipe`, `ConnectionReset`, `UnexpectedEof` or `NotConnected`), never
 ///   a timeout and never a reply. A's console then shows the line the judge looks for:
-///   `ikigai-ipc: refused a connection from <MACHINE>\<B> (S-1-5-21-...): not the owner of
-///   this pipe, <MACHINE>\<A> (S-1-5-21-...)`. (On a standard account the hub reaches B's
-///   identity through the impersonation fallback, since it may not open B's token.)
+///   `ikigai-ipc: refused a connection from <MACHINE>\<B> (S-1-5-21-...) (identified by ...):
+///   not the owner of this pipe, <MACHINE>\<A> (S-1-5-21-...)`, where the parenthesis after the
+///   SID says which path named B: its process token, or impersonation (and with which
+///   `OpenAsSelf`). (On a standard account the hub usually reaches B's identity through the
+///   impersonation fallback, since it may not open B's token.) If neither path could name B the
+///   line says `could not identify the client account` with the Win32 error of each.
+///   B's connect makes ONE connection, so A's console shows one refusal line per run.
 ///
 /// With no `IKIGAI_IPC_LIVE_EXPECT`, B's test accepts either, and says which one it saw.
-/// Without `IKIGAI_IPC_LIVE_ROLE` the test does nothing, so `--ignored` on one account cannot
-/// pass by accident.
+/// Without `IKIGAI_IPC_LIVE_ROLE` the test PANICS, so `--ignored` on one account cannot pass
+/// by accident.
 #[test]
 #[ignore = "needs a second Windows account; see the doc comment"]
 fn another_account_is_refused_live() {
@@ -173,8 +177,10 @@ fn another_account_is_refused_live() {
         }
         Ok("connect") => {
             let expect = std::env::var("IKIGAI_IPC_LIVE_EXPECT").ok();
-            match ikigai_ipc::PipeStream::connect(&path) {
-                Err(e) => {
+            // One connection: the open, then the hello. An open the DACL refuses fails with
+            // `PermissionDenied` (layer 1); one it lets through ends in a hang-up (layer 2).
+            match ikigai_ipc::connect(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                     assert_eq!(
                         e.kind(),
                         std::io::ErrorKind::PermissionDenied,
@@ -189,17 +195,14 @@ fn another_account_is_refused_live() {
                     );
                     eprintln!("refused by the pipe's DACL (layer 1): {e}");
                 }
-                Ok(raw) => {
-                    drop(raw);
+                Ok(_) => panic!("a different account must not be served by the owner's hub"),
+                Err(err) => {
                     assert_ne!(
                         expect.as_deref(),
                         Some("dacl"),
                         "expected the DACL to refuse this account, but it was let in \
                          (is the hub running with IKIGAI_IPC_LIVE_OPEN=1?)"
                     );
-                    let err = ikigai_ipc::connect(&path)
-                        .err()
-                        .expect("a different account must not be served by the owner's hub");
                     assert!(
                         is_hang_up(&err),
                         "the hub must hang up on a different account (the owner check), \
@@ -213,6 +216,9 @@ fn another_account_is_refused_live() {
                 }
             }
         }
-        _ => eprintln!("set IKIGAI_IPC_LIVE_ROLE=serve (account A) or connect (account B)"),
+        other => panic!(
+            "set IKIGAI_IPC_LIVE_ROLE=serve (account A) or connect (account B), got {other:?}: \
+             this test proves nothing without a role"
+        ),
     }
 }
