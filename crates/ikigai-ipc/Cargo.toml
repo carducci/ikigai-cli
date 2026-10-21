@@ -12,6 +12,13 @@ ikigai-core = { workspace = true }
 ikigai-resolve = { workspace = true }
 ikigai-wire = { workspace = true }
 
+[features]
+# TEST-ONLY, Windows only: exports `bind_open_to_everyone_for_the_refusal_demo`, which widens
+# the pipe's DACL to let Everyone open it, so the per-connection owner check is the only layer.
+# It exists for the live two-account refusal test (`tests/windows_owner.rs`). Never enable it
+# in a build that serves.
+refusal-demo = []
+
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 

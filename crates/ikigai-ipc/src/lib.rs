@@ -27,7 +27,7 @@ mod accept;
 mod winowner;
 #[cfg(windows)]
 mod winpipe;
-#[cfg(windows)]
+#[cfg(all(windows, feature = "refusal-demo"))]
 #[doc(hidden)]
 pub use winpipe::bind_open_to_everyone_for_the_refusal_demo;
 #[cfg(windows)]
