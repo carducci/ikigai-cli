@@ -24,7 +24,24 @@ use std::time::Duration;
 /// reading. A diagnostic that cannot be written is lost; the door is not.
 pub(crate) fn diagnose(line: std::fmt::Arguments<'_>) {
     use std::io::Write;
+    #[cfg(all(test, windows))]
+    captured::LOG
+        .lock()
+        .expect("diagnostic capture lock")
+        .push(line.to_string());
     let _ = writeln!(io::stderr().lock(), "{line}");
+}
+
+/// Every line `diagnose` wrote in this test binary, for tests that assert on the log.
+#[cfg(all(test, windows))]
+pub(crate) mod captured {
+    pub(crate) static LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// The captured lines containing `needle`.
+    pub(crate) fn lines_with(needle: &str) -> Vec<String> {
+        let log = LOG.lock().expect("diagnostic capture lock");
+        log.iter().filter(|l| l.contains(needle)).cloned().collect()
+    }
 }
 
 /// The first wait after an exhaustion error.
