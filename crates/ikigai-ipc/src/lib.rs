@@ -3925,3 +3925,52 @@ mod call_deadline {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+/// The Windows owner check, through the real accept loop.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    /// `serve_loop` with an injected foreign owner (SYSTEM): the server believes its owner is
+    /// somebody else, so the same-account client below is the "stranger". Deleting the owner
+    /// check from the accept loop makes this client served, and the test fails, with one
+    /// account.
+    #[test]
+    fn a_client_that_is_not_the_servers_owner_is_refused_and_named() {
+        let path = winpipe::test_path("foreign-owner");
+        let listener = bind(&path).expect("bind");
+        let foreign = winowner::OwnerSid::from_string("S-1-5-18").expect("SYSTEM's SID");
+        let kernel = Arc::new(Kernel::new(Arc::new(ikigai_core::EndpointSpace::new())));
+        // The accept loop never returns; the thread ends with the test process.
+        std::thread::spawn(move || serve_loop(kernel, listener, Limits::default(), foreign));
+
+        let err = connect(&path)
+            .err()
+            .expect("a client that is not the owner must not be served");
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::NotConnected
+                    | io::ErrorKind::InvalidData
+            ),
+            "the door hangs up on the client: {err:?}"
+        );
+
+        // The refusal reached the log, naming the client's account and SID.
+        let me = winowner::OwnerSid::current().expect("own SID");
+        let lines = accept::captured::lines_with(&me.to_sid_string());
+        let line = lines
+            .iter()
+            .find(|l| l.contains("refused a connection from"))
+            .unwrap_or_else(|| panic!("no refusal line naming {}: {lines:?}", me.describe()));
+        assert!(line.contains(&me.describe()), "names the account: {line}");
+        assert!(line.contains("S-1-5-18"), "and the owner it is not: {line}");
+        assert!(
+            line.contains("process token"),
+            "and how it was named: {line}"
+        );
+    }
+}
