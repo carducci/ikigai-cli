@@ -46,8 +46,8 @@ is `\\.\pipe\ikigai-<the user's SID>`. Two layers keep other accounts out:
   exclusively, so no other process can squat the name and a second server on a live name is
   refused with `AddrInUse`.
 - **A per-connection owner check**, the counterpart of the UID check: the client's user SID
-  (its process token) must equal the server's. A standard account may not open another
-  account's process token, so when that fails the server impersonates the pipe client at
+  (its process token) must equal the server's. A standard account may be denied another
+  account's process token; when that open fails the server impersonates the pipe client at
   identification level just long enough to read its SID. A client that cannot be identified is
   refused. A refusal is logged with the refused account's name and SID, and which path
   (process token, or impersonation) identified it.
@@ -60,6 +60,9 @@ Known limits of the Windows channel:
 - **Admission runs inline in the accept loop.** The impersonation fallback may wait up to 2 s
   for a client's first byte, so a client that connects and says nothing can stall accepts for
   that long.
+- **The impersonation fallback is unit-tested only.** In the one live two-account run the server
+  named the other account by its process token, so the fallback path has not yet been exercised
+  across real accounts.
 
 Because the peer is the owner, a `cap`-attenuated `--connect` session carries its
 capability over `Call::IssueAs`; the server resolves under it (already ≤ root), so
