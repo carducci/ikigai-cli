@@ -125,8 +125,9 @@ fn the_default_door_is_a_per_user_pipe_name() {
 ///   `ikigai-ipc: refused a connection from <MACHINE>\<B> (S-1-5-21-...) (identified by ...):
 ///   not the owner of this pipe, <MACHINE>\<A> (S-1-5-21-...)`, where the parenthesis after the
 ///   SID says which path named B: its process token, or impersonation (and with which
-///   `OpenAsSelf`). (On a standard account the hub usually reaches B's identity through the
-///   impersonation fallback, since it may not open B's token.) If neither path could name B the
+///   `OpenAsSelf`). (In the one live run, two standard accounts on 2026-10-22, the hub named B
+///   by its process token. The impersonation fallback is the path for when that open is denied,
+///   and it has been exercised only by the unit tests so far.) If neither path could name B the
 ///   line says `could not identify the client account` with the Win32 error of each.
 ///   B's connect makes ONE connection, so A's console shows one refusal line per run.
 ///
