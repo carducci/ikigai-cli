@@ -22,9 +22,26 @@ use std::time::Duration;
 /// write returns the error). These lines are written by the accept loop itself, so the panic
 /// would end [`serve`](crate::serve) and with it the whole door, for a log line nobody was
 /// reading. A diagnostic that cannot be written is lost; the door is not.
-fn diagnose(line: std::fmt::Arguments<'_>) {
+pub(crate) fn diagnose(line: std::fmt::Arguments<'_>) {
     use std::io::Write;
+    #[cfg(all(test, windows))]
+    captured::LOG
+        .lock()
+        .expect("diagnostic capture lock")
+        .push(line.to_string());
     let _ = writeln!(io::stderr().lock(), "{line}");
+}
+
+/// Every line `diagnose` wrote in this test binary, for tests that assert on the log.
+#[cfg(all(test, windows))]
+pub(crate) mod captured {
+    pub(crate) static LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// The captured lines containing `needle`.
+    pub(crate) fn lines_with(needle: &str) -> Vec<String> {
+        let log = LOG.lock().expect("diagnostic capture lock");
+        log.iter().filter(|l| l.contains(needle)).cloned().collect()
+    }
 }
 
 /// The first wait after an exhaustion error.
@@ -44,6 +61,7 @@ pub(crate) enum Fault {
 }
 
 /// Classify one accept error.
+#[cfg(unix)]
 pub(crate) fn classify(e: &io::Error) -> Fault {
     if let Some(code) = e.raw_os_error() {
         return match code {
@@ -73,6 +91,32 @@ pub(crate) fn classify(e: &io::Error) -> Fault {
         | io::ErrorKind::Interrupted
         | io::ErrorKind::WouldBlock => Fault::Skip,
         _ => Fault::BackOff,
+    }
+}
+
+/// Classify one error from the named-pipe door's accept (Win32 codes: the instance could not
+/// be waited on or the next one could not be created).
+///
+/// Skip: the client came and went (`ERROR_BROKEN_PIPE`, `ERROR_NO_DATA`,
+/// `ERROR_PIPE_NOT_CONNECTED`, `ERROR_OPERATION_ABORTED`). Fatal: the listener itself is gone or
+/// malformed (`ERROR_INVALID_HANDLE`, `ERROR_INVALID_PARAMETER`). Everything else, including
+/// `ERROR_PIPE_BUSY` (all instances in use), `ERROR_NO_SYSTEM_RESOURCES` and
+/// `ERROR_NOT_ENOUGH_MEMORY`, is exhaustion or unknown: back off.
+#[cfg(windows)]
+pub(crate) fn classify(e: &io::Error) -> Fault {
+    const SKIPPED: [i32; 4] = [109, 232, 233, 995];
+    const FATAL: [i32; 2] = [6, 87];
+    match e.raw_os_error() {
+        Some(code) if FATAL.contains(&code) => Fault::Fatal,
+        Some(code) if SKIPPED.contains(&code) => Fault::Skip,
+        Some(_) => Fault::BackOff,
+        None => match e.kind() {
+            io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock => Fault::Skip,
+            _ => Fault::BackOff,
+        },
     }
 }
 
@@ -121,7 +165,7 @@ impl Backoff {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -217,5 +261,19 @@ mod tests {
             status.success() && out.contains(SURVIVED),
             "the accept loop's log lines must not panic on a closed stderr: {status}\n{out}"
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn win32_codes_classify_like_their_unix_twins() {
+        let os = io::Error::from_raw_os_error;
+        assert_eq!(classify(&os(6)), Fault::Fatal); // ERROR_INVALID_HANDLE
+        assert_eq!(classify(&os(109)), Fault::Skip); // ERROR_BROKEN_PIPE
+        assert_eq!(classify(&os(231)), Fault::BackOff); // ERROR_PIPE_BUSY
+        assert_eq!(classify(&os(99999)), Fault::BackOff); // unrecognized
     }
 }

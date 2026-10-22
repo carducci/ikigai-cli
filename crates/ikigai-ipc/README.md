@@ -33,6 +33,37 @@ No CA, no TLS — the operating system already authenticates a local peer:
   on Linux, `getpeereid` on macOS/BSD) and refuses any connection that isn't the
   server's own user — defense in depth over the directory mode.
 
+### On Windows
+
+The same API runs over a **named pipe** (tokio's native `named_pipe` support). The pipe name
+is derived from the path you pass to `bind` and `connect` (hashed into `\\.\pipe\ikigai-<hash>`;
+a path that already starts with `\\.\pipe\` is used as given), and `default_socket_path()`
+is `\\.\pipe\ikigai-<the user's SID>`. Two layers keep other accounts out:
+
+- **The pipe's DACL.** Every instance is created with a protected DACL holding one entry, full
+  access for the server's own user SID (no Everyone, Administrators or SYSTEM, nothing
+  inherited), owned by that SID, with remote clients rejected. The first instance is created
+  exclusively, so no other process can squat the name and a second server on a live name is
+  refused with `AddrInUse`.
+- **A per-connection owner check**, the counterpart of the UID check: the client's user SID
+  (its process token) must equal the server's. A standard account may be denied another
+  account's process token; when that open fails the server impersonates the pipe client at
+  identification level just long enough to read its SID. A client that cannot be identified is
+  refused. A refusal is logged with the refused account's name and SID, and which path
+  (process token, or impersonation) identified it.
+
+Known limits of the Windows channel:
+
+- **The client does not verify the server.** The owner check is server-side only: an account
+  that creates the pipe name before the hub starts (squatting it) would be dialled by a client
+  that never checks the server's SID.
+- **Admission runs inline in the accept loop.** The impersonation fallback may wait up to 2 s
+  for a client's first byte, so a client that connects and says nothing can stall accepts for
+  that long.
+- **The impersonation fallback is unit-tested only.** In the one live two-account run the server
+  named the other account by its process token, so the fallback path has not yet been exercised
+  across real accounts.
+
 Because the peer is the owner, a `cap`-attenuated `--connect` session carries its
 capability over `Call::IssueAs`; the server resolves under it (already ≤ root), so
 attenuation behaves over IPC exactly as it does for the embedded kernel.

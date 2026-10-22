@@ -11,4 +11,26 @@ repository.workspace = true
 ikigai-core = { workspace = true }
 ikigai-resolve = { workspace = true }
 ikigai-wire = { workspace = true }
+
+[features]
+# TEST-ONLY, Windows only: exports `bind_open_to_everyone_for_the_refusal_demo`, which widens
+# the pipe's DACL to let Everyone open it, so the per-connection owner check is the only layer.
+# It exists for the live two-account refusal test (`tests/windows_owner.rs`). Never enable it
+# in a build that serves.
+refusal-demo = []
+
+[target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+
+# The Windows owner channel (docs on the private `winpipe` and `winowner` modules): a named
+# pipe served through tokio's native support, the owner proof read through `windows-sys`
+# (0.61 is the version the lock already holds for other crates).
+[target.'cfg(windows)'.dependencies]
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time", "io-util"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
