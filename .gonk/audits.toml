@@ -1,0 +1,8 @@
+[[run]]
+id = "ikigai-cli-correctness"
+kind = "audit"
+lens = "correctness: wrong output, crashes, and refusals that don't fire"
+scope = ["crates/**/*.rs", "demos/*.sh"]
+budget = 60
+auditors = ["opus"]
+every = "30d"
